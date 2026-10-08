@@ -235,7 +235,12 @@ def _normalized(token: str) -> str:
 def _is_self(word: str) -> bool:
     if word == TOOL_NAME:
         return True
-    return os.path.basename(word) == TOOL_NAME and os.path.realpath(word) == SELF_PATH
+    if os.path.basename(word) != TOOL_NAME:
+        return False
+    expanded = re.sub(r"^(\$HOME|\$\{HOME\})", USER_HOME, word)
+    if expanded.startswith("~/"):
+        expanded = USER_HOME + expanded[1:]
+    return os.path.realpath(expanded) == SELF_PATH
 
 
 def _tokenize(command: str) -> list[list[str]]:
