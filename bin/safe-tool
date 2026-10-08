@@ -12,6 +12,8 @@ if __name__ == "__main__" and not sys.flags.isolated and sys.executable:
     posix.execv(sys.executable, [sys.executable, "-I", *sys.argv])
 
 import fcntl
+import glob
+import itertools
 import json
 import os
 import re
@@ -120,16 +122,31 @@ SHELL_COMMAND_OPTION = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 STARTUP_RC_NAMES = r"zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|kshrc|cshrc|tcshrc"
 STARTUP_HISTORY_NAMES = r"zsh_history|bash_history|sh_history|history|python_history|psql_history|mysql_history|sqlite_history|node_repl_history"
 STARTUP_NAME = r"\.(?:" + STARTUP_RC_NAMES + "|" + STARTUP_HISTORY_NAMES + r")(?![A-Za-z0-9_])|\.config/fish/"
-STARTUP_FILE_PATTERN = re.compile(r"(?:^|[\s\"'=:(<>|;&/~{`])(?:" + STARTUP_NAME + ")")
+STARTUP_FILE_PATTERN = re.compile(r"(?:^|[\s\"'=:(<>|;&/~{`])(?:" + STARTUP_NAME + ")", re.IGNORECASE)
+STARTUP_BASENAME_PATTERN = re.compile(r"\.(?:" + STARTUP_RC_NAMES + "|" + STARTUP_HISTORY_NAMES + r")(?![A-Za-z0-9_])", re.IGNORECASE)
+# Metadata checks stay allowed only on their own: a pipe, loop or substitution could feed the path to a command that reads it.
+PIPELINE_CONTEXT_PATTERN = re.compile(r"(?<!\|)\|(?!\|)|`|\$\(|[<>]\(|\b(?:xargs|while|for|eval|exec|parallel)\b|-exec|-ok\b")
+HISTORY_VARIABLE_PATTERN = re.compile(r"\$\{?histfile\b", re.IGNORECASE)
+PROCESS_ENVIRONMENT_PATTERN = re.compile(r"/proc/[^\s/]+/environ")
+MAX_GLOB_WORDS = 20
+MAX_GLOB_VARIANTS = 256
+MAX_GLOB_MATCHES = 2000
+# A command that prints a variable named like a secret shows the secret, so it is refused for the printing commands.
+SECRET_VARIABLE_PATTERN = re.compile(r"\$\{?[#!]?[A-Za-z0-9_]*(?:key|token|secret|pass|credential|auth)[A-Za-z0-9_]*", re.IGNORECASE)
+PRINTING_COMMANDS = frozenset({"echo", "print", "printf"})
+# These read from a password manager or a secret store, so the command is refused whatever it asks for.
+CREDENTIAL_COMMANDS = frozenset({"bw", "gopass", "keyctl", "pass", "secret-tool"})
+ENVIRONMENT_SERVICE_ACTIONS = frozenset({"dumpstate", "export", "getenv", "print", "print-cache", "print-disabled", "procinfo"})
 STARTUP_NAME_PATTERN = re.compile(STARTUP_NAME, re.IGNORECASE)
 STARTUP_COMMAND_POSITION = r"(?:^|[;&|({\n`]|[\"'])\s*(?:(?:if|then|elif|else|do|while|until|time|!)\s+)*"
 SOURCE_STARTUP_PATTERN = re.compile(
     STARTUP_COMMAND_POSITION
     + r"(?:source|\.)\s+[\"']?[^\s\"';&|()<>`]*\.(?:"
     + STARTUP_RC_NAMES
-    + r")(?![A-Za-z0-9_])[^\s\"';&|()<>`]*[\"']?"
+    + r")(?![A-Za-z0-9_])[^\s\"';&|()<>`]*[\"']?",
+    re.IGNORECASE,
 )
-METADATA_STARTUP_PATTERN = re.compile(STARTUP_COMMAND_POSITION + r"(?:ls|stat|test|\[\[?|wc)\s+[^;&|()<>`\n]*")
+METADATA_STARTUP_PATTERN = re.compile(STARTUP_COMMAND_POSITION + r"(?:ls|stat|test|\[\[?)\s+[^;&|()<>`\n]*", re.IGNORECASE)
 STARTUP_KEY_FILES = (".zshrc", ".zshenv", ".zprofile", ".bashrc", ".bash_profile", ".profile")
 KEY_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 KEY_ASSIGNMENT_PATTERN = re.compile(r"[ \t]*(?:(?:export|readonly|declare|typeset)[ \t]+(?:-[A-Za-z]+[ \t]+)*)?([A-Za-z_][A-Za-z0-9_]*)=(.*)")
@@ -415,6 +432,8 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
     normalized = [_normalized(word) for word in words]
     if normalized[0] == TOOL_NAME:
         return not _is_self(words[0])
+    if normalized[0] == "eval" and len(words) > 1:
+        return _sensitive_command(" ".join(words[1:]))
     if normalized[0] in {"bash", "sh", "zsh"}:
         for index, argument in enumerate(words[:-1]):
             if SHELL_COMMAND_OPTION.fullmatch(argument):
@@ -423,12 +442,14 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
         return True
     if normalized[0] in DIRECT_IDENTITY_COMMANDS:
         return True
+    if normalized[0] in CREDENTIAL_COMMANDS or (normalized[0] in PRINTING_COMMANDS and any(SECRET_VARIABLE_PATTERN.search(word) for word in words[1:])):
+        return True
     printer = normalized[1:] if normalized[0] == "builtin" and len(normalized) > 1 else normalized
     if printer[0] in DEFINITION_PRINTERS and _prints_definitions(printer[0], printer[1:]):
         return True
     if any(word.split("=", 1)[0] in SENSITIVE_FLAGS for word in normalized):
         return True
-    if "git" in normalized and _sensitive_git_command(words):
+    if "git" in normalized and (_sensitive_git_command(words) or (_git_subcommand(words)[0] or "").startswith("credential")):
         return True
 
     executable = normalized[0]
@@ -436,6 +457,22 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
     first = arguments[0] if arguments else ""
     second = arguments[1] if len(arguments) > 1 else ""
     if executable in {"coderabbit", "cr"} and first in {"auth", "doctor", "stats", "usage"}:
+        return True
+    if executable == "ps" and re.fullmatch(r"-?[a-z]*e[a-z]*", first):
+        return True
+    if executable == "launchctl" and first in ENVIRONMENT_SERVICE_ACTIONS:
+        return True
+    if executable == "op" and first not in {"", "--version", "-v", "help", "run"}:
+        return True
+    if executable == "doppler" and first in {"configs", "secrets"}:
+        return True
+    if executable == "vault" and first in {"kv", "login", "read", "token", "transit", "unwrap"}:
+        return True
+    if executable == "sops" and any(argument in {"-d", "--decrypt", "decrypt"} for argument in arguments):
+        return True
+    if executable == "ansible-vault" and first in {"decrypt", "view"}:
+        return True
+    if executable == "kubectl" and first in {"describe", "get"} and any(argument.startswith("secret") for argument in arguments[1:4]):
         return True
     if executable == "gh" and (first == "auth" or (first == "api" and second in {"user", "/user"})):
         return True
@@ -466,12 +503,51 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
     return False
 
 
+def _expand_braces(word: str) -> list[str] | None:
+    pending, done = [word], []
+    while pending:
+        if len(done) + len(pending) > MAX_GLOB_VARIANTS:
+            return None
+        current = pending.pop()
+        found = re.search(r"\{([^{}]*,[^{}]*)\}", current)
+        if found is None:
+            done.append(current)
+            continue
+        pending.extend(current[: found.start()] + option + current[found.end() :] for option in found.group(1).split(","))
+    return done
+
+
+# Globs and braces are expanded against the real folders, the way the shell would, so `cat ~/.z*` is seen for what it reads.
+def _glob_names_startup_file(text: str) -> bool:
+    words = [word for word in re.findall(r"[^\s;&|()<>\"'`]+", text) if any(character in word for character in "*?[{")]
+    if len(words) > MAX_GLOB_WORDS:
+        return True
+    for word in words:
+        variants = _expand_braces(word)
+        if variants is None:
+            return True
+        for variant in variants:
+            expanded = re.sub(r"^(?:~|\$HOME|\$\{HOME\})(?=/|$)", USER_HOME, variant, flags=re.IGNORECASE)
+            if not any(character in expanded for character in "*?["):
+                candidates = [expanded]
+            else:
+                patterns = [expanded] if os.path.isabs(expanded) else [expanded, os.path.join(USER_HOME, expanded)]
+                candidates = [match for pattern in patterns for match in itertools.islice(glob.iglob(pattern), MAX_GLOB_MATCHES)]
+            for candidate in candidates:
+                if STARTUP_BASENAME_PATTERN.match(os.path.basename(candidate)) or "/.config/fish/" in candidate.lower():
+                    return True
+    return False
+
+
 def _reads_startup_file(command: str) -> bool:
-    lowered = command.lower()
-    if STARTUP_FILE_PATTERN.search(lowered) is None:
+    if HISTORY_VARIABLE_PATTERN.search(command):
+        return True
+    if STARTUP_FILE_PATTERN.search(command) is None and not _glob_names_startup_file(command):
         return False
-    remainder = METADATA_STARTUP_PATTERN.sub(" ", SOURCE_STARTUP_PATTERN.sub(" ", lowered))
-    return STARTUP_FILE_PATTERN.search(remainder) is not None
+    remainder = SOURCE_STARTUP_PATTERN.sub(" ", command)
+    if PIPELINE_CONTEXT_PATTERN.search(command) is None:
+        remainder = METADATA_STARTUP_PATTERN.sub(" ", remainder)
+    return STARTUP_FILE_PATTERN.search(remainder) is not None or _glob_names_startup_file(remainder)
 
 
 def _sensitive_command(command: str) -> bool:
@@ -482,6 +558,7 @@ def _sensitive_command(command: str) -> bool:
         DEFINITION_PARAMETER_PATTERN.search(lowered)
         or SENSITIVE_PATH_PATTERN.search(lowered)
         or SENSITIVE_FILE_PATTERN.search(lowered)
+        or PROCESS_ENVIRONMENT_PATTERN.search(lowered)
         or _reads_startup_file(command)
     ):
         return True
