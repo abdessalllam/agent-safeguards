@@ -64,8 +64,8 @@ web-shot https://example.com --width 1024 --height 768
 ```
 
 - Only `http` and `https` addresses are accepted. `file:`, `javascript:`, `data:` and similar schemes are refused, because a screenshot of a local file would put its content in front of the model, and an address with a username or password is refused so credentials never reach a log.
-- It only creates new `.png` files. It refuses to overwrite an existing file or to write any other extension, so the allow rule above is safe to grant.
-- It starts the browser with a fresh temporary profile, waits for the finished PNG, stops the browser, and removes the profile.
+- It only creates new `.png` files. It refuses to overwrite an existing file or to write any other extension, and a page that answers with a file to download is kept inside the throwaway browser profile, which is deleted. It still makes web requests to the address it is given, as `curl` does, so granting the allow rule gives an agent the same reach as an allowed `curl`. Link-local addresses, which cloud metadata services use, are refused.
+- It starts the browser with a fresh temporary profile, waits for the finished PNG, stops the browser, and removes the profile. A termination signal also stops the browser and removes the temporary files.
 - It captures the viewport, not the whole page, and waits up to 5 seconds of page time for scripts to settle. A page that needs a login or interaction is out of reach, so use a browser tool for that and keep its screenshots small.
 
 ## The browser hook

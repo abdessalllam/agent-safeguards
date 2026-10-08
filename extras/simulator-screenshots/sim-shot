@@ -19,7 +19,7 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "lib"))
 
 from agent_safeguards.common import find_executable, message  # noqa: E402
-from agent_safeguards.screenshot import MAX_SIDE, MIN_SIDE, ScreenshotError, fit_png, reserve_output  # noqa: E402
+from agent_safeguards.screenshot import MAX_SIDE, MIN_SIDE, ScreenshotError, discard, fit_png, reserve_output  # noqa: E402
 
 TOOL_NAME = "sim-shot"
 XCRUN = find_executable("xcrun")
@@ -75,12 +75,13 @@ def main(arguments: list[str]) -> int:
         print("%s: %s" % (TOOL_NAME, error), file=sys.stderr)
         return 1
     finally:
-        for leftover in (full,) if succeeded else (full, output):
-            if leftover is not None:
-                try:
-                    os.remove(leftover)
-                except OSError:
-                    pass
+        if full is not None:
+            try:
+                os.remove(full)
+            except OSError:
+                pass
+        if not succeeded:
+            discard(output)
     print(output)
     return 0
 
