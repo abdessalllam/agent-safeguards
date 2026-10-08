@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Save a website screenshot as a new PNG within fixed pixel and size limits and print its path."""
+
+from __future__ import annotations
+
+import sys
+
+# Run again in isolated mode before any other import, so PYTHON* variables and user site packages cannot shadow the library.
+if __name__ == "__main__" and not sys.flags.isolated and sys.executable:
+    import posix
+
+    posix.execv(sys.executable, [sys.executable, "-I", *sys.argv])
+
+import argparse
+import os
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "lib"))
+
+from agent_safeguards.common import find_executable, message  # noqa: E402
+from agent_safeguards.screenshot import MAX_SIDE, MIN_SIDE, ScreenshotError, fit_png, reserve_output  # noqa: E402
+
+TOOL_NAME = "web-shot"
+DEFAULT_WIDTH = 1280
+DEFAULT_HEIGHT = 800
+CAPTURE_TIMEOUT_SECONDS = 60
+VIRTUAL_TIME_BUDGET_MS = 5000
+MAX_URL_CHARS = 2048
+POLL_SECONDS = 0.25
+PNG_END = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+ALLOWED_SCHEMES = ("http", "https")
+BROWSER_PATHS = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+)
+BROWSER_NAMES = ("google-chrome", "chromium", "chromium-browser", "microsoft-edge")
+
+
+def fail(text: str) -> None:
+    print("%s: %s" % (TOOL_NAME, text), file=sys.stderr)
+    sys.exit(1)
+
+
+def find_browser() -> str | None:
+    for path in BROWSER_PATHS:
+        if os.access(path, os.X_OK):
+            return path
+    for name in BROWSER_NAMES:
+        found = find_executable(name)
+        if found:
+            return found
+    return None
+
+
+def checked_url(url: str) -> str:
+    # Only web addresses: file: and similar schemes would let a screenshot show local files, and credentials in a URL would be logged.
+    try:
+        parts = urlsplit(url)
+        hostname, port = parts.hostname, parts.port
+    except ValueError:
+        hostname = None
+    clean = len(url) <= MAX_URL_CHARS and all(32 < ord(character) != 127 for character in url)
+    if not clean or hostname is None or parts.scheme not in ALLOWED_SCHEMES or "@" in parts.netloc:
+        raise ScreenshotError(message("web_shot.error.bad_url"))
+    return url
+
+
+def png_complete(path: str) -> bool:
+    try:
+        with open(path, "rb") as handle:
+            if handle.seek(0, os.SEEK_END) < len(PNG_END) + 8:
+                return False
+            handle.seek(-len(PNG_END), os.SEEK_END)
+            return handle.read() == PNG_END
+    except OSError:
+        return False
+
+
+def capture(browser: str, url: str, width: int, height: int, destination: str) -> None:
+    profile = tempfile.mkdtemp(prefix="web-shot-profile-")
+    command = [
+        browser,
+        "--headless=new",
+        "--disable-gpu",
+        "--hide-scrollbars",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--force-device-scale-factor=1",
+        "--user-data-dir=" + profile,
+        "--window-size=%d,%d" % (width, height),
+        "--virtual-time-budget=%d" % VIRTUAL_TIME_BUDGET_MS,
+        "--screenshot=" + destination,
+        url,
+    ]
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.monotonic() + CAPTURE_TIMEOUT_SECONDS
+    try:
+        # The browser can keep running after it has written the file, so the finished file ends the wait, not the process.
+        while not png_complete(destination) and process.poll() is None:
+            if time.monotonic() > deadline:
+                raise ScreenshotError(message("web_shot.error.timeout", seconds=CAPTURE_TIMEOUT_SECONDS))
+            time.sleep(POLL_SECONDS)
+    finally:
+        # The browser starts helper processes; its own session lets one signal end the whole group. Signalling only
+        # while the leader is unreaped keeps its process id from being reused by something else.
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        shutil.rmtree(profile, ignore_errors=True)
+    if not os.path.exists(destination) or not os.path.getsize(destination):
+        raise ScreenshotError(message("web_shot.error.capture"))
+
+
+def main(arguments: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog=TOOL_NAME, usage=message("web_shot.usage"), add_help=False)
+    parser.add_argument("url")
+    parser.add_argument("output", nargs="?")
+    parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
+    parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
+    args = parser.parse_args(arguments)
+    if not (MIN_SIDE <= args.width <= MAX_SIDE and MIN_SIDE <= args.height <= MAX_SIDE):
+        fail(message("web_shot.error.range", low=MIN_SIDE, high=MAX_SIDE))
+
+    output = None
+    full = None
+    succeeded = False
+    try:
+        url = checked_url(args.url)
+        browser = find_browser()
+        if browser is None:
+            raise ScreenshotError(message("web_shot.error.no_browser"))
+        output = reserve_output(args.output, "web-shot-")
+        handle, full = tempfile.mkstemp(prefix="web-shot-full-", suffix=".png")
+        os.close(handle)
+        capture(browser, url, args.width, args.height, full)
+        fit_png(full, output, max(args.width, args.height))
+        succeeded = True
+    except ScreenshotError as error:
+        print("%s: %s" % (TOOL_NAME, error), file=sys.stderr)
+        return 1
+    finally:
+        for leftover in (full,) if succeeded else (full, output):
+            if leftover is not None:
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+    print(output)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

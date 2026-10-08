@@ -18,5 +18,6 @@ First release.
 - Skills `command-guards` and `setup-agent-safeguards`.
 - Optional Codex rule files under `extras/codex-rules/`.
 - Optional simulator screenshot extras for Claude Code on macOS under `extras/simulator-screenshots/`: `sim-shot` saves a shrunk simulator screenshot as a new file and prints its path, and a hook holds the simulator control tool's crashing `screenshot` action for the user.
+- Optional website screenshot extras under `extras/web-screenshots/`: `web-shot` saves an `http` or `https` page as a new PNG within fixed limits (1568 pixels, 1 MB) and prints its path, and a Claude Code hook refuses in-app browser and Chrome extension screenshots that do not ask for a scale of 0.5 or lower. The simulator extras share the same limits through `lib/agent_safeguards/screenshot.py`.
 - Message catalog in `locales/en.json`.
 - Settings through `AGENT_SAFEGUARDS_*` environment variables.

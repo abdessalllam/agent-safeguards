@@ -19,47 +19,17 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "lib"))
 
 from agent_safeguards.common import find_executable, message  # noqa: E402
+from agent_safeguards.screenshot import MAX_SIDE, MIN_SIDE, ScreenshotError, fit_png, reserve_output  # noqa: E402
 
 TOOL_NAME = "sim-shot"
 XCRUN = find_executable("xcrun")
-SIPS = find_executable("sips")
 DEFAULT_MAX_SIDE = 600
-MIN_MAX_SIDE = 100
-MAX_MAX_SIDE = 1600
 CAPTURE_TIMEOUT_SECONDS = 45
-SHRINK_TIMEOUT_SECONDS = 30
 
 
 def fail(text: str) -> None:
     print("%s: %s" % (TOOL_NAME, text), file=sys.stderr)
     sys.exit(1)
-
-
-def side_lengths(path: str) -> list[int] | None:
-    done = subprocess.run([SIPS, "-g", "pixelWidth", "-g", "pixelHeight", path], capture_output=True, text=True, timeout=SHRINK_TIMEOUT_SECONDS)
-    values = [int(line.split(":")[1]) for line in done.stdout.splitlines() if "pixel" in line]
-    return values if len(values) == 2 else None
-
-
-def reserve_output(requested: str | None) -> str:
-    # The command can run without a prompt, so it only ever creates new .png files. Creating the file with O_EXCL
-    # claims the path atomically, which also means the cleanup on failure only ever removes a file this run made.
-    if requested is None:
-        handle, path = tempfile.mkstemp(prefix="sim-shot-", suffix=".png")
-        os.close(handle)
-        return path
-    path = os.path.abspath(requested)
-    if not path.lower().endswith(".png"):
-        fail(message("sim_shot.error.not_png"))
-    if not os.path.isdir(os.path.dirname(path)):
-        fail(message("sim_shot.error.no_folder", path=os.path.dirname(path)))
-    try:
-        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
-    except FileExistsError:
-        fail(message("sim_shot.error.exists", path=path))
-    except OSError:
-        fail(message("sim_shot.error.not_writable", path=path))
-    return path
 
 
 def capture(device: str, destination: str) -> None:
@@ -72,19 +42,10 @@ def capture(device: str, destination: str) -> None:
             timeout=CAPTURE_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        fail(message("sim_shot.error.timeout", seconds=CAPTURE_TIMEOUT_SECONDS, hint=hint))
+        raise ScreenshotError(message("sim_shot.error.timeout", seconds=CAPTURE_TIMEOUT_SECONDS, hint=hint)) from None
     if captured.returncode != 0 or not os.path.getsize(destination):
         reason = (captured.stderr or captured.stdout).strip().splitlines()
-        fail(message("sim_shot.error.capture", reason=reason[-1].strip() if reason else "-", hint=hint))
-
-
-def shrink(source: str, destination: str, max_side: int) -> None:
-    shrunk = subprocess.run([SIPS, "-Z", str(max_side), source, "--out", destination], capture_output=True, text=True, timeout=SHRINK_TIMEOUT_SECONDS)
-    if shrunk.returncode != 0:
-        fail(message("sim_shot.error.shrink", hint=message("sim_shot.hint")))
-    sides = side_lengths(destination)
-    if sides is None or max(sides) > max_side:
-        fail(message("sim_shot.error.size"))
+        raise ScreenshotError(message("sim_shot.error.capture", reason=reason[-1].strip() if reason else "-", hint=hint))
 
 
 def main(arguments: list[str]) -> int:
@@ -93,22 +54,26 @@ def main(arguments: list[str]) -> int:
     parser.add_argument("--device", default="booted")
     parser.add_argument("--max-side", type=int, default=DEFAULT_MAX_SIDE)
     args = parser.parse_args(arguments)
-    if XCRUN is None or SIPS is None:
+    if XCRUN is None:
         fail(message("sim_shot.error.no_tools"))
-    if not MIN_MAX_SIDE <= args.max_side <= MAX_MAX_SIDE:
-        fail(message("sim_shot.error.range", low=MIN_MAX_SIDE, high=MAX_MAX_SIDE))
+    if not MIN_SIDE <= args.max_side <= MAX_SIDE:
+        fail(message("sim_shot.error.range", low=MIN_SIDE, high=MAX_SIDE))
 
-    output = reserve_output(args.output)
+    output = None
     full = None
     succeeded = False
     try:
+        output = reserve_output(args.output, "sim-shot-")
         # simctl is refused with "Operation not permitted" when it writes into Documents or other protected folders,
-        # so the full-size capture goes to the temp folder and only sips writes the final file.
+        # so the full-size capture goes to the temp folder and only fit_png writes the final file.
         handle, full = tempfile.mkstemp(prefix="sim-shot-full-", suffix=".png")
         os.close(handle)
         capture(args.device, full)
-        shrink(full, output, args.max_side)
+        fit_png(full, output, args.max_side)
         succeeded = True
+    except ScreenshotError as error:
+        print("%s: %s" % (TOOL_NAME, error), file=sys.stderr)
+        return 1
     finally:
         for leftover in (full,) if succeeded else (full, output):
             if leftover is not None:

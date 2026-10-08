@@ -52,6 +52,7 @@ sim-shot --device "iPhone 17 Pro" --max-side 800
 ```
 
 - It only creates new `.png` files. It refuses to overwrite an existing file or to write any other extension, so the allow rule above is safe to grant.
+- The result stays within 1568 pixels (default 600) and 1 MB. A heavier capture is shrunk further until it fits. These limits are shared with the [website screenshot extras](../web-screenshots/README.md).
 - It captures into the temp folder first, because `simctl` is refused ("Operation not permitted") when it writes straight into `~/Documents` and similar protected folders. Only `sips` writes the final file, so any folder works as the output.
 - It does not boot a simulator. If none is running it fails with a message, and the agent should skip the screenshot.
 
