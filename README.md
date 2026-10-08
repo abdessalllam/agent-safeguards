@@ -1,4 +1,58 @@
-# Agent Safeguards
+<div align="center">
+
+# 🛡️ Agent Safeguards
+
+**Shell-command guardrails for Claude Code and Codex.**<br>
+Keep credentials out of the transcript. Keep deletes away from your drive.
+
+[![self-test](https://github.com/abdessalllam/agent-safeguards/actions/workflows/test.yml/badge.svg)](https://github.com/abdessalllam/agent-safeguards/actions/workflows/test.yml)
+![License: MIT](https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square)
+![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white)
+![Claude Code](https://img.shields.io/badge/Claude%20Code-supported-D97757?style=flat-square)
+![Codex](https://img.shields.io/badge/Codex-supported-000000?style=flat-square)
+![Platforms: macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square)
+![Dependencies: standard library only](https://img.shields.io/badge/dependencies-stdlib%20only-success?style=flat-square)
+![Network: none](https://img.shields.io/badge/network-none-success?style=flat-square)
+![Telemetry: none](https://img.shields.io/badge/telemetry-none-success?style=flat-square)
+
+[Quick start](#quick-start) · [What it does](#what-it-does) · [Install](#install) · [Verify](#verify) · [Settings](#settings) · [Limits](#what-it-does-not-do) · [Security policy](SECURITY.md)
+
+<table>
+  <tr>
+    <td align="center" width="33%"><b>🔐 Secrets stay out</b><br>Blocks commands that print identity or credentials, and withholds output that holds a secret.</td>
+    <td align="center" width="33%"><b>🧯 Drives stay safe</b><br>Refuses recursive deletes outside the repository and temp folders.</td>
+    <td align="center" width="33%"><b>🪶 Small and local</b><br>Python standard library only. No network, no telemetry, no account.</td>
+  </tr>
+</table>
+
+</div>
+
+---
+
+## Contents
+
+- [Overview](#overview)
+- [Quick start](#quick-start)
+- [What it does](#what-it-does)
+  - [safe-tool](#safe-tool)
+  - [delete-guard](#delete-guard)
+- [What it does not do](#what-it-does-not-do)
+- [Install](#install)
+  - [Claude Code](#claude-code)
+  - [Codex](#codex)
+  - [From a local clone](#from-a-local-clone)
+  - [Already wired by hand?](#already-wired-by-hand)
+- [Verify](#verify)
+- [Settings](#settings)
+  - [Force agents to use RTK (optional)](#force-agents-to-use-rtk-optional)
+- [Troubleshooting](#troubleshooting)
+- [How it works](#how-it-works)
+- [Development](#development)
+- [License](#license)
+
+---
+
+## Overview
 
 Shell-command guardrails for Claude Code and Codex. Two small hooks check every shell command an agent runs:
 
@@ -6,6 +60,22 @@ Shell-command guardrails for Claude Code and Codex. Two small hooks check every 
 - **delete-guard** stops deletes that could wipe a drive. It blocks recursive deletes outside the current repository and temp folders.
 
 Everything runs locally. There is no network access, no telemetry, and no account. The only dependency is `python3` (standard library only), plus `git` for the Git features.
+
+## Quick start
+
+Needs macOS or Linux with `python3` (3.9 or newer) and `git`. Pick your host:
+
+```sh
+# Claude Code
+claude plugin marketplace add abdessalllam/agent-safeguards
+claude plugin install agent-safeguards@abdessalllam
+
+# Codex
+codex plugin marketplace add abdessalllam/agent-safeguards
+codex plugin add agent-safeguards@abdessalllam
+```
+
+Start a new session, then ask the agent to run `whoami >/dev/null 2>&1`. If it comes back blocked, the hooks are live. The [Install](#install) section has details, updating, and the Codex Desktop setting, and [Verify](#verify) has the full probe list.
 
 ## What it does
 
