@@ -138,15 +138,25 @@ PRINTING_COMMANDS = frozenset({"echo", "print", "printf"})
 CREDENTIAL_COMMANDS = frozenset({"bw", "gopass", "keyctl", "pass", "secret-tool"})
 ENVIRONMENT_SERVICE_ACTIONS = frozenset({"dumpstate", "export", "getenv", "print", "print-cache", "print-disabled", "procinfo"})
 STARTUP_NAME_PATTERN = re.compile(STARTUP_NAME, re.IGNORECASE)
-STARTUP_COMMAND_POSITION = r"(?:^|[;&|({\n`]|[\"'])\s*(?:(?:if|then|elif|else|do|while|until|time|!)\s+)*"
+STARTUP_KEYWORDS = r"(?:(?:if|then|elif|else|do|while|until|time|!)[ \t]+)*"
+STARTUP_COMMAND_POSITION = r"(?:^|[;&|({\n`])[ \t]*" + STARTUP_KEYWORDS
+STARTUP_QUOTED_POSITION = r"(?:^|[;&|({\n`]|[\"'])[ \t]*" + STARTUP_KEYWORDS
 SOURCE_STARTUP_PATTERN = re.compile(
-    STARTUP_COMMAND_POSITION
-    + r"(?:source|\.)\s+[\"']?[^\s\"';&|()<>`]*\.(?:"
+    STARTUP_QUOTED_POSITION
+    + r"(?:source|\.)[ \t]+[\"']?[^\s\"';&|()<>`]*\.(?:"
     + STARTUP_RC_NAMES
     + r")(?![A-Za-z0-9_])[^\s\"';&|()<>`]*[\"']?",
     re.IGNORECASE,
 )
-METADATA_STARTUP_PATTERN = re.compile(STARTUP_COMMAND_POSITION + r"(?:ls|stat|test|\[\[?)\s+[^;&|()<>`\n]*", re.IGNORECASE)
+METADATA_STARTUP_PATTERN = re.compile(
+    STARTUP_COMMAND_POSITION + r"(?:rtk[ \t]+(?:proxy[ \t]+)?)?(?:[^\s;&|()<>`]*/)?(?:ls|stat|test|\[\[?)[ \t]+[^;&|()<>`\n]*", re.IGNORECASE
+)
+HAS_KEY_STARTUP_PATTERN = re.compile(
+    STARTUP_COMMAND_POSITION + r"(?:safe-tool|~/\.local/bin/safe-tool|\$\{?HOME\}?/\.local/bin/safe-tool)[ \t]+has-key\b[^;&|()<>`\n]*",
+    re.IGNORECASE,
+)
+# Verbose and trace modes print the lines of a sourced file and the values the shell expands.
+TRACE_OPTION = re.compile(r"-[a-z]*[vx][a-z]*|--(?:verbose|xtrace)")
 STARTUP_KEY_FILES = (".zshrc", ".zshenv", ".zprofile", ".bashrc", ".bash_profile", ".profile")
 KEY_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 KEY_ASSIGNMENT_PATTERN = re.compile(r"[ \t]*(?:(?:export|readonly|declare|typeset)[ \t]+(?:-[A-Za-z]+[ \t]+)*)?([A-Za-z_][A-Za-z0-9_]*)=(.*)")
@@ -160,7 +170,8 @@ PRIVATE_ADDRESS_V4 = re.compile(
 )
 PRIVATE_ADDRESS_V6 = re.compile(
     r"(?<![\w:])(?!2001:0?db8:)(?:fe80|f[cd][0-9a-f]{2}|[23][0-9a-f]{3})"
-    r"(?:(?::[0-9a-f]{1,4}){7}|(?::[0-9a-f]{1,4}){0,6}::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,5})?)(?![\w:])",
+    r"(?:(?::[0-9a-f]{1,4}){7}|(?::[0-9a-f]{1,4}){0,6}::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,5})?"
+    r"|(?::[0-9a-f]{1,4}){5}:\d{1,3}(?:\.\d{1,3}){3}|(?::[0-9a-f]{1,4}){0,4}::(?:[0-9a-f]{1,4}:){0,3}\d{1,3}(?:\.\d{1,3}){3})(?![\w:])",
     re.IGNORECASE,
 )
 EMULATOR_ADDRESS = re.compile(r"(?<![\w.])10\.0\.(?:2\.\d{1,3}|3\.2)(?!\w|\.\d)")
@@ -432,6 +443,10 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
     normalized = [_normalized(word) for word in words]
     if normalized[0] == TOOL_NAME:
         return not _is_self(words[0])
+    if normalized[0] in {"bash", "sh", "zsh"} and any(TRACE_OPTION.fullmatch(argument) for argument in normalized[1:]):
+        return True
+    if normalized[0] == "set" and (any(TRACE_OPTION.fullmatch(argument) for argument in normalized[1:]) or {"verbose", "xtrace"} & set(normalized[1:])):
+        return True
     if normalized[0] == "eval" and len(words) > 1:
         return _sensitive_command(" ".join(words[1:]))
     if normalized[0] in {"bash", "sh", "zsh"}:
@@ -544,7 +559,7 @@ def _reads_startup_file(command: str) -> bool:
         return True
     if STARTUP_FILE_PATTERN.search(command) is None and not _glob_names_startup_file(command):
         return False
-    remainder = SOURCE_STARTUP_PATTERN.sub(" ", command)
+    remainder = HAS_KEY_STARTUP_PATTERN.sub(" ", SOURCE_STARTUP_PATTERN.sub(" ", command))
     if PIPELINE_CONTEXT_PATTERN.search(command) is None:
         remainder = METADATA_STARTUP_PATTERN.sub(" ", remainder)
     return STARTUP_FILE_PATTERN.search(remainder) is not None or _glob_names_startup_file(remainder)
@@ -1188,8 +1203,7 @@ def _commit_messages(arguments: list[str]) -> list[str] | None:
 
 
 def _startup_key_file(requested: str | None) -> str | None:
-    if requested is None:
-        return os.path.join(USER_HOME, ".zshrc")
+    requested = "~/.zshrc" if requested is None else requested
     expanded = USER_HOME + requested[1:] if requested.startswith("~/") else requested
     if not os.path.isabs(expanded) or os.path.realpath(os.path.dirname(expanded)) != USER_HOME or os.path.basename(expanded) not in STARTUP_KEY_FILES:
         return None
@@ -1199,20 +1213,37 @@ def _startup_key_file(requested: str | None) -> str | None:
     return expanded
 
 
-def _keys_set_in(path: str) -> set[str]:
+def _assigned_names(line: str) -> list[str]:
+    try:
+        tokens = shlex.split(line, comments=True)
+    except ValueError:
+        return []
+    keyword = bool(tokens) and tokens[0] in {"export", "readonly", "declare", "typeset"}
+    if keyword:
+        tokens = tokens[1:]
+        while tokens and re.fullmatch(r"-[A-Za-z]+", tokens[0]):
+            tokens = tokens[1:]
+    names = []
+    for token in tokens:
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.+)", token, re.DOTALL)
+        if match:
+            names.append(match.group(1))
+        elif not keyword and "=" not in token:
+            return []
+    return names if keyword or len(names) == len(tokens) else []
+
+
+def _keys_set_in(path: str) -> tuple[set[str], bool]:
     found: set[str] = set()
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
             for number, line in enumerate(handle):
                 if number >= MAX_STARTUP_FILE_LINES:
-                    break
-                match = KEY_ASSIGNMENT_PATTERN.match(line.rstrip("\n"))
-                value = match.group(2).strip() if match else ""
-                if match and value and not value.startswith("#") and value not in {'""', "''"}:
-                    found.add(match.group(1))
+                    return found, False
+                found.update(_assigned_names(line))
     except OSError:
-        return set()
-    return found
+        return set(), True
+    return found, True
 
 
 # A key check prints only the name and pass or fail, never the value, so an agent can learn that a key is set without reading the file.
@@ -1235,8 +1266,8 @@ def _has_key(arguments: list[str]) -> int:
     if not names or len(names) > MAX_KEY_NAMES or path is None:
         sys.stderr.write(message("safe_tool.cli.usage") + "\n")
         return 2
-    found = _keys_set_in(path)
-    sys.stdout.write("".join("%s=%s\n" % (name, "pass" if name in found else "fail") for name in names))
+    found, complete = _keys_set_in(path)
+    sys.stdout.write("".join("%s=%s\n" % (name, "pass" if name in found else ("fail" if complete else "unknown")) for name in names))
     return 0
 
 
