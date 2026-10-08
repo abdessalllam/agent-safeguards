@@ -86,12 +86,16 @@ Before a command runs, safe-tool blocks it if it would print who you are or what
 - has no effect on tokens, but I'd still recommend using it along with a plugin like RTK. They work together great.
 - identity and account commands: `whoami`, `env`, `printenv`, `git config`, `git var GIT_AUTHOR_IDENT`, `gh auth ...`, `aws sts get-caller-identity`, `gcloud auth ...`, `az account ...`, `kubectl config ...`, `security find-identity`, `gpg --list...`, `ssh-add -l`, and any tool's `status`, `doctor`, `whoami`, or `auth` subcommand;
 - secret-bearing flags such as `--token`, `--password`, `--api-key`;
+- commands that print what the shell holds: `alias`, `type`, `whence`, `where`, `functions`, `declare` with `-f` or `-p`, and bare `export`, `readonly` and `set`. An alias or function can carry a host, a key path or a password. `which` and `command -v` still run, and any output that shows an alias or function definition is withheld;
+- reading shell startup and history files: `~/.zshrc`, `~/.zshenv`, `~/.zprofile`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zsh_history`, `~/.bash_history`, the fish config folder and similar, whatever the command (`cat`, `grep`, `sed`, `< file`, `cp`). They hold exported keys, aliases and typed passwords. `source ~/.zshrc` and `. ~/.zshrc` still work to reload one, and `ls`, `stat`, `test` and `wc` still work on them. To ask whether a key is set, use `safe-tool has-key NAME` (below);
 - credential paths such as `~/.ssh/`, `~/.aws/credentials`, `~/.netrc`, `~/.npmrc`, and dotenv files, plus well-known secret file names anywhere (private keys such as `id_rsa` and `id_ed25519`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `kubeconfig`, `credentials.json`, `service-account*.json`, `secrets.yml`, Terraform state and `*.tfvars`, `.pgpass`, `.git-credentials`). Public keys (`*.pub`) and files ending in `.example`, `.sample`, `.template`, or `.dist` are left alone;
 - Git history commands that print author details, unless the last format option is a safe one.
 
 It looks through variable prefixes (`FOO=1 cmd`), shell keywords, and the wrappers `sudo`, `env`, `time`, `nice`, `nohup`, `timeout`, `exec`, `stdbuf`, and `command`, and it checks each line of a multi-line command. A bare `env`, or `env` with only options and variables, prints the environment and is blocked; `env FOO=1 ./build.sh` is fine. It also checks the body of every `$(...)`, backtick and `<(...)` substitution, even inside double quotes.
 
 `rtk proxy <tool>` is allowed only for the text tools `awk`, `cat`, `cmp`, `diff`, `du`, `find`, `git`, `grep`, `head`, `ls`, `nl`, `rg`, `sed`, `sort`, `stat`, `tail`, `uniq`, and `wc`. Tools that reshape text so the output scanner can no longer recognise a secret in it (`tr`, `cut`, `rev`, `fold`, `od`, `base64`) and pagers that can hang an agent (`less`, `more`) stay refused. For any other tool the refusal says to run the command without `rtk proxy`, or as `rtk <tool>`: `rtk proxy python3 build.py` is refused, while `python3 build.py` and `rtk python3 build.py` are fine. Reading a file with `rtk proxy cat` is allowed, but the same protections still apply: credential files such as `.env` or `~/.ssh/` are refused before `cat` runs, and any output that holds a secret-shaped value or a real email address is withheld.
+
+Output that shows a private network address is withheld as well: `10.x`, `172.16` to `172.31`, `192.168`, `169.254` and `100.64/10` addresses, and IPv6 link-local (`fe80`), unique-local (`fc00::/7`) and global (`2000::/3`) addresses. A remote machine reports its own addresses in ordinary output (`ip addr`, `hostname -I`, a dev server's network URL), and they are infrastructure details. The Android emulator's fixed `10.0.2.x` and `10.0.3.2` are not touched. Set `AGENT_SAFEGUARDS_SHOW_ADDRESSES=1` to turn this off.
 
 After a command runs, safe-tool withholds the output if it contains a real email address, a secret-shaped value (private key header, JWT, cloud and forge tokens, `password=` style assignments), or a labeled identity field from an account-style command. The agent sees a placeholder instead of the value.
 
@@ -101,6 +105,7 @@ It also ships a small command surface for the things it blocks:
 safe-tool git identity                        # configured | identity_missing | not_repository
 safe-tool git commit -m "subject" -m "body"   # commits what is staged, prints JSON only
 safe-tool status coderabbit                   # ready | unauthenticated | unavailable
+safe-tool has-key OPENAI_API_KEY GITHUB_TOKEN # OPENAI_API_KEY=pass and GITHUB_TOKEN=fail, never the value
 safe-tool self-test
 ```
 
@@ -224,6 +229,7 @@ Settings are environment variables, read on every call. Set them where the agent
 | `AGENT_SAFEGUARDS_AUTO_EXCLUDE` | `1` adds those names to the repository's local `.git/info/exclude` at session start (Claude Code only). Off by default. |
 | `AGENT_SAFEGUARDS_BLOCK_ATTRIBUTION` | `1` makes `safe-tool git commit` reject `Co-authored-by:` and `Generated-by:` trailers. Off by default. |
 | `AGENT_SAFEGUARDS_FAIL_OPEN` | `1` lets a command through when a hook hits an internal error or `python3` is missing. By default those cases block. |
+| `AGENT_SAFEGUARDS_SHOW_ADDRESSES` | `1` stops safe-tool from withholding output that shows private network addresses. Off by default, so addresses stay hidden. |
 | `AGENT_SAFEGUARDS_LOCALE` | Message catalog from the `locales` folder. Default: `en`. |
 
 ### Force agents to use RTK (optional)

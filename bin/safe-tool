@@ -100,6 +100,53 @@ SAFE_PROXY_COMMANDS = frozenset(
 DIRECT_IDENTITY_COMMANDS = frozenset(
     {"env", "finger", "groups", "logname", "printenv", "users", "whoami"}
 )
+# These shell builtins print what the shell holds (alias and function bodies, every variable), and an alias can carry
+# a host, a key path or a password. Their printing forms are refused; `which` and `command -v` stay allowed because
+# agents use them to look for a tool, and their output is checked for alias and function definitions instead.
+DEFINITION_PRINTERS = frozenset({"alias", "declare", "export", "functions", "local", "readonly", "set", "type", "typeset", "whence", "where"})
+DEFINITION_OUTPUT_PATTERN = re.compile(
+    r"alias [^\s=]*="
+    r"| is an alias for "
+    r"| is aliased to "
+    r"|: aliased to "
+    r"| is a shell function\b"
+    r"|(?m:^[ \t]*\S+ \(\) ?\{?[ \t]*$)"
+)
+# zsh and bash also expose these tables as parameters, so reading one prints the same definitions.
+DEFINITION_PARAMETER_PATTERN = re.compile(r"\$\{?[(@~^=%#a-z)]*(?:aliases|galiases|saliases|functions|dis_aliases|dis_functions|bash_aliases)\b")
+SHELL_COMMAND_OPTION = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
+# Startup files hold exported keys and aliases, and history files hold whatever was typed, so none of them is read.
+# Reloading one with source and asking only for metadata stay possible; the key check is `safe-tool has-key`.
+STARTUP_RC_NAMES = r"zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|kshrc|cshrc|tcshrc"
+STARTUP_HISTORY_NAMES = r"zsh_history|bash_history|sh_history|history|python_history|psql_history|mysql_history|sqlite_history|node_repl_history"
+STARTUP_NAME = r"\.(?:" + STARTUP_RC_NAMES + "|" + STARTUP_HISTORY_NAMES + r")(?![A-Za-z0-9_])|\.config/fish/"
+STARTUP_FILE_PATTERN = re.compile(r"(?:^|[\s\"'=:(<>|;&/~{`])(?:" + STARTUP_NAME + ")")
+STARTUP_NAME_PATTERN = re.compile(STARTUP_NAME, re.IGNORECASE)
+STARTUP_COMMAND_POSITION = r"(?:^|[;&|({\n`]|[\"'])\s*(?:(?:if|then|elif|else|do|while|until|time|!)\s+)*"
+SOURCE_STARTUP_PATTERN = re.compile(
+    STARTUP_COMMAND_POSITION
+    + r"(?:source|\.)\s+[\"']?[^\s\"';&|()<>`]*\.(?:"
+    + STARTUP_RC_NAMES
+    + r")(?![A-Za-z0-9_])[^\s\"';&|()<>`]*[\"']?"
+)
+METADATA_STARTUP_PATTERN = re.compile(STARTUP_COMMAND_POSITION + r"(?:ls|stat|test|\[\[?|wc)\s+[^;&|()<>`\n]*")
+STARTUP_KEY_FILES = (".zshrc", ".zshenv", ".zprofile", ".bashrc", ".bash_profile", ".profile")
+KEY_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+KEY_ASSIGNMENT_PATTERN = re.compile(r"[ \t]*(?:(?:export|readonly|declare|typeset)[ \t]+(?:-[A-Za-z]+[ \t]+)*)?([A-Za-z_][A-Za-z0-9_]*)=(.*)")
+MAX_KEY_NAMES = 50
+MAX_STARTUP_FILE_LINES = 20000
+# A remote machine's own addresses are infrastructure details, and they reach the transcript through ordinary output
+# (ip addr, hostname -I, a dev server's network URL). The Android emulator's fixed addresses are not about any machine.
+PRIVATE_ADDRESS_V4 = re.compile(
+    r"(?<![\w.])(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}"
+    r"|169\.254(?:\.\d{1,3}){2}|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2})(?!\w|\.\d)"
+)
+PRIVATE_ADDRESS_V6 = re.compile(
+    r"(?<![\w:])(?!2001:0?db8:)(?:fe80|f[cd][0-9a-f]{2}|[23][0-9a-f]{3})"
+    r"(?:(?::[0-9a-f]{1,4}){7}|(?::[0-9a-f]{1,4}){0,6}::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,5})?)(?![\w:])",
+    re.IGNORECASE,
+)
+EMULATOR_ADDRESS = re.compile(r"(?<![\w.])10\.0\.(?:2\.\d{1,3}|3\.2)(?!\w|\.\d)")
 SENSITIVE_FLAGS = frozenset(
     {
         "--api-key",
@@ -340,6 +387,22 @@ def _without_global_options(executable: str, arguments: list[str]) -> list[str]:
     return arguments[index:]
 
 
+def _prints_definitions(command: str, arguments: list[str]) -> bool:
+    flags = "".join(argument[1:] for argument in arguments if argument.startswith(("-", "+")) and not argument.startswith(("--", "++")))
+    operands = [argument for argument in arguments if not argument.startswith(("-", "+"))]
+    if command in {"functions", "whence", "where"}:
+        return True
+    if command == "type":
+        return "t" not in flags
+    if command == "alias":
+        return not operands or any("=" not in operand for operand in operands)
+    if command in {"declare", "local", "typeset"}:
+        return not operands or any(flag in flags for flag in "fFp") or any("=" not in operand for operand in operands)
+    if command in {"export", "readonly"}:
+        return not operands or "p" in flags
+    return command == "set" and not arguments
+
+
 def _sensitive_chunk(raw_words: list[str]) -> bool:
     if all(ASSIGNMENT.fullmatch(word) or word in SHELL_KEYWORDS for word in raw_words):
         return False
@@ -354,11 +417,14 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
         return not _is_self(words[0])
     if normalized[0] in {"bash", "sh", "zsh"}:
         for index, argument in enumerate(words[:-1]):
-            if argument in {"-c", "-lc"}:
+            if SHELL_COMMAND_OPTION.fullmatch(argument):
                 return _sensitive_command(words[index + 1])
     if used_proxy and normalized[0] not in SAFE_PROXY_COMMANDS:
         return True
     if normalized[0] in DIRECT_IDENTITY_COMMANDS:
+        return True
+    printer = normalized[1:] if normalized[0] == "builtin" and len(normalized) > 1 else normalized
+    if printer[0] in DEFINITION_PRINTERS and _prints_definitions(printer[0], printer[1:]):
         return True
     if any(word.split("=", 1)[0] in SENSITIVE_FLAGS for word in normalized):
         return True
@@ -400,11 +466,24 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
     return False
 
 
+def _reads_startup_file(command: str) -> bool:
+    lowered = command.lower()
+    if STARTUP_FILE_PATTERN.search(lowered) is None:
+        return False
+    remainder = METADATA_STARTUP_PATTERN.sub(" ", SOURCE_STARTUP_PATTERN.sub(" ", lowered))
+    return STARTUP_FILE_PATTERN.search(remainder) is not None
+
+
 def _sensitive_command(command: str) -> bool:
     if len(command) > MAX_COMMAND_CHARS:
         return True
     lowered = command.lower()
-    if SENSITIVE_PATH_PATTERN.search(lowered) or SENSITIVE_FILE_PATTERN.search(lowered):
+    if (
+        DEFINITION_PARAMETER_PATTERN.search(lowered)
+        or SENSITIVE_PATH_PATTERN.search(lowered)
+        or SENSITIVE_FILE_PATTERN.search(lowered)
+        or _reads_startup_file(command)
+    ):
         return True
     if re.search(r"(?<![\w.-])\.env(?!\.(?:dist|example|sample|template)\b)(?:\b|$)", lowered):
         return True
@@ -412,6 +491,12 @@ def _sensitive_command(command: str) -> bool:
     if not chunks or any(_sensitive_chunk(chunk) for chunk in chunks):
         return True
     return any(_sensitive_command(body) for body in command_substitutions(command) if body.strip())
+
+
+# The same holds for a startup file: the agent needs the two safe alternatives, not the generic refusal.
+def _blocked_only_by_startup_file(command: str) -> bool:
+    neutral = STARTUP_NAME_PATTERN.sub(".neutral", command)
+    return neutral != command and not _sensitive_command(neutral)
 
 
 # When the proxy prefix is the only problem the agent needs the one-line fix, not the generic refusal.
@@ -473,6 +558,13 @@ def _response_values(value: Any) -> str:
     return ""
 
 
+def _shows_private_address(text: str) -> bool:
+    if env_flag("AGENT_SAFEGUARDS_SHOW_ADDRESSES"):
+        return False
+    stripped = EMULATOR_ADDRESS.sub(" ", text)
+    return PRIVATE_ADDRESS_V4.search(stripped) is not None or PRIVATE_ADDRESS_V6.search(stripped) is not None
+
+
 def _sensitive_output(command: str, response: Any) -> bool:
     text = _response_text(response)
     if contains_secret(_response_values(response)):
@@ -486,7 +578,13 @@ def _sensitive_output(command: str, response: Any) -> bool:
         for token in chunk
     )
     labeled_non_email_identity = NON_EMAIL_IDENTITY_FIELD_PATTERN.search(text) is not None
-    return private_email or (identity_context and labeled_non_email_identity)
+    values = _response_values(response)
+    return (
+        private_email
+        or (identity_context and labeled_non_email_identity)
+        or DEFINITION_OUTPUT_PATTERN.search(values) is not None
+        or _shows_private_address(values)
+    )
 
 
 def _withheld_shape(value: Any, *, root: bool = True) -> Any:
@@ -548,7 +646,10 @@ def _handle_event(runtime: str, event: str, payload: dict[str, Any]) -> None:
         return
     if event == "PreToolUse":
         if _sensitive_command(command):
-            _deny_hook("safe_tool.deny.proxy" if _blocked_only_by_proxy(command) else "safe_tool.deny.sensitive")
+            if _blocked_only_by_proxy(command):
+                _deny_hook("safe_tool.deny.proxy")
+            else:
+                _deny_hook("safe_tool.deny.startup_file" if _blocked_only_by_startup_file(command) else "safe_tool.deny.sensitive")
         elif _require_rtk() and _rtk_required(command):
             _deny_hook("safe_tool.deny.rtk")
         elif runtime == "claude" and _requires_local_artifact_approval(command, payload.get("cwd")):
@@ -1009,6 +1110,59 @@ def _commit_messages(arguments: list[str]) -> list[str] | None:
     return messages or None
 
 
+def _startup_key_file(requested: str | None) -> str | None:
+    if requested is None:
+        return os.path.join(USER_HOME, ".zshrc")
+    expanded = USER_HOME + requested[1:] if requested.startswith("~/") else requested
+    if not os.path.isabs(expanded) or os.path.realpath(os.path.dirname(expanded)) != USER_HOME or os.path.basename(expanded) not in STARTUP_KEY_FILES:
+        return None
+    # A dotfile manager may link the file elsewhere in the home folder, but not out of it.
+    if os.path.lexists(expanded) and not (os.path.realpath(expanded) + os.sep).startswith(USER_HOME + os.sep):
+        return None
+    return expanded
+
+
+def _keys_set_in(path: str) -> set[str]:
+    found: set[str] = set()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for number, line in enumerate(handle):
+                if number >= MAX_STARTUP_FILE_LINES:
+                    break
+                match = KEY_ASSIGNMENT_PATTERN.match(line.rstrip("\n"))
+                value = match.group(2).strip() if match else ""
+                if match and value and not value.startswith("#") and value not in {'""', "''"}:
+                    found.add(match.group(1))
+    except OSError:
+        return set()
+    return found
+
+
+# A key check prints only the name and pass or fail, never the value, so an agent can learn that a key is set without reading the file.
+def _has_key(arguments: list[str]) -> int:
+    names: list[str] = []
+    requested = None
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--file" and requested is None and index + 1 < len(arguments):
+            requested = arguments[index + 1]
+            index += 2
+        elif KEY_NAME_PATTERN.fullmatch(argument):
+            names.append(argument)
+            index += 1
+        else:
+            names = []
+            break
+    path = _startup_key_file(requested)
+    if not names or len(names) > MAX_KEY_NAMES or path is None:
+        sys.stderr.write(message("safe_tool.cli.usage") + "\n")
+        return 2
+    found = _keys_set_in(path)
+    sys.stdout.write("".join("%s=%s\n" % (name, "pass" if name in found else "fail") for name in names))
+    return 0
+
+
 # The command line is parsed by hand so every printed word comes from the message catalog.
 def main() -> int:
     arguments = sys.argv[1:]
@@ -1026,6 +1180,8 @@ def main() -> int:
         return _coderabbit_status()
     if arguments == ["status", "rtk"]:
         return _rtk_status()
+    if arguments[:1] == ["has-key"]:
+        return _has_key(arguments[1:])
     if arguments == ["git", "identity"]:
         return _git_identity()
     if arguments[:2] == ["git", "commit"]:
