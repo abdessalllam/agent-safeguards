@@ -8,6 +8,7 @@ Agent Safeguards is a defense-in-depth layer for shell commands run by coding ag
 
 These are design limits, not bugs. Please do not report them as vulnerabilities, but do help improve them.
 
+- Output scanning catches accidental leaks, not deliberate evasion. A command that re-encodes or splits a secret (`base64`, `rev`, `tr`, `cut`, character-by-character output) hides it from the scanner, and a bare 40-character hex string with no label is not flagged because it looks like a Git hash. The scanner prefers false positives, so ordinary output is sometimes withheld too, and output it cannot finish checking within 3 seconds (the hook is killed at 5, which would let the output through) or that exceeds 1 MiB is withheld as well.
 - Only the shell tool is checked. File-read, file-write, and network tools are outside this plugin.
 - Command parsing is heuristic. Indirection the parser cannot see (obfuscated strings, generated scripts, here-document bodies run by a shell, inline shell in `xargs` or `find -exec`, tools that wrap other tools) can get past it.
 - A hook that times out or is killed by the host does not block the command.

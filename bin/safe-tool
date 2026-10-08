@@ -43,6 +43,7 @@ from agent_safeguards.common import (  # noqa: E402
     normalize_command,
     strip_wrappers,
 )
+from agent_safeguards.secret_scan import contains_secret  # noqa: E402
 
 # These immutable contracts stay at module scope so hooks and commands share one policy.
 TOOL_NAME = "safe-tool"
@@ -56,29 +57,15 @@ GIT_TIMEOUT_SECONDS = 300
 RTK_REWRITE_TIMEOUT_SECONDS = 2
 OBJECT_ID_PATTERN = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 ATTRIBUTION_PATTERN = re.compile(r"(?im)^\s*(?:co-authored-by|generated-by)\s*:")
-EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
+EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]{1,64}@([A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,})\b")
 NON_EMAIL_IDENTITY_FIELD_PATTERN = re.compile(
     r"(?i)(?:user(?:name)?|display[_ -]?name|name|account(?:[_ -]?id)?|"
     r"org(?:anization)?|tenant(?:[_ -]?id)?)\s*[\"']?\s*[:=]\s*[\"']?[^\s,}\]]+"
-)
-PRIVATE_URL_PATTERN = re.compile(
-    r"(?i)https?://(?:[^\s/:@]+:[^\s/@]+@|[^\s#]*[?&](?:[a-z0-9.-]*_)?(?:token|key|secret|password|passwd|apikey)=)"
 )
 HOOK_EVENTS = frozenset({"PreToolUse", "PostToolUse", "SessionStart"})
 PROXY_PREFIX = re.compile(r"\brtk\s+proxy\b")
 EVENT_PATTERN = re.compile(rb'"hook_event_name"\s*:\s*"(PreToolUse|PostToolUse|SessionStart)"')
 EVENT_SEARCH_BYTES = 64 * 1024
-SECRET_PATTERNS = (
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b"),
-    re.compile(r"\b(?:AKIA[0-9A-Z]{16}|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,})\b"),
-    re.compile(r"\b(?:glpat-|npm_|pypi-AgEIcHlwaS5vcmc)[A-Za-z0-9_-]{12,}\b"),
-    re.compile(r"\b(?:sk-(?:ant-|proj-)?|xox[baprs]-|sk_live_|rk_live_)[A-Za-z0-9_-]{12,}\b"),
-    re.compile(
-        r"(?i)\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|"
-        r"private[_-]?key)\b\s*[:=]\s*[\"']?[A-Za-z0-9_+/=-]{12,}"
-    ),
-)
 RESERVED_EMAIL_DOMAINS = frozenset(
     {"example.com", "example.net", "example.org", "example.test", "localhost"}
 )
@@ -108,7 +95,7 @@ CLI_GLOBAL_VALUE_OPTIONS = {
     ),
 }
 SAFE_PROXY_COMMANDS = frozenset(
-    {"awk", "cat", "cmp", "diff", "du", "find", "git", "grep", "head", "ls", "rg", "sed", "stat", "tail", "wc"}
+    {"awk", "cat", "cmp", "diff", "du", "find", "git", "grep", "head", "ls", "nl", "rg", "sed", "sort", "stat", "tail", "uniq", "wc"}
 )
 DIRECT_IDENTITY_COMMANDS = frozenset(
     {"env", "finger", "groups", "logname", "printenv", "users", "whoami"}
@@ -142,6 +129,17 @@ SENSITIVE_PATH_FRAGMENTS = (
     "/.gitconfig",
 )
 TEMPLATE_SUFFIX = r"(?!\.(?:example|sample|template|dist)(?![A-Za-z0-9_-]))"
+SECRET_FILE_EXEMPT = r"(?!(?:\.[a-z0-9_-]{1,64}){0,8}\.(?:pub|example|sample|template|dist)(?![^\s\"'|;&<>()=:/]))"
+SECRET_FILE_NAME = (
+    r"\.pgpass|\.my\.cnf|\.git-credentials|\.vault-token|\.dev\.vars|\.envrc"
+    r"|id_(?:rsa|dsa|ecdsa|ed25519)(?:_[a-z0-9]+)?"
+    r"|credentials\.json|secrets?\.(?:json|ya?ml|toml)|service[-_]account[^\s\"'|;&<>()=:/]{0,256}\.json|kubeconfig"
+    r"|terraform\.tfstate(?:\.backup)?"
+    r"|[^\s\"'|;&<>()=:/]{0,256}\.(?:pem|key|p12|pfx|jks|keystore|p8|tfstate|tfvars)"
+)
+SENSITIVE_FILE_PATTERN = re.compile(
+    r"(?:^|[\s\"'=:(<>|;&/])(?:" + SECRET_FILE_NAME + r")(?![a-z0-9_-])" + SECRET_FILE_EXEMPT
+)
 SENSITIVE_PATH_PATTERN = re.compile(
     "|".join(
         re.escape(fragment) + ("" if fragment.endswith("/") else TEMPLATE_SUFFIX)
@@ -406,7 +404,7 @@ def _sensitive_command(command: str) -> bool:
     if len(command) > MAX_COMMAND_CHARS:
         return True
     lowered = command.lower()
-    if SENSITIVE_PATH_PATTERN.search(lowered):
+    if SENSITIVE_PATH_PATTERN.search(lowered) or SENSITIVE_FILE_PATTERN.search(lowered):
         return True
     if re.search(r"(?<![\w.-])\.env(?!\.(?:dist|example|sample|template)\b)(?:\b|$)", lowered):
         return True
@@ -464,9 +462,20 @@ def _response_text(value: Any) -> str:
     return ""
 
 
+# The key prefix that _response_text adds would hide a token at the very start of the output, so secrets are scanned without it.
+def _response_values(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return "\n".join(_response_values(child) for child in value.values())
+    if isinstance(value, list):
+        return "\n".join(_response_values(child) for child in value)
+    return ""
+
+
 def _sensitive_output(command: str, response: Any) -> bool:
     text = _response_text(response)
-    if any(pattern.search(text) for pattern in SECRET_PATTERNS) or PRIVATE_URL_PATTERN.search(text):
+    if contains_secret(_response_values(response)):
         return True
     private_email = any(match.group(1).lower() not in RESERVED_EMAIL_DOMAINS for match in EMAIL_PATTERN.finditer(text))
     identity_context = any(

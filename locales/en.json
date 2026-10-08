@@ -24,7 +24,7 @@
   "safe_tool.ask.local_artifact": "Tracking a machine-local agent artifact requires explicit user approval.",
   "safe_tool.cli.usage": "usage: safe-tool hook <claude|codex> | self-test | status coderabbit | status rtk | git identity | git commit -m <message> [-m <message> ...]",
   "safe_tool.deny.internal": "agent-safeguards hit an internal error while checking this command and blocked it. Ask the user to run it outside the agent.",
-  "safe_tool.deny.proxy": "`rtk proxy` is limited to read-only tools (awk, cat, cmp, diff, du, find, git, grep, head, ls, rg, sed, stat, tail, wc). Run the command without `rtk proxy`, or as `rtk <tool>`.",
+  "safe_tool.deny.proxy": "`rtk proxy` is limited to a short list of text tools (awk, cat, cmp, diff, du, find, git, grep, head, ls, nl, rg, sed, sort, stat, tail, uniq, wc). Run the command without `rtk proxy`, or as `rtk <tool>`.",
   "safe_tool.deny.rtk": "RTK is required for this supported shell command. Rerun it through rtk.",
   "safe_tool.deny.sensitive": "Sensitive-output command blocked. Use safe-tool or ask the user to run it outside the agent.",
   "safe_tool.withheld.placeholder": "[withheld: sensitive output]",

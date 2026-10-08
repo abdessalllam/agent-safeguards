@@ -8,6 +8,7 @@ First release.
 - delete-guard: blocks recursive deletes outside the current repository and temp folders, plus disk-erase commands (`mkfs.*`, `newfs_*`, `dd` onto a device). It refuses glob-plus-`..` targets, understands wrapper and `xargs` options, and does not trust a `cd` it cannot follow.
 - Both hooks block on unreadable or oversized input and on internal errors, and the launcher blocks when the tool crashes.
 - When `rtk proxy` is the only reason a command is refused, the refusal now says so and names the fix. Both tools re-run themselves in isolated Python mode when started directly.
+- Output scanning is a single detector (`lib/agent_safeguards/secret_scan.py`) that favours false positives: token shapes for common providers, labelled values (`password`, `secret`, `token`, `api_key`, ...), and unlabelled high-entropy strings. Well-known secret file names are refused before the command runs. `rtk proxy` also allows `nl`, `sort`, and `uniq`.
 - Optional RTK enforcement: the `require_rtk` plugin setting on Claude Code, or `AGENT_SAFEGUARDS_REQUIRE_RTK` on any host, denies commands that `rtk rewrite` would change. `safe-tool status rtk` reports readiness and whether it is on.
 - Plugin for Claude Code and Codex with a fail-closed launcher.
 - Skills `command-guards` and `setup-agent-safeguards`.

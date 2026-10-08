@@ -33,7 +33,7 @@ The message reads `Sensitive-output command blocked. Use safe-tool or ask the us
 | Any tool's `status`, `doctor`, `whoami`, `auth`, `account`, `profile`, `user`, `org`, `credential(s)`, or `identity` subcommand, or `config get/list/show/view/dump/--list` (Git's own `status` is fine) | Check the effect instead: a file exists, a port answers, a build passes. |
 | `env`, `printenv`, `whoami`, `users`, `groups`, `logname`, `finger`, or a flag such as `--token`, `--password`, `--secret`, `--api-key`, `--credential(s)`, `--client-secret`, `--private-key`, `--show-token` | To check that a variable is set without printing it: `[ -n "${NAME+x}" ] && echo present \|\| echo absent`. |
 | A credential path anywhere in the command, even inside a search pattern: `/.ssh/`, `/.gitconfig`, `/.git/config`, `/.git/objects/`, `/.aws/credentials`, `/.netrc`, `/.npmrc`, `/.pypirc`, `/.kube/config`, `/.docker/config.json`, `/.config/gh/hosts.yml`, `/.gnupg/`, or a dotenv file name (the `.example`, `.sample`, `.template`, and `.dist` variants are fine) | Drop the mention. Never open these files. |
-| `rtk proxy <tool>` for a tool outside the read-only set (`awk`, `cat`, `cmp`, `diff`, `du`, `find`, `git`, `grep`, `head`, `ls`, `rg`, `sed`, `stat`, `tail`, `wc`) | Run it plainly or as `rtk <tool>`. |
+| `rtk proxy <tool>` for a tool outside the read-only set (`awk`, `cat`, `cmp`, `diff`, `du`, `find`, `git`, `grep`, `head`, `ls`, `nl`, `rg`, `sed`, `sort`, `stat`, `tail`, `uniq`, `wc`) | Run it plainly or as `rtk <tool>`. |
 | A script named `safe-tool` that is not the installed one | Run `safe-tool` by its bare name. |
 | `bash -c`, `sh -c`, `zsh -c` | The inner string is checked the same way; fix it there. |
 
