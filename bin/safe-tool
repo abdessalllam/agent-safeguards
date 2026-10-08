@@ -545,7 +545,13 @@ def _expand_braces(word: str) -> list[str] | None:
 
 # Globs and braces are expanded against the real folders, the way the shell would, so `cat ~/.z*` is seen for what it reads.
 def _glob_names_startup_file(text: str) -> bool:
-    words = [word for word in re.findall(r"[^\s;&|()<>\"'`]+", text) if any(character in word for character in "*?[{")]
+    # A shell never expands a glob inside quotes, so quoted text (a sed script, a grep pattern) is not looked at; a quoted
+    # home folder in front of an unquoted glob still counts as the home folder. find matches its quoted patterns itself,
+    # so when it runs something on the matches or feeds a pipe, the quoted patterns are looked at too.
+    unquoted = re.sub(r'"\$\{?HOME\}?"', "~", text)
+    if not (re.search(r"\bfind\b", text) and re.search(r"-exec|-ok|\|", text)):
+        unquoted = re.sub(r"'[^']*'|\"[^\"]*\"", " ", unquoted)
+    words = [word for word in re.findall(r"[^\s;&|()<>\"'`]+", unquoted) if any(character in word for character in "*?[{")]
     if len(words) > MAX_GLOB_WORDS:
         return True
     for word in words:
