@@ -105,7 +105,9 @@ DIRECT_IDENTITY_COMMANDS = frozenset(
 # These shell builtins print what the shell holds (alias and function bodies, every variable), and an alias can carry
 # a host, a key path or a password. Their printing forms are refused; `which` and `command -v` stay allowed because
 # agents use them to look for a tool, and their output is checked for alias and function definitions instead.
-DEFINITION_PRINTERS = frozenset({"alias", "declare", "export", "functions", "local", "readonly", "set", "type", "typeset", "whence", "where"})
+DEFINITION_PRINTERS = frozenset(
+    {"alias", "declare", "export", "fc", "functions", "history", "local", "readonly", "set", "type", "typeset", "whence", "where"}
+)
 DEFINITION_OUTPUT_PATTERN = re.compile(
     r"alias [^\s=]*="
     r"| is an alias for "
@@ -119,11 +121,20 @@ DEFINITION_PARAMETER_PATTERN = re.compile(r"\$\{?[(@~^=%#a-z)]*(?:aliases|galias
 SHELL_COMMAND_OPTION = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 # Startup files hold exported keys and aliases, and history files hold whatever was typed, so none of them is read.
 # Reloading one with source and asking only for metadata stay possible; the key check is `safe-tool has-key`.
-STARTUP_RC_NAMES = r"zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|kshrc|cshrc|tcshrc"
-STARTUP_HISTORY_NAMES = r"zsh_history|bash_history|sh_history|history|python_history|psql_history|mysql_history|sqlite_history|node_repl_history"
-STARTUP_NAME = r"\.(?:" + STARTUP_RC_NAMES + "|" + STARTUP_HISTORY_NAMES + r")(?![A-Za-z0-9_])|\.config/fish/"
+STARTUP_RC_NAMES = r"zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|login|logout|kshrc|cshrc|tcshrc"
+STARTUP_HISTORY_NAMES = (
+    r"zsh_history|bash_history|sh_history|history|zhistory|python_history|psql_history|mysql_history|sqlite_history|node_repl_history"
+    r"|irb_history|rediscli_history|dbshell|viminfo|lesshst"
+)
+STARTUP_FOLDERS = r"zsh|zprezto/runcoms|oh-my-zsh/custom|config/(?:fish|zsh|bash)"
+STARTUP_HISTORY_FOLDERS = r"zsh_sessions|bash_sessions|local/share/fish"
+STARTUP_SYSTEM_FILES = (
+    r"/etc/(?:zshrc|zprofile|zshenv|zlogin|zlogout|profile|bashrc|bash\.bashrc|environment)(?![A-Za-z0-9_])|/etc/(?:zsh|bash|profile\.d)/"
+)
+# Only these may be sourced: a history file is never a script to run.
+STARTUP_SOURCEABLE = r"\.(?:" + STARTUP_RC_NAMES + r")(?![A-Za-z0-9_])|\.(?:" + STARTUP_FOLDERS + ")/|" + STARTUP_SYSTEM_FILES
+STARTUP_NAME = STARTUP_SOURCEABLE + r"|\.(?:" + STARTUP_HISTORY_NAMES + r")(?![A-Za-z0-9_])|\.(?:" + STARTUP_HISTORY_FOLDERS + ")/"
 STARTUP_FILE_PATTERN = re.compile(r"(?:^|[\s\"'=:(<>|;&/~{`])(?:" + STARTUP_NAME + ")", re.IGNORECASE)
-STARTUP_BASENAME_PATTERN = re.compile(r"\.(?:" + STARTUP_RC_NAMES + "|" + STARTUP_HISTORY_NAMES + r")(?![A-Za-z0-9_])", re.IGNORECASE)
 # Metadata checks stay allowed only on their own: a pipe, loop or substitution could feed the path to a command that reads it.
 PIPELINE_CONTEXT_PATTERN = re.compile(r"(?<!\|)\|(?!\|)|`|\$\(|[<>]\(|\b(?:xargs|while|for|eval|exec|parallel)\b|-exec|-ok\b")
 HISTORY_VARIABLE_PATTERN = re.compile(r"\$\{?histfile\b", re.IGNORECASE)
@@ -143,9 +154,9 @@ STARTUP_COMMAND_POSITION = r"(?:^|[;&|({\n`])[ \t]*" + STARTUP_KEYWORDS
 STARTUP_QUOTED_POSITION = r"(?:^|[;&|({\n`]|[\"'])[ \t]*" + STARTUP_KEYWORDS
 SOURCE_STARTUP_PATTERN = re.compile(
     STARTUP_QUOTED_POSITION
-    + r"(?:source|\.)[ \t]+[\"']?[^\s\"';&|()<>`]*\.(?:"
-    + STARTUP_RC_NAMES
-    + r")(?![A-Za-z0-9_])[^\s\"';&|()<>`]*[\"']?",
+    + r"(?:source|\.)[ \t]+[\"']?[^\s\"';&|()<>`]*(?:"
+    + STARTUP_SOURCEABLE
+    + r")[^\s\"';&|()<>`]*[\"']?",
     re.IGNORECASE,
 )
 METADATA_STARTUP_PATTERN = re.compile(
@@ -418,7 +429,7 @@ def _without_global_options(executable: str, arguments: list[str]) -> list[str]:
 def _prints_definitions(command: str, arguments: list[str]) -> bool:
     flags = "".join(argument[1:] for argument in arguments if argument.startswith(("-", "+")) and not argument.startswith(("--", "++")))
     operands = [argument for argument in arguments if not argument.startswith(("-", "+"))]
-    if command in {"functions", "whence", "where"}:
+    if command in {"fc", "functions", "history", "whence", "where"}:
         return True
     if command == "type":
         return "t" not in flags
@@ -511,7 +522,7 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
         return True
     if first == "status" and executable != "git":
         return True
-    if first in GENERIC_PRIVATE_SUBCOMMANDS and (not second or second in GENERIC_PRIVATE_ACTIONS):
+    if executable not in {"source", "."} and first in GENERIC_PRIVATE_SUBCOMMANDS and (not second or second in GENERIC_PRIVATE_ACTIONS):
         return True
     if first == "config" and any(argument in GENERIC_PRIVATE_ACTIONS or argument in {"--list", "-l", "dump", "view"} for argument in arguments[1:]):
         return True
@@ -549,7 +560,8 @@ def _glob_names_startup_file(text: str) -> bool:
                 patterns = [expanded] if os.path.isabs(expanded) else [expanded, os.path.join(USER_HOME, expanded)]
                 candidates = [match for pattern in patterns for match in itertools.islice(glob.iglob(pattern), MAX_GLOB_MATCHES)]
             for candidate in candidates:
-                if STARTUP_BASENAME_PATTERN.match(os.path.basename(candidate)) or "/.config/fish/" in candidate.lower():
+                shown = candidate + "/" if os.path.isdir(candidate) else candidate
+                if STARTUP_FILE_PATTERN.search(shown):
                     return True
     return False
 
