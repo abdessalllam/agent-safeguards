@@ -13,5 +13,6 @@ First release.
 - Plugin for Claude Code and Codex with a fail-closed launcher.
 - Skills `command-guards` and `setup-agent-safeguards`.
 - Optional Codex rule files under `extras/codex-rules/`.
+- Optional simulator screenshot extras for Claude Code on macOS under `extras/simulator-screenshots/`: `sim-shot` saves a shrunk simulator screenshot as a new file and prints its path, and a hook holds the simulator control tool's crashing `screenshot` action for the user.
 - Message catalog in `locales/en.json`.
 - Settings through `AGENT_SAFEGUARDS_*` environment variables.

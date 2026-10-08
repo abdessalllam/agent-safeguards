@@ -28,5 +28,18 @@
   "safe_tool.deny.rtk": "RTK is required for this supported shell command. Rerun it through rtk.",
   "safe_tool.deny.sensitive": "Sensitive-output command blocked. Use safe-tool or ask the user to run it outside the agent.",
   "safe_tool.withheld.placeholder": "[withheld: sensitive output]",
-  "safe_tool.withheld.reason": "Sensitive command output was withheld. Use safe-tool or ask the user to run the command outside the agent."
+  "safe_tool.withheld.reason": "Sensitive command output was withheld. Use safe-tool or ask the user to run the command outside the agent.",
+  "sim_shot.error.capture": "simctl could not capture ({reason}). {hint}",
+  "sim_shot.error.exists": "refusing to overwrite an existing file: {path}",
+  "sim_shot.error.no_folder": "folder does not exist: {path}",
+  "sim_shot.error.no_tools": "xcrun and sips are needed, so this runs on macOS with the Xcode command line tools",
+  "sim_shot.error.not_png": "the output path must end in .png",
+  "sim_shot.error.not_writable": "cannot create the output file: {path}",
+  "sim_shot.error.range": "--max-side must be between {low} and {high}",
+  "sim_shot.error.shrink": "sips could not shrink the capture. {hint}",
+  "sim_shot.error.size": "the shrunk capture is missing or still too large, so it was removed",
+  "sim_shot.error.timeout": "simctl did not answer in {seconds} seconds. {hint}",
+  "sim_shot.hint": "Run `xcrun simctl list devices booted` to see what is running. If the capture is refused, skip the screenshot.",
+  "sim_shot.usage": "sim-shot [--device <name|udid>] [--max-side <pixels>] [new-file.png]",
+  "simulator_hook.reason": "The simulator control tool's screenshot returns an image the API rejects, and one such image breaks this chat for good. Approve only if you, the user, want to run it anyway. Agents: do not retry. Run `sim-shot` (optionally with a new .png path in a temp or scratchpad folder), then read the path it prints with the image reader. If sim-shot fails, skip the screenshot."
 }
