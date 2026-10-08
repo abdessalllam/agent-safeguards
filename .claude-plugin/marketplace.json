@@ -1,0 +1,15 @@
+{
+  "name": "abdessalllam",
+  "description": "Shell-command guardrails for Claude Code and Codex.",
+  "owner": {
+    "name": "abdessalllam",
+    "url": "https://github.com/abdessalllam"
+  },
+  "plugins": [
+    {
+      "name": "agent-safeguards",
+      "source": "./",
+      "description": "Keeps identity and credential output out of the transcript and blocks deletes that could wipe a drive."
+    }
+  ]
+}

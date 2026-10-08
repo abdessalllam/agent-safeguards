@@ -1,0 +1,27 @@
+prefix_rule(
+    pattern = ["git", "config"],
+    decision = "forbidden",
+    justification = "Git config can print identity and credential helpers. Use `safe-tool git identity` to check that an identity exists.",
+    match = ["git config --get user.email", "git config --list"],
+)
+
+prefix_rule(
+    pattern = ["git", "var", ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"]],
+    decision = "forbidden",
+    justification = "Use `safe-tool git identity`, which returns configured or identity_missing only.",
+    match = ["git var GIT_AUTHOR_IDENT", "git var GIT_COMMITTER_IDENT"],
+)
+
+prefix_rule(
+    pattern = ["security", "find-identity"],
+    decision = "forbidden",
+    justification = "Signing identities are private; inspect them outside the agent when required.",
+    match = ["security find-identity -v -p codesigning"],
+)
+
+prefix_rule(
+    pattern = [["env", "printenv", "whoami", "logname"]],
+    decision = "forbidden",
+    justification = "These print the environment or the account name. To check that a variable is set without printing it, test it in the shell.",
+    match = ["env", "printenv", "whoami", "logname"],
+)

@@ -1,0 +1,41 @@
+prefix_rule(
+    pattern = [["rm", "/bin/rm"], ["-r", "-R", "-rf", "-fr", "-Rf", "-fR", "-rF", "-Fr", "-RF", "-FR", "-rv", "-rfv", "-rvf", "-vrf", "-fvr", "-frv", "-vfr", "-dr", "-rd", "--recursive", "--dir"]],
+    decision = "forbidden",
+    justification = "Recursive rm is blocked. Remove a worktree with `git worktree remove <path>`; move anything else to the Trash with `trash <path>` (recoverable). Resolve variables first and pass the literal path.",
+    match = ["rm -rf build", "rm -r old", "/bin/rm -Rf x", "rm --recursive x"],
+)
+
+prefix_rule(
+    pattern = [["rm", "/bin/rm"], ["-f", "-v", "-i", "-I", "-d"], ["-r", "-R", "--recursive"]],
+    decision = "forbidden",
+    justification = "Recursive or forced multi-flag rm is blocked. Use `trash <path>` or `git worktree remove <path>`.",
+    match = ["rm -f -r build", "rm -v -R x"],
+)
+
+prefix_rule(
+    pattern = ["xargs", ["rm", "/bin/rm", "unlink", "trash"]],
+    decision = "forbidden",
+    justification = "`xargs rm` deletes paths nobody checked. List the paths, then `trash` each literal path.",
+    match = ["xargs rm -f", "xargs trash"],
+)
+
+prefix_rule(
+    pattern = ["git", "clean"],
+    decision = "forbidden",
+    justification = "`git clean` deletes untracked files, and with -x every ignored file. Run `git status --short` and `trash` the exact paths instead.",
+    match = ["git clean -fdx", "git clean -fd"],
+)
+
+prefix_rule(
+    pattern = ["diskutil", ["eraseDisk", "eraseVolume", "zeroDisk", "secureErase", "partitionDisk", "reformat"]],
+    decision = "forbidden",
+    justification = "Disk erase and repartition commands are never run by an agent.",
+    match = ["diskutil eraseDisk APFS X disk4"],
+)
+
+prefix_rule(
+    pattern = ["diskutil", "apfs", ["deleteVolume", "deleteContainer", "eraseVolume"]],
+    decision = "forbidden",
+    justification = "APFS volume and container deletes are never run by an agent.",
+    match = ["diskutil apfs deleteVolume disk3s5"],
+)

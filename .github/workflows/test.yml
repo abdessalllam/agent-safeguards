@@ -1,0 +1,30 @@
+name: self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Manifests and catalog are valid JSON
+        run: |
+          for file in .claude-plugin/*.json .codex-plugin/plugin.json .agents/plugins/marketplace.json hosts/*/hooks.json locales/*.json; do
+            python3 -m json.tool "$file" > /dev/null
+          done
+      - name: Launcher syntax
+        run: sh -n scripts/hook.sh
+      - name: Self-tests
+        run: |
+          python3 -I bin/safe-tool self-test
+          python3 -I bin/delete-guard self-test

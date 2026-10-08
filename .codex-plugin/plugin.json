@@ -1,0 +1,32 @@
+{
+  "name": "agent-safeguards",
+  "version": "0.1.0",
+  "description": "Shell-command guardrails for Claude Code and Codex: keeps identity and credential output out of the transcript and blocks deletes that could wipe a drive.",
+  "author": {
+    "name": "abdessalllam",
+    "url": "https://github.com/abdessalllam"
+  },
+  "homepage": "https://github.com/abdessalllam/agent-safeguards",
+  "repository": "https://github.com/abdessalllam/agent-safeguards",
+  "license": "MIT",
+  "keywords": [
+    "safety",
+    "hooks",
+    "guardrails",
+    "privacy",
+    "shell"
+  ],
+  "hooks": "./hosts/codex/hooks.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Safeguards",
+    "shortDescription": "Shell guardrails for identity output and destructive deletes",
+    "longDescription": "Checks every shell command before it runs and its output after. safe-tool blocks commands that print identity or credential data and withholds output that contains it. delete-guard blocks recursive deletes outside the current repository and temp folders. Local, no network, no telemetry.",
+    "developerName": "abdessalllam",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read"
+    ],
+    "websiteURL": "https://github.com/abdessalllam/agent-safeguards"
+  }
+}

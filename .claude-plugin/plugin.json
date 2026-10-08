@@ -1,0 +1,29 @@
+{
+  "name": "agent-safeguards",
+  "displayName": "Agent Safeguards",
+  "version": "0.1.0",
+  "description": "Shell-command guardrails for Claude Code and Codex: keeps identity and credential output out of the transcript and blocks deletes that could wipe a drive.",
+  "author": {
+    "name": "abdessalllam",
+    "url": "https://github.com/abdessalllam"
+  },
+  "homepage": "https://github.com/abdessalllam/agent-safeguards",
+  "repository": "https://github.com/abdessalllam/agent-safeguards",
+  "license": "MIT",
+  "keywords": [
+    "safety",
+    "hooks",
+    "guardrails",
+    "privacy",
+    "shell"
+  ],
+  "hooks": "./hosts/claude/hooks.json",
+  "userConfig": {
+    "require_rtk": {
+      "type": "boolean",
+      "title": "Require RTK",
+      "description": "Block shell commands that the rtk CLI would rewrite, so the agent reruns them through rtk. Needs rtk installed.",
+      "default": false
+    }
+  }
+}

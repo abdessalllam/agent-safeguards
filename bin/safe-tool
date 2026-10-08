@@ -1,0 +1,1026 @@
+#!/usr/bin/env python3
+"""Expose narrow tool operations without exposing identity-bearing output."""
+
+from __future__ import annotations
+
+import sys
+
+# Run again in isolated mode before any other import, so PYTHON* variables and user site packages cannot shadow the library.
+if __name__ == "__main__" and not sys.flags.isolated and sys.executable:
+    import posix
+
+    posix.execv(sys.executable, [sys.executable, "-I", *sys.argv])
+
+import fcntl
+import json
+import os
+import re
+import shlex
+import stat
+import subprocess
+from dataclasses import dataclass
+from typing import Any
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+
+from agent_safeguards.common import (  # noqa: E402
+    ASSIGNMENT,
+    GIT_VALUE_OPTIONS,
+    MAX_COMMAND_CHARS,
+    REDIRECTION_MARKER,
+    SHELL_KEYWORDS,
+    TRUSTED_PATH,
+    USER_HOME,
+    UnresolvableCommand,
+    command_substitutions,
+    emit,
+    emit_decision,
+    env_flag,
+    env_list,
+    fail_open,
+    find_executable,
+    message,
+    normalize_command,
+    strip_wrappers,
+)
+
+# These immutable contracts stay at module scope so hooks and commands share one policy.
+TOOL_NAME = "safe-tool"
+SELF_PATH = os.path.realpath(__file__)
+GIT_PATH = find_executable("git")
+RTK_PATH = find_executable("rtk")
+CODERABBIT_PATH = find_executable("coderabbit")
+MAX_OUTPUT_BYTES = 1024 * 1024
+STATUS_TIMEOUT_SECONDS = 20
+GIT_TIMEOUT_SECONDS = 300
+RTK_REWRITE_TIMEOUT_SECONDS = 2
+OBJECT_ID_PATTERN = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+ATTRIBUTION_PATTERN = re.compile(r"(?im)^\s*(?:co-authored-by|generated-by)\s*:")
+EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
+NON_EMAIL_IDENTITY_FIELD_PATTERN = re.compile(
+    r"(?i)(?:user(?:name)?|display[_ -]?name|name|account(?:[_ -]?id)?|"
+    r"org(?:anization)?|tenant(?:[_ -]?id)?)\s*[\"']?\s*[:=]\s*[\"']?[^\s,}\]]+"
+)
+PRIVATE_URL_PATTERN = re.compile(
+    r"(?i)https?://(?:[^\s/:@]+:[^\s/@]+@|[^\s#]*[?&](?:[a-z0-9.-]*_)?(?:token|key|secret|password|passwd|apikey)=)"
+)
+HOOK_EVENTS = frozenset({"PreToolUse", "PostToolUse", "SessionStart"})
+PROXY_PREFIX = re.compile(r"\brtk\s+proxy\b")
+EVENT_PATTERN = re.compile(rb'"hook_event_name"\s*:\s*"(PreToolUse|PostToolUse|SessionStart)"')
+EVENT_SEARCH_BYTES = 64 * 1024
+SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b"),
+    re.compile(r"\b(?:AKIA[0-9A-Z]{16}|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,})\b"),
+    re.compile(r"\b(?:glpat-|npm_|pypi-AgEIcHlwaS5vcmc)[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\b(?:sk-(?:ant-|proj-)?|xox[baprs]-|sk_live_|rk_live_)[A-Za-z0-9_-]{12,}\b"),
+    re.compile(
+        r"(?i)\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|"
+        r"private[_-]?key)\b\s*[:=]\s*[\"']?[A-Za-z0-9_+/=-]{12,}"
+    ),
+)
+RESERVED_EMAIL_DOMAINS = frozenset(
+    {"example.com", "example.net", "example.org", "example.test", "localhost"}
+)
+SHELL_PUNCTUATION = frozenset(";&|()\n")
+# Options that take a value before the subcommand of these tools, so the value is not mistaken for the subcommand.
+CLI_GLOBAL_VALUE_OPTIONS = {
+    "aws": frozenset(
+        {
+            "--region", "--profile", "--output", "--endpoint-url", "--ca-bundle", "--color", "--query",
+            "--cli-read-timeout", "--cli-connect-timeout", "--cli-binary-format", "--cli-input-json", "--cli-input-yaml",
+        }
+    ),
+    "az": frozenset({"--subscription", "--output", "-o", "--query", "--tenant"}),
+    "gcloud": frozenset(
+        {
+            "--project", "--account", "--configuration", "--format", "--impersonate-service-account", "--billing-project",
+            "--verbosity", "--flags-file", "--access-token-file", "--trace-token", "--user-output-enabled",
+        }
+    ),
+    "gh": frozenset({"-r", "--repo", "--hostname"}),
+    "kubectl": frozenset(
+        {
+            "--context", "--namespace", "-n", "--kubeconfig", "--cluster", "--user", "-s", "--server", "--request-timeout",
+            "--as", "--as-group", "--as-uid", "--certificate-authority", "--client-certificate", "--client-key",
+            "--tls-server-name", "--cache-dir", "--profile", "--profile-output", "--log-flush-frequency", "-v", "--v",
+        }
+    ),
+}
+SAFE_PROXY_COMMANDS = frozenset(
+    {"awk", "cmp", "diff", "du", "find", "git", "grep", "head", "ls", "rg", "sed", "stat", "tail", "wc"}
+)
+DIRECT_IDENTITY_COMMANDS = frozenset(
+    {"env", "finger", "groups", "logname", "printenv", "users", "whoami"}
+)
+SENSITIVE_FLAGS = frozenset(
+    {
+        "--api-key",
+        "--client-secret",
+        "--credential",
+        "--credentials",
+        "--password",
+        "--private-key",
+        "--secret",
+        "--show-token",
+        "--token",
+    }
+)
+SENSITIVE_PATH_FRAGMENTS = (
+    "/.aws/credentials",
+    "/.config/gh/hosts.yml",
+    "/.config/git/config",
+    "/.docker/config.json",
+    "/.git/config",
+    "/.git/objects/",
+    "/.gnupg/",
+    "/.kube/config",
+    "/.netrc",
+    "/.npmrc",
+    "/.pypirc",
+    "/.ssh/",
+    "/.gitconfig",
+)
+TEMPLATE_SUFFIX = r"(?!\.(?:example|sample|template|dist)(?![A-Za-z0-9_-]))"
+SENSITIVE_PATH_PATTERN = re.compile(
+    "|".join(
+        re.escape(fragment) + ("" if fragment.endswith("/") else TEMPLATE_SUFFIX)
+        for fragment in SENSITIVE_PATH_FRAGMENTS
+    )
+    + "|"
+    + "|".join(
+        r"(?:^|[\s\"'=:(<>|;&])" + re.escape(fragment[1:]) + ("" if fragment.endswith("/") else TEMPLATE_SUFFIX)
+        for fragment in SENSITIVE_PATH_FRAGMENTS
+    )
+)
+GENERIC_PRIVATE_SUBCOMMANDS = frozenset(
+    {"account", "auth", "credential", "credentials", "identity", "org", "organization", "profile", "user"}
+)
+GENERIC_PRIVATE_ACTIONS = frozenset(
+    {"current", "get", "list", "login", "logout", "org", "show", "status", "switch", "whoami"}
+)
+SAFE_LOG_FORMATS = frozenset(
+    {
+        "%H",
+        "%h",
+        "%s",
+        "%H%x09%s",
+        "%h%x09%s",
+        "%H%x09%ct%x09%s",
+        "format:%H",
+        "format:%h",
+        "format:%s",
+        "format:%H%x09%s",
+        "format:%h%x09%s",
+        "format:%H%x09%ct%x09%s",
+        "oneline",
+    }
+)
+SAFE_ENV_KEYS = (
+    "SSH_AUTH_SOCK",
+    "TERM",
+)
+DEFAULT_LOCAL_ONLY = ("CLAUDE.local.md",)
+LOCAL_ONLY_ENTRY = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")
+
+
+# This result is module-level because every subprocess must cross the same bounded boundary.
+@dataclass(frozen=True)
+class _ProcessResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+def _environment() -> dict[str, str]:
+    environment = {key: os.environ[key] for key in SAFE_ENV_KEYS if key in os.environ}
+    environment["HOME"] = USER_HOME
+    environment["LC_ALL"] = "C"
+    environment["PATH"] = TRUSTED_PATH
+    environment["TMPDIR"] = "/tmp"
+    environment["XDG_CONFIG_HOME"] = os.path.join(USER_HOME, ".config")
+    environment["XDG_DATA_HOME"] = os.path.join(USER_HOME, ".local", "share")
+    environment["XDG_STATE_HOME"] = os.path.join(USER_HOME, ".local", "state")
+    environment["GIT_PAGER"] = "cat"
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["NO_COLOR"] = "1"
+    return environment
+
+
+def _run(command: list[str], *, cwd: str, timeout: int) -> _ProcessResult | None:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if len(completed.stdout) > MAX_OUTPUT_BYTES or len(completed.stderr) > MAX_OUTPUT_BYTES:
+        return None
+    return _ProcessResult(completed.returncode, completed.stdout, completed.stderr)
+
+
+def _normalized(token: str) -> str:
+    return os.path.basename(token).lower()
+
+
+# Only the bare name or this exact installed file counts, so a look-alike script cannot borrow the exemption.
+def _is_self(word: str) -> bool:
+    if word == TOOL_NAME:
+        return True
+    return os.path.basename(word) == TOOL_NAME and os.path.realpath(word) == SELF_PATH
+
+
+def _tokenize(command: str) -> list[list[str]]:
+    try:
+        lexer = shlex.shlex(normalize_command(command), posix=True, punctuation_chars=";&|()\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = [token for token in lexer if token != REDIRECTION_MARKER]
+    except ValueError:
+        return []
+    chunks: list[list[str]] = [[]]
+    for token in tokens:
+        if token and all(character in SHELL_PUNCTUATION for character in token):
+            if chunks[-1]:
+                chunks.append([])
+            continue
+        chunks[-1].append(token)
+    return [chunk for chunk in chunks if chunk]
+
+
+def _unwrap(words: list[str]) -> tuple[list[str], bool]:
+    used_proxy = False
+    words = strip_wrappers(words, frozenset({"rtk"}))
+    if words and _normalized(words[0]) == "rtk":
+        if len(words) > 1 and _normalized(words[1]) == "proxy":
+            used_proxy = True
+            words = words[2:]
+        else:
+            words = words[1:]
+        words = strip_wrappers(words, frozenset({"rtk"}))
+    return words, used_proxy
+
+
+def _git_subcommand(words: list[str]) -> tuple[str | None, list[str]]:
+    normalized = [_normalized(word) for word in words]
+    try:
+        index = normalized.index("git") + 1
+    except ValueError:
+        return None, []
+    while index < len(words):
+        argument = words[index]
+        if argument in GIT_VALUE_OPTIONS:
+            index += 2
+            continue
+        if argument.startswith("-"):
+            index += 1
+            continue
+        return _normalized(argument), words[index + 1 :]
+    return None, []
+
+
+# Git applies the last format option, so only that one decides whether author details can print.
+def _safe_history_arguments(arguments: list[str], *, show: bool) -> bool:
+    effective: str | None = None
+    for argument in arguments:
+        if argument == "--":
+            break
+        lowered = argument.lower()
+        if lowered == "--oneline":
+            effective = "oneline"
+        elif lowered.startswith(("--format=", "--pretty=")):
+            effective = argument.split("=", 1)[1]
+        elif lowered in {"--format", "--pretty"}:
+            effective = "default"
+    if effective is None:
+        return False
+    if show and not effective:
+        return True
+    return effective in SAFE_LOG_FORMATS
+
+
+def _sensitive_git_command(words: list[str]) -> bool:
+    subcommand, arguments = _git_subcommand(words)
+    if subcommand in {"blame", "cat-file", "commit", "config", "format-patch", "request-pull", "send-email", "shortlog", "whatchanged"}:
+        return True
+    if subcommand == "var":
+        return any(argument.upper() in {"GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"} for argument in arguments)
+    if subcommand == "log":
+        return not _safe_history_arguments(arguments, show=False)
+    if subcommand == "show":
+        return not _safe_history_arguments(arguments, show=True)
+    if subcommand == "remote":
+        return any(argument in {"-v", "--verbose", "get-url"} for argument in arguments)
+    if subcommand == "rev-list":
+        return any(argument.startswith(("--format", "--pretty")) for argument in arguments)
+    if subcommand == "for-each-ref":
+        return any(re.search(r"(?i)(author|committer|creator|email|signature)", argument) for argument in arguments)
+    return False
+
+
+def _without_global_options(executable: str, arguments: list[str]) -> list[str]:
+    value_options = CLI_GLOBAL_VALUE_OPTIONS.get(executable)
+    if not value_options:
+        return arguments
+    index = 0
+    while index < len(arguments) and arguments[index].startswith("-"):
+        index += 2 if arguments[index] in value_options else 1
+    return arguments[index:]
+
+
+def _sensitive_chunk(raw_words: list[str]) -> bool:
+    if all(ASSIGNMENT.fullmatch(word) or word in SHELL_KEYWORDS for word in raw_words):
+        return False
+    try:
+        words, used_proxy = _unwrap(raw_words)
+    except UnresolvableCommand:
+        return True
+    if not words:
+        return True
+    normalized = [_normalized(word) for word in words]
+    if normalized[0] == TOOL_NAME:
+        return not _is_self(words[0])
+    if normalized[0] in {"bash", "sh", "zsh"}:
+        for index, argument in enumerate(words[:-1]):
+            if argument in {"-c", "-lc"}:
+                return _sensitive_command(words[index + 1])
+    if used_proxy and normalized[0] not in SAFE_PROXY_COMMANDS:
+        return True
+    if normalized[0] in DIRECT_IDENTITY_COMMANDS:
+        return True
+    if any(word.split("=", 1)[0] in SENSITIVE_FLAGS for word in normalized):
+        return True
+    if "git" in normalized and _sensitive_git_command(words):
+        return True
+
+    executable = normalized[0]
+    arguments = _without_global_options(executable, normalized[1:])
+    first = arguments[0] if arguments else ""
+    second = arguments[1] if len(arguments) > 1 else ""
+    if executable in {"coderabbit", "cr"} and first in {"auth", "doctor", "stats", "usage"}:
+        return True
+    if executable == "gh" and (first == "auth" or (first == "api" and second in {"user", "/user"})):
+        return True
+    if executable in {"npm", "pnpm", "yarn"} and first in {"adduser", "login", "logout", "profile", "token", "whoami"}:
+        return True
+    if executable == "aws" and ((first == "sts" and second == "get-caller-identity") or first == "configure"):
+        return True
+    if executable == "gcloud" and first in {"auth", "config"}:
+        return True
+    if executable == "az" and first == "account":
+        return True
+    if executable == "kubectl" and first == "config":
+        return True
+    if executable == "security" and first in {"dump-keychain", "find-generic-password", "find-identity", "find-internet-password"}:
+        return True
+    if executable in {"gpg", "gpg2"} and any(argument.startswith("--list") for argument in arguments):
+        return True
+    if executable == "ssh-add" and any(argument in {"-l", "-L"} for argument in arguments):
+        return True
+    if first == "doctor" or first == "whoami":
+        return True
+    if first == "status" and executable != "git":
+        return True
+    if first in GENERIC_PRIVATE_SUBCOMMANDS and (not second or second in GENERIC_PRIVATE_ACTIONS):
+        return True
+    if first == "config" and any(argument in GENERIC_PRIVATE_ACTIONS or argument in {"--list", "-l", "dump", "view"} for argument in arguments[1:]):
+        return True
+    return False
+
+
+def _sensitive_command(command: str) -> bool:
+    if len(command) > MAX_COMMAND_CHARS:
+        return True
+    lowered = command.lower()
+    if SENSITIVE_PATH_PATTERN.search(lowered):
+        return True
+    if re.search(r"(?<![\w.-])\.env(?!\.(?:dist|example|sample|template)\b)(?:\b|$)", lowered):
+        return True
+    chunks = _tokenize(command)
+    if not chunks or any(_sensitive_chunk(chunk) for chunk in chunks):
+        return True
+    return any(_sensitive_command(body) for body in command_substitutions(command) if body.strip())
+
+
+# When the proxy prefix is the only problem the agent needs the one-line fix, not the generic refusal.
+def _blocked_only_by_proxy(command: str) -> bool:
+    without_proxy = PROXY_PREFIX.sub("rtk", command)
+    return without_proxy != command and not _sensitive_command(without_proxy)
+
+
+def _deny_hook(reason_key: str = "safe_tool.deny.sensitive") -> None:
+    emit_decision("deny", message(reason_key))
+
+
+# The plugin setting reaches the hook as CLAUDE_PLUGIN_OPTION_REQUIRE_RTK; the variable works on every host.
+def _require_rtk() -> bool:
+    return env_flag("AGENT_SAFEGUARDS_REQUIRE_RTK") or env_flag("CLAUDE_PLUGIN_OPTION_REQUIRE_RTK")
+
+
+# This probe is module-level because the hook, the status command and the self-test share one RTK support decision.
+def _rtk_required(command: str) -> bool:
+    if RTK_PATH is None:
+        return False
+    completed = _run(
+        [RTK_PATH, "rewrite", command],
+        cwd=os.getcwd(),
+        timeout=RTK_REWRITE_TIMEOUT_SECONDS,
+    )
+    if completed is None or completed.returncode not in {0, 3}:
+        return False
+    try:
+        rewritten = completed.stdout.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return False
+    return bool(rewritten and rewritten != command.strip())
+
+
+# This decision stays separate so Git admission requires a visible user confirmation.
+def _ask_local_artifact_hook() -> None:
+    emit_decision("ask", message("safe_tool.ask.local_artifact"))
+
+
+def _response_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return "\n".join(f"{key}={_response_text(child)}" for key, child in value.items())
+    if isinstance(value, list):
+        return "\n".join(_response_text(child) for child in value)
+    return ""
+
+
+def _sensitive_output(command: str, response: Any) -> bool:
+    text = _response_text(response)
+    if any(pattern.search(text) for pattern in SECRET_PATTERNS) or PRIVATE_URL_PATTERN.search(text):
+        return True
+    private_email = any(match.group(1).lower() not in RESERVED_EMAIL_DOMAINS for match in EMAIL_PATTERN.finditer(text))
+    identity_context = any(
+        _normalized(token) in {"account", "auth", "doctor", "identity", "org", "organization", "profile", "status", "whoami"}
+        or "identity" in _normalized(token)
+        for text in (command, *command_substitutions(command))
+        for chunk in _tokenize(text)
+        for token in chunk
+    )
+    labeled_non_email_identity = NON_EMAIL_IDENTITY_FIELD_PATTERN.search(text) is not None
+    return private_email or (identity_context and labeled_non_email_identity)
+
+
+def _withheld_shape(value: Any, *, root: bool = True) -> Any:
+    placeholder = message("safe_tool.withheld.placeholder")
+    if isinstance(value, dict):
+        replacement = {key: _withheld_shape(child, root=False) for key, child in value.items()}
+        for key in ("stdout", "output", "content"):
+            if key in replacement and isinstance(replacement[key], str):
+                replacement[key] = placeholder
+                break
+        return replacement
+    if isinstance(value, list):
+        return []
+    if isinstance(value, str):
+        return placeholder if root else ""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return 0
+    return None
+
+
+def _withhold_post_hook(runtime: str, response: Any) -> None:
+    if runtime == "claude":
+        if not isinstance(response, dict):
+            response = {"stdout": "", "stderr": "", "interrupted": False, "isImage": False}
+        emit(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "updatedToolOutput": _withheld_shape(response),
+                }
+            }
+        )
+        return
+    emit({"decision": "block", "reason": message("safe_tool.withheld.reason")})
+
+
+def _command_of(payload: dict[str, Any]) -> str | None:
+    tool_input = payload.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    return command if isinstance(command, str) else None
+
+
+def _handle_event(runtime: str, event: str, payload: dict[str, Any]) -> None:
+    if event == "SessionStart":
+        cwd = payload.get("cwd")
+        if runtime == "claude" and env_flag("AGENT_SAFEGUARDS_AUTO_EXCLUDE") and isinstance(cwd, str):
+            _ensure_local_excludes(cwd)
+        return
+    if event not in {"PreToolUse", "PostToolUse"}:
+        return
+    command = _command_of(payload)
+    if command is None:
+        if event == "PostToolUse":
+            _withhold_post_hook(runtime, payload.get("tool_response"))
+        else:
+            _deny_hook()
+        return
+    if event == "PreToolUse":
+        if _sensitive_command(command):
+            _deny_hook("safe_tool.deny.proxy" if _blocked_only_by_proxy(command) else "safe_tool.deny.sensitive")
+        elif _require_rtk() and _rtk_required(command):
+            _deny_hook("safe_tool.deny.rtk")
+        elif runtime == "claude" and _requires_local_artifact_approval(command, payload.get("cwd")):
+            _ask_local_artifact_hook()
+    elif _sensitive_output(command, payload.get("tool_response")):
+        _withhold_post_hook(runtime, payload.get("tool_response"))
+
+
+# The hook registration names its own event, so an unreadable payload still gets the right kind of refusal.
+# Without it (a manual run) the event name is searched for near the start of the payload.
+def _fail_closed_unreadable(runtime: str, raw_input: bytes, expected_event: str | None) -> None:
+    event = expected_event
+    if event is None:
+        match = EVENT_PATTERN.search(raw_input[:EVENT_SEARCH_BYTES])
+        event = match.group(1).decode("ascii") if match else "PreToolUse"
+    if event == "PostToolUse":
+        _withhold_post_hook(runtime, None)
+    elif event == "PreToolUse":
+        _deny_hook()
+
+
+def _run_hook(runtime: str, expected_event: str | None = None) -> int:
+    raw_input = b""
+    try:
+        raw_input = sys.stdin.buffer.read(MAX_OUTPUT_BYTES + 1)
+        if len(raw_input) > MAX_OUTPUT_BYTES:
+            raise ValueError
+        payload = json.loads(raw_input)
+        if not isinstance(payload, dict):
+            raise ValueError
+    except (OSError, TypeError, ValueError):
+        _fail_closed_unreadable(runtime, raw_input, expected_event)
+        return 0
+    event = expected_event or payload.get("hook_event_name", "PreToolUse")
+    if not isinstance(event, str):
+        event = "PreToolUse"
+    try:
+        _handle_event(runtime, event, payload)
+    except Exception:
+        if fail_open():
+            return 0
+        if event == "PreToolUse":
+            _deny_hook("safe_tool.deny.internal")
+        elif event == "PostToolUse":
+            _withhold_post_hook(runtime, payload.get("tool_response"))
+    return 0
+
+
+def _json_payloads(output: bytes) -> list[Any] | None:
+    try:
+        text = output.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    try:
+        return [json.loads(text)]
+    except json.JSONDecodeError:
+        payloads: list[Any] = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                payloads.append(json.loads(line))
+            except json.JSONDecodeError:
+                return None
+        return payloads or None
+
+
+def _authentication_state(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized_key = re.sub(r"[^a-z]", "", str(key).lower())
+            if normalized_key in {"authenticated", "isauthenticated", "loggedin", "isloggedin"} and isinstance(child, bool):
+                return "ready" if child else "unauthenticated"
+            if normalized_key in {"authstatus", "state", "status"} and isinstance(child, str):
+                normalized_value = re.sub(r"[^a-z]", "", child.lower())
+                if normalized_value in {"authenticated", "loggedin", "ready"}:
+                    return "ready"
+                if normalized_value in {"expired", "loggedout", "missing", "notauthenticated", "unauthenticated"}:
+                    return "unauthenticated"
+            nested = _authentication_state(child)
+            if nested:
+                return nested
+    elif isinstance(value, list):
+        for child in value:
+            nested = _authentication_state(child)
+            if nested:
+                return nested
+    return None
+
+
+def _rtk_status() -> int:
+    enforcement = "on" if _require_rtk() else "off"
+    if RTK_PATH is None:
+        emit({"tool": "rtk", "status": "unavailable", "enforcement": enforcement})
+        return 127
+    status = "ready" if _rtk_required("git status --short") else "operation_failed"
+    emit({"tool": "rtk", "status": status, "enforcement": enforcement})
+    return 0 if status == "ready" else 2
+
+
+def _coderabbit_status() -> int:
+    if CODERABBIT_PATH is None:
+        emit({"tool": "coderabbit", "status": "unavailable"})
+        return 127
+    completed = _run(
+        [CODERABBIT_PATH, "auth", "status", "--agent"],
+        cwd=os.getcwd(),
+        timeout=STATUS_TIMEOUT_SECONDS,
+    )
+    if completed is None:
+        emit({"tool": "coderabbit", "status": "operation_failed"})
+        return 2
+    payloads = _json_payloads(completed.stdout)
+    state = _authentication_state(payloads) if payloads is not None else None
+    if state is None:
+        emit({"tool": "coderabbit", "status": "schema_mismatch"})
+        return 2
+    emit({"tool": "coderabbit", "status": state})
+    return 0 if state == "ready" else 1
+
+
+def _git(command: list[str], cwd: str, timeout: int = GIT_TIMEOUT_SECONDS) -> _ProcessResult | None:
+    if GIT_PATH is None:
+        return None
+    return _run([GIT_PATH, "-c", "user.useConfigOnly=true", *command], cwd=cwd, timeout=timeout)
+
+
+def _repository_root(cwd: str) -> str | None:
+    completed = _git(["rev-parse", "--show-toplevel"], cwd, 20)
+    if completed is None or completed.returncode != 0:
+        return None
+    try:
+        root = os.path.realpath(completed.stdout.decode("utf-8").strip())
+        current = os.path.realpath(cwd)
+        if not os.path.isdir(root) or os.path.commonpath((current, root)) != root:
+            return None
+        return root
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+# These entries are read per call because the policy comes from the environment, not from a file the agent could edit.
+def _local_only_entries() -> tuple[str, ...]:
+    configured = env_list("AGENT_SAFEGUARDS_LOCAL_ONLY")
+    entries = DEFAULT_LOCAL_ONLY if configured is None else configured
+    return tuple(
+        entry
+        for entry in entries
+        if LOCAL_ONLY_ENTRY.fullmatch(entry)
+        and re.search(r"[A-Za-z0-9]", entry)
+        and ".." not in entry.split("/")
+    )
+
+
+def _local_only_paths() -> tuple[str, ...]:
+    return tuple(entry.rstrip("/") for entry in _local_only_entries())
+
+
+def _local_only_exclude_patterns() -> tuple[str, ...]:
+    return tuple("/" + entry for entry in _local_only_entries())
+
+
+# This Git-owned path is resolved once per event so worktrees use their real local exclude file.
+def _git_exclude_path(root: str) -> str | None:
+    completed = _git(["rev-parse", "--git-path", "info/exclude"], root, 20)
+    if completed is None or completed.returncode != 0:
+        return None
+    try:
+        value = completed.stdout.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    path = os.path.abspath(value if os.path.isabs(value) else os.path.join(root, value))
+    if os.path.basename(path) != "exclude" or os.path.basename(os.path.dirname(path)) != "info":
+        return None
+    return path
+
+
+# Every folder on the way is opened without following links, so a swap after the check fails instead of redirecting the write.
+def _open_without_symlinks(path: str) -> int:
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parts = [part for part in path.split(os.sep) if part]
+    descriptor = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            following = os.open(part, directory_flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = following
+        return os.open(parts[-1], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=descriptor)
+    finally:
+        os.close(descriptor)
+
+
+# This local write is locked because concurrent Claude sessions can start in the same repository.
+def _ensure_local_excludes(cwd: str) -> bool:
+    patterns = _local_only_exclude_patterns()
+    if not patterns:
+        return False
+    root = _repository_root(cwd)
+    if root is None:
+        return False
+    path = _git_exclude_path(root)
+    if path is None or os.path.realpath(path) != path:
+        return False
+    try:
+        descriptor = _open_without_symlinks(path)
+        with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return False
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            content = handle.read()
+            existing = set(content.splitlines())
+            missing = [pattern for pattern in patterns if pattern not in existing]
+            if missing:
+                handle.seek(0, os.SEEK_END)
+                if content and not content.endswith("\n"):
+                    handle.write("\n")
+                handle.write("".join(f"{pattern}\n" for pattern in missing))
+                handle.flush()
+                os.fsync(handle.fileno())
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        return False
+    return True
+
+
+# This decoder centralizes NUL-delimited Git paths and rejects malformed output.
+def _decoded_paths(result: _ProcessResult | None) -> set[str]:
+    if result is None or result.returncode != 0:
+        return set()
+    try:
+        return {path for path in result.stdout.decode("utf-8").split("\0") if path}
+    except UnicodeDecodeError:
+        return set()
+
+
+# This fixed query covers ignored and visible untracked artifacts without reading their contents.
+def _untracked_local_only_paths(root: str) -> set[str]:
+    paths = _local_only_paths()
+    if not paths:
+        return set()
+    visible = _git(["ls-files", "--others", "--exclude-standard", "-z", "--", *paths], root, 20)
+    ignored = _git(
+        ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", *paths],
+        root,
+        20,
+    )
+    return _decoded_paths(visible) | _decoded_paths(ignored)
+
+
+# This fixed query limits commit approval to newly admitted protected paths.
+def _new_staged_local_only_paths(root: str) -> set[str]:
+    paths = _local_only_paths()
+    if not paths:
+        return set()
+    staged = _git(
+        ["diff", "--cached", "--name-only", "--diff-filter=A", "-z", "--", *paths],
+        root,
+        20,
+    )
+    return _decoded_paths(staged)
+
+
+# This parser is separate because force-add is the staging form that bypasses local excludes.
+def _is_force_git_add(raw_words: list[str]) -> bool:
+    words, _ = _unwrap(raw_words)
+    subcommand, arguments = _git_subcommand(words)
+    if subcommand != "add":
+        return False
+    return any(
+        argument == "--force"
+        or (argument.startswith("-") and not argument.startswith("--") and "f" in argument[1:])
+        for argument in arguments
+    )
+
+
+# This parser recognizes only the approved wrapper and leaves raw commits to the sensitive-command gate.
+def _is_safe_tool_commit(raw_words: list[str]) -> bool:
+    words, _ = _unwrap(raw_words)
+    if len(words) < 3 or not _is_self(words[0]):
+        return False
+    return [_normalized(word) for word in words[1:3]] == ["git", "commit"]
+
+
+# This check is model-independent and asks only when a new local artifact can cross into Git.
+def _requires_local_artifact_approval(command: str, cwd: Any) -> bool:
+    if not isinstance(cwd, str) or not _local_only_entries():
+        return False
+    root = _repository_root(cwd)
+    if root is None:
+        return False
+    chunks = _tokenize(command)
+    if any(_is_force_git_add(chunk) for chunk in chunks) and _untracked_local_only_paths(root):
+        return True
+    return any(_is_safe_tool_commit(chunk) for chunk in chunks) and bool(_new_staged_local_only_paths(root))
+
+
+def _git_identity_ready(root: str) -> bool:
+    for variable in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+        completed = _git(["var", variable], root, 20)
+        if completed is None or completed.returncode != 0 or not completed.stdout.strip():
+            return False
+    return True
+
+
+def _git_identity() -> int:
+    root = _repository_root(os.getcwd())
+    if root is None:
+        emit({"tool": "git", "operation": "identity", "status": "not_repository"})
+        return 2
+    status = "configured" if _git_identity_ready(root) else "identity_missing"
+    emit({"tool": "git", "operation": "identity", "status": status})
+    return 0 if status == "configured" else 1
+
+
+def _object_id(output: bytes) -> str | None:
+    try:
+        value = output.decode("ascii").strip()
+    except UnicodeDecodeError:
+        return None
+    return value if OBJECT_ID_PATTERN.fullmatch(value) else None
+
+
+def _git_commit(messages: list[str]) -> int:
+    commit_message = "\n\n".join(messages).strip()
+    if (
+        not commit_message
+        or len(commit_message.encode("utf-8")) > 16 * 1024
+        or (env_flag("AGENT_SAFEGUARDS_BLOCK_ATTRIBUTION") and ATTRIBUTION_PATTERN.search(commit_message))
+        or _sensitive_output("git commit", commit_message)
+    ):
+        emit({"tool": "git", "operation": "commit", "status": "invalid_message"})
+        return 2
+    root = _repository_root(os.getcwd())
+    if root is None:
+        emit({"tool": "git", "operation": "commit", "status": "not_repository"})
+        return 2
+    if not _git_identity_ready(root):
+        emit({"tool": "git", "operation": "commit", "status": "identity_missing"})
+        return 1
+    staged = _git(["diff", "--cached", "--quiet", "--exit-code"], root, 20)
+    if staged is None or staged.returncode not in {0, 1}:
+        emit({"tool": "git", "operation": "commit", "status": "operation_failed"})
+        return 2
+    if staged.returncode == 0:
+        emit({"tool": "git", "operation": "commit", "status": "no_staged_changes"})
+        return 1
+    candidate = _git(["write-tree"], root, 20)
+    paths = _git(["diff", "--cached", "--name-only", "-z"], root, 20)
+    candidate_tree = _object_id(candidate.stdout) if candidate and candidate.returncode == 0 else None
+    if candidate_tree is None or paths is None or paths.returncode != 0:
+        emit({"tool": "git", "operation": "commit", "status": "operation_failed"})
+        return 2
+    arguments = ["commit", "--quiet", "--no-status"]
+    for paragraph in messages:
+        arguments.extend(("--message", paragraph))
+    completed = _git(arguments, root)
+    if completed is None or completed.returncode != 0:
+        combined = (completed.stdout + completed.stderr).lower() if completed else b""
+        if b"hook" in combined:
+            status = "hook_failed"
+        elif b"sign" in combined or b"gpg" in combined:
+            status = "signing_failed"
+        elif b"unmerged" in combined or b"conflict" in combined:
+            status = "unmerged_changes"
+        else:
+            status = "commit_failed"
+        emit({"tool": "git", "operation": "commit", "status": status})
+        return 1
+    commit = _git(["rev-parse", "--verify", "HEAD"], root, 20)
+    tree = _git(["rev-parse", "--verify", "HEAD^{tree}"], root, 20)
+    commit_id = _object_id(commit.stdout) if commit and commit.returncode == 0 else None
+    tree_id = _object_id(tree.stdout) if tree and tree.returncode == 0 else None
+    if commit_id is None or tree_id is None:
+        emit({"tool": "git", "operation": "commit", "status": "verification_failed"})
+        return 2
+    status = "committed" if tree_id == candidate_tree else "committed_tree_changed"
+    emit(
+        {
+            "tool": "git",
+            "operation": "commit",
+            "status": status,
+            "commit": commit_id,
+            "tree": tree_id,
+            "files": paths.stdout.count(b"\0"),
+        }
+    )
+    return 0 if status == "committed" else 2
+
+
+def _self_test() -> int:
+    blocked = (
+        "coderabbit auth status",
+        "rtk proxy coderabbit auth status",
+        "bash -lc 'coderabbit auth status'",
+        "git config --get user.email",
+        "git -C /tmp/repository config --get user.name",
+        "git var GIT_AUTHOR_IDENT",
+        "git commit -m test",
+        "git log -1",
+        "git show HEAD",
+        "gh auth status",
+        "aws sts get-caller-identity",
+        "vendor account show",
+        "vendor status",
+        "cat ~/.gitconfig",
+        "security find-identity -v -p codesigning",
+        "rtk proxy security find-identity -v -p codesigning",
+        "rtk proxy ./gradlew test",
+        "./other/safe-tool env",
+    )
+    allowed = (
+        "safe-tool status coderabbit",
+        "safe-tool git identity",
+        "safe-tool git commit -m test",
+        "git log --oneline -5",
+        "git show --format= --stat HEAD",
+        "rtk git status --short",
+        "rtk proxy git diff --stat",
+        'rg "git config" AGENTS.md',
+    )
+    status_payload = [{"type": "status", "authenticated": True, "email": "withheld@example.invalid"}]
+    secret_output = {"stdout": "token=" + "ghp_" + ("A" * 32), "stderr": ""}
+    identity_output = {"stdout": "email=owner@corp" + ".internal", "stderr": ""}
+    name_output = {"stdout": "name=PrivateUser", "stderr": ""}
+    rtk_checks = True
+    if RTK_PATH is not None and _require_rtk():
+        rtk_checks = (
+            _rtk_required("git status --short")
+            and not _rtk_required("rtk git status --short")
+            and not _rtk_required("printf ok")
+        )
+    passed = (
+        all(_sensitive_command(command) for command in blocked)
+        and all(not _sensitive_command(command) for command in allowed)
+        and _authentication_state(status_payload) == "ready"
+        and _sensitive_output("tool status", secret_output)
+        and _sensitive_output("tool status", identity_output)
+        and _sensitive_output("tool status", name_output)
+        and rtk_checks
+    )
+    emit({"tool": TOOL_NAME, "status": "self_test_passed" if passed else "self_test_failed"})
+    return 0 if passed else 1
+
+
+def _commit_messages(arguments: list[str]) -> list[str] | None:
+    messages: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in {"-m", "--message"} and index + 1 < len(arguments):
+            messages.append(arguments[index + 1])
+            index += 2
+        elif argument.startswith("--message="):
+            messages.append(argument.split("=", 1)[1])
+            index += 1
+        else:
+            return None
+    return messages or None
+
+
+# The command line is parsed by hand so every printed word comes from the message catalog.
+def main() -> int:
+    arguments = sys.argv[1:]
+    if arguments in (["-h"], ["--help"]):
+        sys.stdout.write(message("safe_tool.cli.usage") + "\n")
+        return 0
+    if arguments[:1] == ["hook"] and 2 <= len(arguments) <= 3 and arguments[1] in {"claude", "codex"}:
+        if len(arguments) == 2:
+            return _run_hook(arguments[1])
+        if arguments[2] in HOOK_EVENTS:
+            return _run_hook(arguments[1], arguments[2])
+    if arguments == ["self-test"]:
+        return _self_test()
+    if arguments == ["status", "coderabbit"]:
+        return _coderabbit_status()
+    if arguments == ["status", "rtk"]:
+        return _rtk_status()
+    if arguments == ["git", "identity"]:
+        return _git_identity()
+    if arguments[:2] == ["git", "commit"]:
+        messages = _commit_messages(arguments[2:])
+        if messages is not None:
+            return _git_commit(messages)
+    sys.stderr.write(message("safe_tool.cli.usage") + "\n")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

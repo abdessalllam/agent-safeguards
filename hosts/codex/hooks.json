@@ -1,0 +1,33 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/hook.sh\" safe-tool codex PreToolUse",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/hook.sh\" delete-guard codex PreToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/hook.sh\" safe-tool codex PostToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

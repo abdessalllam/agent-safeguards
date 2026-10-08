@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""Deny shell commands that could delete data outside the task's own repository or temp space."""
+
+from __future__ import annotations
+
+import sys
+
+# Run again in isolated mode before any other import, so PYTHON* variables and user site packages cannot shadow the library.
+if __name__ == "__main__" and not sys.flags.isolated and sys.executable:
+    import posix
+
+    posix.execv(sys.executable, [sys.executable, "-I", *sys.argv])
+
+import functools
+import json
+import os
+import re
+import shlex
+import subprocess
+from typing import NamedTuple
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+
+from agent_safeguards.common import (  # noqa: E402
+    GIT_VALUE_OPTIONS,
+    MAX_COMMAND_CHARS,
+    REDIRECTION_MARKER,
+    SHELL_KEYWORDS,
+    USER_HOME,
+    UnresolvableCommand,
+    command_substitutions,
+    emit_decision,
+    fail_open,
+    find_executable,
+    message,
+    normalize_command,
+    option_names,
+    strip_wrappers,
+    strip_wrappers_with_directory,
+)
+
+# These immutable policy values stay at module scope so the hook and the self-test share one policy.
+TOOL_NAME = "delete-guard"
+GIT_PATH = find_executable("git")
+MAX_INPUT_BYTES = 1024 * 1024
+TEMP_ROOTS = tuple(
+    os.path.realpath(path)
+    for path in ("/tmp", "/private/tmp", "/var/tmp", "/var/folders", "/private/var/folders", os.environ.get("TMPDIR", "/tmp"))
+)
+SYSTEM_ROOTS = (
+    "/",
+    "/Applications",
+    "/Library",
+    "/System",
+    "/Users",
+    "/Volumes",
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/home",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/media",
+    "/mnt",
+    "/opt",
+    "/private",
+    "/proc",
+    "/root",
+    "/run",
+    "/sbin",
+    "/snap",
+    "/srv",
+    "/sys",
+    "/usr",
+    "/var",
+)
+MOUNT_PARENTS = ("/Volumes", "/mnt", "/media")
+HOOK_EVENTS = frozenset({"PreToolUse", "PostToolUse", "SessionStart"})
+QUICK_SCAN = re.compile(
+    r"\b(rm|rmtree|removedirs|rmSync|rmdirSync|remove_dir_all|rm_rf|find|xargs|trash|diskutil|dd|mkfs|newfs|shred|srm|rsync|clean)\b"
+    r"|\b(?:mkfs|newfs)[._]"
+)
+INLINE_RECURSIVE_DELETE = re.compile(r"rmtree|removedirs|rmSync|rmdirSync|remove_dir_all|rm_rf|rm\s+-[a-zA-Z]*[rR]")
+INTERPRETERS = frozenset({"python", "python3", "node", "perl", "ruby", "deno", "bun", "osascript", "swift"})
+SHELLS = frozenset({"bash", "sh", "zsh", "dash", "fish"})
+XARGS_VALUE_OPTIONS = frozenset(
+    {
+        "-a", "-d", "-E", "-I", "-J", "-L", "-n", "-P", "-R", "-S", "-s",
+        "--arg-file", "--delimiter", "--eof", "--max-args", "--max-chars", "--max-lines", "--max-procs", "--process-slot-var",
+    }
+)
+ERASE_TOOL = re.compile(r"(?:mkfs|newfs|shred|srm)(?:[._].*)?")
+TRASH_TOOLS = frozenset({"trash", "trash-put"})
+DISKUTIL_ERASE = re.compile(r"(?i)^(erase|zero|secureerase|partitiondisk|reformat|deletevolume|deletecontainer|apfs)")
+
+
+# Each decision carries its reason so the agent learns the exact rewrite instead of a bare refusal.
+class Denied(Exception):
+    pass
+
+
+def _emit_deny(reason: str) -> None:
+    emit_decision("deny", message("delete_guard.deny", reason=reason))
+
+
+# Each command keeps the separators around it so a directory change is only trusted where it surely runs.
+class Chunk(NamedTuple):
+    words: list[str]
+    before: str | None
+    after: str | None
+    opened: bool
+    redirected: bool
+
+
+def _chunk(raw_words: list[str], before: str | None, after: str | None, redirected: bool) -> Chunk:
+    words = [word for word in raw_words if word]
+    opened = bool(words) and (words[0].startswith("(") or words[0] == "{")
+    while words and words[0].startswith("("):
+        words[0] = words[0][1:]
+        if not words[0]:
+            words.pop(0)
+    if words and words[-1].endswith(")"):
+        words[-1] = words[-1].rstrip(")")
+        if not words[-1]:
+            words.pop()
+    return Chunk(words, before, after, opened, redirected)
+
+
+def _tokenize(command: str) -> list[Chunk] | None:
+    try:
+        lexer = shlex.shlex(normalize_command(command), posix=True, punctuation_chars=";&|\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    chunks: list[Chunk] = []
+    words: list[str] = []
+    before: str | None = None
+    redirected = False
+    for token in tokens:
+        if token == REDIRECTION_MARKER:
+            redirected = True
+        elif token and all(character in ";&|\n" for character in token):
+            # A line break beside an operator only continues it, so "&&" plus a newline is still "&&".
+            stripped = token.replace("\n", "")
+            separator = stripped if stripped and set(stripped) != {";"} else ";"
+            if words:
+                chunks.append(_chunk(words, before, separator, redirected))
+                words, redirected = [], False
+            before = separator
+        else:
+            words.append(token)
+    if words:
+        chunks.append(_chunk(words, before, None, redirected))
+    return [chunk for chunk in chunks if chunk.words or chunk.opened]
+
+
+def _base(word: str) -> str:
+    return os.path.basename(word)
+
+
+def _is_computed(path: str) -> bool:
+    return any(marker in path for marker in ("$", "`")) and not re.fullmatch(r"(\$HOME|\$\{HOME\})(/.*)?", path)
+
+
+def _expand(path: str, cwd: str | None) -> str | None:
+    path = re.sub(r"^(\$HOME|\$\{HOME\})", USER_HOME, path)
+    if path == "~" or path.startswith("~/"):
+        path = USER_HOME + path[1:]
+    elif path.startswith("~"):
+        return None
+    if not os.path.isabs(path):
+        if cwd is None:
+            return None
+        path = os.path.join(cwd, path)
+    return os.path.realpath(path)
+
+
+def _glob_base(path: str) -> str:
+    match = re.search(r"[*?\[]", path)
+    if not match:
+        return path
+    head = path[: match.start()]
+    return head if head.endswith("/") or not head else os.path.dirname(head) or "."
+
+
+def _inside(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _protected(path: str) -> bool:
+    if path in SYSTEM_ROOTS or path in TEMP_ROOTS or path == USER_HOME:
+        return True
+    if _inside(USER_HOME, path):
+        return True
+    if os.path.dirname(path) == USER_HOME:
+        return True
+    return os.path.dirname(path) in MOUNT_PARENTS
+
+
+# The answer is cached because one command can name hundreds of targets that all resolve against the same folder.
+@functools.lru_cache(maxsize=32)
+def _repository_root(cwd: str | None) -> str | None:
+    if cwd is None or GIT_PATH is None or not os.path.isdir(cwd):
+        return None
+    try:
+        completed = subprocess.run(
+            [GIT_PATH, "-C", cwd, "rev-parse", "--show-toplevel"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=5,
+            check=False,
+            env={"PATH": "/usr/bin:/bin", "HOME": USER_HOME, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    root = os.path.realpath(completed.stdout.decode("utf-8", "replace").strip())
+    return None if not root or _protected(root) else root
+
+
+def _check_target(raw: str, cwd: str | None, *, recursive: bool, verb: str) -> None:
+    if _is_computed(raw):
+        if recursive:
+            raise Denied(message("delete_guard.reason.computed_path", verb=verb, raw=raw))
+        return
+    base = _glob_base(raw)
+    if base != raw and recursive and not base.strip("./"):
+        raise Denied(message("delete_guard.reason.bare_glob", verb=verb, raw=raw))
+    wildcard = re.search(r"[*?\[]", raw)
+    if wildcard and recursive:
+        component_end = raw.find("/", wildcard.start())
+        if component_end != -1 and raw[component_end:].strip("/"):
+            raise Denied(message("delete_guard.reason.glob_midpath", verb=verb, raw=raw))
+    resolved = _expand(base, cwd)
+    if resolved is None:
+        raise Denied(message("delete_guard.reason.unresolvable", verb=verb, raw=raw))
+    # A glob under a temp root is cleanup of scratch folders only when a literal name comes before the first wildcard.
+    if base != raw and resolved in TEMP_ROOTS:
+        first_component = raw[len(base) :].lstrip("/").split("/")[0]
+        if re.search(r"[A-Za-z0-9_]", re.split(r"[*?\[]", first_component)[0]):
+            return
+    if _protected(resolved):
+        raise Denied(message("delete_guard.reason.protected_folder", verb=verb, path=resolved))
+    if any(_inside(resolved, root) for root in TEMP_ROOTS):
+        return
+    root = _repository_root(cwd)
+    if root is None or not _inside(resolved, root):
+        raise Denied(message("delete_guard.reason.outside_repository", verb=verb, path=resolved))
+    if resolved == root:
+        raise Denied(message("delete_guard.reason.repository_root", verb=verb, path=resolved))
+    if resolved == os.path.join(root, ".git") or _inside(resolved, os.path.join(root, ".git")):
+        raise Denied(message("delete_guard.reason.git_metadata", verb=verb, path=resolved))
+    if recursive and os.path.isdir(resolved) and os.path.isfile(os.path.join(resolved, ".git")):
+        raise Denied(message("delete_guard.reason.worktree", path=resolved))
+
+
+def _rm(words: list[str], cwd: str | None) -> None:
+    recursive = False
+    targets: list[str] = []
+    options_done = False
+    for word in words[1:]:
+        if not options_done and word == "--":
+            options_done = True
+        elif not options_done and word.startswith("--"):
+            recursive = recursive or word in {"--recursive", "--dir"}
+        elif not options_done and word.startswith("-") and len(word) > 1:
+            recursive = recursive or bool(set(word[1:]) & {"r", "R", "d"})
+        else:
+            targets.append(word)
+    for target in targets:
+        _check_target(target, cwd, recursive=recursive, verb="rm -r" if recursive else "rm")
+
+
+def _trash(words: list[str], cwd: str | None) -> None:
+    for target in (word for word in words[1:] if not word.startswith("-")):
+        if _is_computed(target):
+            continue
+        resolved = _expand(_glob_base(target), cwd)
+        if resolved is not None and _protected(resolved):
+            raise Denied(message("delete_guard.reason.trash_protected", path=resolved))
+
+
+def _find(words: list[str], cwd: str | None) -> None:
+    deleting = "-delete" in words
+    for index, word in enumerate(words):
+        if word in {"-exec", "-execdir", "-ok", "-okdir"} and index + 1 < len(words):
+            if _base(words[index + 1]) in {"rm", "trash", "trash-put", "unlink", "rmdir", "shred", "srm"}:
+                deleting = True
+    if not deleting:
+        return
+    starts: list[str] = []
+    for word in words[1:]:
+        if word in {"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"} and not starts:
+            continue
+        if word.startswith("-") or word in {"(", "!", "\\("}:
+            break
+        starts.append(word)
+    for start in starts or ["."]:
+        _check_target(start, cwd, recursive=True, verb="find -delete")
+
+
+def _xargs(words: list[str]) -> None:
+    rest = words[1:]
+    while rest and rest[0].startswith("-") and len(rest[0]) > 1 and rest[0] != "--":
+        rest = rest[2:] if option_names(rest[0], XARGS_VALUE_OPTIONS)[1] else rest[1:]
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+    rest = strip_wrappers(rest)
+    if rest and _base(rest[0]) in {"rm", "unlink", "shred", "srm"}:
+        raise Denied(message("delete_guard.reason.xargs_rm"))
+
+
+def _rsync(words: list[str], cwd: str | None) -> None:
+    if not any(word.startswith("--delete") or word == "--remove-source-files" for word in words):
+        return
+    operands = [word for word in words[1:] if not word.startswith("-")]
+    if operands:
+        _check_target(operands[-1], cwd, recursive=True, verb="rsync --delete")
+
+
+# The result is the shell's folder after the command and whether this command was a directory change that is known.
+def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: bool = True) -> tuple[str | None, bool]:
+    try:
+        stripped, moved = strip_wrappers_with_directory(words)
+    except UnresolvableCommand:
+        raise Denied(message("delete_guard.reason.unparseable"))
+    if not stripped:
+        return cwd, False
+    wrapped = len(stripped) != len(words)
+    words = stripped
+    # A wrapper that changes directory only affects its own command, so the shell's folder is restored afterwards.
+    shell_cwd = cwd
+    if moved:
+        cwd = None
+    name = _base(words[0])
+    if name == "popd":
+        return None, False
+    if name in {"cd", "pushd"}:
+        if wrapped:
+            return None, False
+        targets = [word for word in words[1:] if word == "-" or not word.startswith("-")]
+        if not targets:
+            return (USER_HOME, True) if trusted else (None, False)
+        if len(targets) > 1:
+            return None, False
+        target = targets[0]
+        if target == "-" or _is_computed(target):
+            return None, False
+        resolved = _expand(target, cwd)
+        # A cd that may be skipped, grouped, backgrounded or failed leaves the real folder unknown.
+        if not trusted or resolved is None or not os.path.isdir(resolved):
+            return None, False
+        return resolved, True
+    if name in SHELLS:
+        for index, word in enumerate(words[:-1]):
+            if word in {"-c", "-lc", "-ic"}:
+                _check_command(words[index + 1], cwd)
+                break
+        return shell_cwd, False
+    if name == "eval":
+        _check_command(" ".join(words[1:]), cwd)
+        return shell_cwd, False
+    if name.rstrip("0123456789.") in INTERPRETERS:
+        heredoc = command_text.split("<<", 1)[1] if "<<" in command_text else ""
+        if INLINE_RECURSIVE_DELETE.search(" ".join(words[1:])) or INLINE_RECURSIVE_DELETE.search(heredoc):
+            raise Denied(message("delete_guard.reason.inline_delete"))
+    if name == "rm":
+        _rm(words, cwd)
+    elif name in TRASH_TOOLS:
+        _trash(words, cwd)
+    elif name == "find":
+        _find(words, cwd)
+    elif name == "xargs":
+        _xargs(words)
+    elif name == "rsync":
+        _rsync(words, cwd)
+    elif ERASE_TOOL.fullmatch(name):
+        raise Denied(message("delete_guard.reason.erase_tool", name=name))
+    elif name == "diskutil" and any(DISKUTIL_ERASE.match(word) for word in words[1:]):
+        raise Denied(message("delete_guard.reason.diskutil"))
+    elif name == "dd":
+        for word in words[1:]:
+            if word.startswith("of="):
+                if _is_computed(word[3:]):
+                    raise Denied(message("delete_guard.reason.computed_path", verb="dd", raw=word[3:]))
+                resolved = _expand(word[3:], cwd)
+                if resolved is None or _inside(resolved, "/dev"):
+                    raise Denied(message("delete_guard.reason.dd_device"))
+    elif name == "git":
+        _git_clean(words)
+    return shell_cwd, False
+
+
+# Ignored files hold machine-local notes and archives, so a real `git clean` run is never automatic.
+def _git_clean(words: list[str]) -> None:
+    index = 1
+    while index < len(words) and words[index].startswith("-"):
+        index += 2 if words[index] in GIT_VALUE_OPTIONS else 1
+    if index >= len(words) or words[index] != "clean":
+        return
+    dry_run = False
+    position = index + 1
+    while position < len(words) and words[position] != "--":
+        option = words[position]
+        position += 1
+        if option.startswith("--"):
+            name = option.split("=", 1)[0]
+            if name == "--dry-run":
+                dry_run = True
+            elif name == "--no-dry-run":
+                dry_run = False
+            elif name == "--exclude" and "=" not in option:
+                position += 1
+        elif option.startswith("-") and len(option) > 1:
+            letters = option[1:]
+            for offset, letter in enumerate(letters):
+                if letter == "n":
+                    dry_run = True
+                elif letter == "e":
+                    if offset == len(letters) - 1:
+                        position += 1
+                    break
+    if not dry_run:
+        raise Denied(message("delete_guard.reason.git_clean"))
+
+
+def _check_command(command: str, cwd: str | None) -> None:
+    if not QUICK_SCAN.search(command):
+        return
+    if len(command) > MAX_COMMAND_CHARS:
+        raise Denied(message("delete_guard.reason.too_large"))
+    # A substitution can run from anywhere in the command, so its body is checked on its own, from an unknown
+    # folder whenever the command also changes directory.
+    substitution_cwd = None if re.search(r"\b(?:cd|pushd|popd)\b", command) else cwd
+    for body in command_substitutions(command):
+        if body.strip():
+            _check_command(body, substitution_cwd)
+    chunks = _tokenize(command)
+    if chunks is None:
+        if INLINE_RECURSIVE_DELETE.search(command) or re.search(r"-delete\b", command):
+            raise Denied(message("delete_guard.reason.unparseable"))
+        return
+    current = os.path.realpath(cwd) if cwd else None
+    grouped = False
+    previous_cd_known = False
+    conditional = False
+    for chunk in chunks:
+        grouped = grouped or chunk.opened
+        if not chunk.words:
+            continue
+        # A folder learned after && holds only while the commands keep chaining with &&; anything else may still run.
+        if conditional and chunk.before != "&&":
+            current, conditional = None, False
+        # A cd after && only runs if the command before it worked. It is trusted after a known cd, or when the
+        # next command also waits on it with &&, so skipping it can never leave a later command in the wrong folder.
+        reached = chunk.before in {None, ";"} or (
+            chunk.before == "&&" and (previous_cd_known or chunk.after == "&&")
+        )
+        # A failed redirection stops its cd, so a redirected cd is trusted only when && keeps the next command waiting on it.
+        trusted = (
+            not grouped
+            and (not chunk.redirected or chunk.after == "&&")
+            and chunk.words[0] not in SHELL_KEYWORDS
+            and reached
+            and chunk.after in {None, ";", "&&"}
+        )
+        current, previous_cd_known = _check_chunk(chunk.words, current, command, trusted)
+        if previous_cd_known and chunk.before == "&&" and chunk.after == "&&":
+            conditional = True
+
+
+def _run_hook() -> int:
+    try:
+        raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+        if len(raw) > MAX_INPUT_BYTES:
+            raise ValueError
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError
+    except (OSError, TypeError, ValueError):
+        emit_decision("deny", message("delete_guard.deny_input"))
+        return 0
+    tool_input = payload.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str):
+        return 0
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
+    workdir = tool_input.get("workdir")
+    if isinstance(workdir, str) and workdir:
+        cwd = workdir if os.path.isabs(workdir) or cwd is None else os.path.join(cwd, workdir)
+    try:
+        _check_command(command, cwd)
+    except Denied as denial:
+        _emit_deny(str(denial))
+    except Exception:
+        if not fail_open():
+            emit_decision("deny", message("delete_guard.deny_internal"))
+    return 0
+
+
+def _self_test() -> int:
+    probe = _repository_root(os.getcwd()) or ""
+    blocked = [
+        "rm -rf ~/Documents",
+        "rm -rf ~",
+        "rm -rf /",
+        "rm -rf /Users/x",
+        '/bin/rm -rf "$WT"/',
+        "rm -rf $HOME",
+        "sudo rm -rf /opt/x",
+        "cd ~ && rm -rf Documents",
+        "cd ~\nrm -rf Documents",
+        "find ~ -mindepth 1 -delete",
+        "find ~/Documents -name x -exec rm -rf {} +",
+        "find . -type f | xargs rm -f",
+        "python3 -c 'import shutil; shutil.rmtree(\"/x\")'",
+        "bash -lc 'rm -rf ~/Library'",
+        "rm -rf /Volumes/Drive",
+        "rm -rf /mnt/data",
+        "diskutil eraseDisk APFS X disk4",
+        "dd if=/dev/zero of=/dev/disk4",
+        "trash ~/Documents",
+        "rm -rf *",
+        "rsync -a --delete src/ ~/Documents/",
+        "git clean -fdx",
+        "git -C /tmp/r clean -fd",
+    ]
+    allowed = [
+        "rm -rf /private/tmp/agent-probe",
+        "rm -rf /tmp/agent-probe/build",
+        "rm -rf /var/tmp/agent-probe",
+        "rm -f /tmp/x.log",
+        "rmdir empty-dir",
+        "trash /private/tmp/old",
+        "git rm -r --cached x",
+        "git worktree remove .worktrees/old",
+        "find /tmp/x -name '*.log' -delete",
+        "rg -n 'rm -rf' docs",
+        "ls -la",
+        "echo find this",
+        "git clean -ndx",
+        "git status --short",
+    ]
+    if probe:
+        allowed.append(f"rm -rf {probe}/build/outputs")
+        blocked.append(f"rm -rf {probe}")
+        blocked.append(f"rm -rf {probe}/.git")
+    failures = []
+    for command in blocked:
+        try:
+            _check_command(command, probe or "/private/tmp")
+            failures.append(f"allowed: {command!r}")
+        except Denied:
+            pass
+    for command in allowed:
+        try:
+            _check_command(command, probe or "/private/tmp")
+        except Denied as denial:
+            failures.append(f"blocked: {command!r} ({denial})")
+    status = "self_test_passed" if not failures else "self_test_failed"
+    sys.stdout.write(json.dumps({"tool": TOOL_NAME, "status": status, "failures": failures, "repo_probe": bool(probe)}) + "\n")
+    return 0 if not failures else 1
+
+
+def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "self-test":
+        return _self_test()
+    arguments = sys.argv[1:]
+    if arguments[:1] == ["hook"] and 2 <= len(arguments) <= 3 and arguments[1] in {"claude", "codex"}:
+        if len(arguments) == 2 or arguments[2] in HOOK_EVENTS:
+            return _run_hook()
+    sys.stderr.write(message("delete_guard.cli.usage") + "\n")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
