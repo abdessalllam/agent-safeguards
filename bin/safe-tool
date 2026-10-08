@@ -12,6 +12,7 @@ if __name__ == "__main__" and not sys.flags.isolated and sys.executable:
     posix.execv(sys.executable, [sys.executable, "-I", *sys.argv])
 
 import fcntl
+import fnmatch
 import glob
 import itertools
 import json
@@ -22,6 +23,7 @@ import stat
 import subprocess
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import unquote
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
 
@@ -124,22 +126,32 @@ SHELL_COMMAND_OPTION = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 STARTUP_RC_NAMES = r"zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|login|logout|kshrc|cshrc|tcshrc"
 STARTUP_HISTORY_NAMES = (
     r"zsh_history|bash_history|sh_history|history|zhistory|python_history|psql_history|mysql_history|sqlite_history|node_repl_history"
-    r"|irb_history|rediscli_history|dbshell|viminfo|lesshst"
+    r"|irb_history|rediscli_history|dbshell|viminfo|lesshst|Rhistory"
 )
 STARTUP_FOLDERS = r"zsh|zprezto/runcoms|oh-my-zsh/custom|config/(?:fish|zsh|bash)"
-STARTUP_HISTORY_FOLDERS = r"zsh_sessions|bash_sessions|local/share/fish"
+STARTUP_HISTORY_FOLDERS = r"zsh_sessions|bash_sessions|local/share/fish|local/state/zsh|local/share/zsh|cache/zsh|local/share/atuin"
 STARTUP_SYSTEM_FILES = (
-    r"/etc/(?:zshrc|zprofile|zshenv|zlogin|zlogout|profile|bashrc|bash\.bashrc|environment)(?![A-Za-z0-9_])|/etc/(?:zsh|bash|profile\.d)/"
+    r"(?:/private)?/etc/(?:zshrc|zprofile|zshenv|zlogin|zlogout|profile|bashrc|bash\.bashrc|environment)(?![A-Za-z0-9_])"
+    r"|(?:/private)?/etc/(?:zsh|bash|profile\.d)/"
 )
 # Only these may be sourced: a history file is never a script to run.
 STARTUP_SOURCEABLE = r"\.(?:" + STARTUP_RC_NAMES + r")(?![A-Za-z0-9_])|\.(?:" + STARTUP_FOLDERS + ")/|" + STARTUP_SYSTEM_FILES
-STARTUP_NAME = STARTUP_SOURCEABLE + r"|\.(?:" + STARTUP_HISTORY_NAMES + r")(?![A-Za-z0-9_])|\.(?:" + STARTUP_HISTORY_FOLDERS + ")/"
-STARTUP_FILE_PATTERN = re.compile(r"(?:^|[\s\"'=:(<>|;&/~{`])(?:" + STARTUP_NAME + ")", re.IGNORECASE)
+STARTUP_NAME_END = r"(?=/|[\s\"';&|()<>`]|$)"
+STARTUP_HISTORY = r"\.(?:" + STARTUP_HISTORY_NAMES + r")(?![A-Za-z0-9_])|\.(?:" + STARTUP_HISTORY_FOLDERS + ")" + STARTUP_NAME_END
+STARTUP_NAME = STARTUP_SOURCEABLE + r"|\.(?:" + STARTUP_FOLDERS + ")" + STARTUP_NAME_END + "|" + STARTUP_HISTORY
+STARTUP_BOUNDARY = r"(?:^|[\s\"'=:(<>|;&/{`])"
+STARTUP_FILE_PATTERN = re.compile(STARTUP_BOUNDARY + "(?:" + STARTUP_NAME + ")", re.IGNORECASE)
+STARTUP_HISTORY_PATTERN = re.compile(STARTUP_BOUNDARY + "(?:" + STARTUP_HISTORY + ")", re.IGNORECASE)
+STARTUP_SAMPLE_NAMES = tuple("." + name.lower() for name in (STARTUP_RC_NAMES + "|" + STARTUP_HISTORY_NAMES).split("|"))
+GLOB_SYNTAX_PATTERN = re.compile(r"\*|\?|\[[^\]]+\]|\{[^{}]*,[^{}]*\}")
+FIND_NAME_PATTERN = re.compile(r"-(?:i?name|i?path)[ \t]+(?:'([^']*)'|\"([^\"]*)\"|([^\s;&|()<>`]+))")
 # Metadata checks stay allowed only on their own: a pipe, loop or substitution could feed the path to a command that reads it.
-PIPELINE_CONTEXT_PATTERN = re.compile(r"(?<!\|)\|(?!\|)|`|\$\(|[<>]\(|\b(?:xargs|while|for|eval|exec|parallel)\b|-exec|-ok\b")
+PIPELINE_OPERATOR_PATTERN = re.compile(r"(?<!\|)\|(?!\|)|`|\$\(|[<>]\(")
+PIPELINE_WORD_PATTERN = re.compile(r"\b(?:xargs|while|for|eval|exec|parallel)\b|-exec|-ok\b")
 HISTORY_VARIABLE_PATTERN = re.compile(r"\$\{?histfile\b", re.IGNORECASE)
 PROCESS_ENVIRONMENT_PATTERN = re.compile(r"/proc/[^\s/]+/environ")
 MAX_GLOB_WORDS = 20
+MAX_GLOB_WORD_CHARS = 512
 MAX_GLOB_VARIANTS = 256
 MAX_GLOB_MATCHES = 2000
 # A command that prints a variable named like a secret shows the secret, so it is refused for the printing commands.
@@ -160,7 +172,9 @@ SOURCE_STARTUP_PATTERN = re.compile(
     re.IGNORECASE,
 )
 METADATA_STARTUP_PATTERN = re.compile(
-    STARTUP_COMMAND_POSITION + r"(?:rtk[ \t]+(?:proxy[ \t]+)?)?(?:[^\s;&|()<>`]*/)?(?:ls|stat|test|\[\[?)[ \t]+[^;&|()<>`\n]*", re.IGNORECASE
+    STARTUP_COMMAND_POSITION
+    + r"(?:rtk[ \t]+(?:proxy[ \t]+)?)?(?:/usr/bin/|/bin/|/usr/local/bin/|/opt/[a-z]+/bin/)?(?:ls|stat|test|\[\[?)[ \t]+[^;&|()<>`\n]*",
+    re.IGNORECASE
 )
 HAS_KEY_STARTUP_PATTERN = re.compile(
     STARTUP_COMMAND_POSITION + r"(?:safe-tool|~/\.local/bin/safe-tool|\$\{?HOME\}?/\.local/bin/safe-tool)[ \t]+has-key\b[^;&|()<>`\n]*",
@@ -168,6 +182,8 @@ HAS_KEY_STARTUP_PATTERN = re.compile(
 )
 # Verbose and trace modes print the lines of a sourced file and the values the shell expands.
 TRACE_OPTION = re.compile(r"-[a-z]*[vx][a-z]*|--(?:verbose|xtrace)")
+TRACE_OPTION_NAMES = frozenset({"sourcetrace", "verbose", "xtrace"})
+TRACE_COMMANDS = frozenset({"bash", "set", "setopt", "sh", "zsh"})
 STARTUP_KEY_FILES = (".zshrc", ".zshenv", ".zprofile", ".bashrc", ".bash_profile", ".profile")
 KEY_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 KEY_ASSIGNMENT_PATTERN = re.compile(r"[ \t]*(?:(?:export|readonly|declare|typeset)[ \t]+(?:-[A-Za-z]+[ \t]+)*)?([A-Za-z_][A-Za-z0-9_]*)=(.*)")
@@ -442,6 +458,27 @@ def _prints_definitions(command: str, arguments: list[str]) -> bool:
     return command == "set" and not arguments
 
 
+SEARCH_COMMANDS = frozenset({"ack", "ag", "egrep", "fgrep", "grep", "rg"})
+
+
+# A recursive search that starts at the home folder (or above it) reads every startup and history file on the way.
+def _searches_home(executable: str, arguments: list[str]) -> bool:
+    options = [argument for argument in arguments if argument.startswith("-")]
+    if executable in {"grep", "egrep", "fgrep"}:
+        recursive = any(argument in {"--recursive", "--dereference-recursive"} or re.fullmatch(r"-[A-Za-z0-9]*[rR][A-Za-z0-9]*", argument) for argument in options)
+    else:
+        recursive = executable != "rg" or any(re.fullmatch(r"--hidden|-u{2,}|-\.", argument) for argument in options)
+    if not recursive:
+        return False
+    for operand in (argument for argument in arguments if not argument.startswith("-")):
+        expanded = re.sub(r"^(?:~|\$HOME|\$\{HOME\})(?=/|$)", USER_HOME, operand)
+        if os.path.isabs(expanded):
+            target = os.path.realpath(expanded)
+            if target == USER_HOME or (USER_HOME + os.sep).startswith(target.rstrip(os.sep) + os.sep):
+                return True
+    return False
+
+
 def _sensitive_chunk(raw_words: list[str]) -> bool:
     if all(ASSIGNMENT.fullmatch(word) or word in SHELL_KEYWORDS for word in raw_words):
         return False
@@ -454,9 +491,10 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
     normalized = [_normalized(word) for word in words]
     if normalized[0] == TOOL_NAME:
         return not _is_self(words[0])
-    if normalized[0] in {"bash", "sh", "zsh"} and any(TRACE_OPTION.fullmatch(argument) for argument in normalized[1:]):
-        return True
-    if normalized[0] == "set" and (any(TRACE_OPTION.fullmatch(argument) for argument in normalized[1:]) or {"verbose", "xtrace"} & set(normalized[1:])):
+    if normalized[0] in TRACE_COMMANDS and (
+        any(re.sub(r"[_-]", "", argument) in TRACE_OPTION_NAMES for argument in normalized[1:])
+        or (normalized[0] != "setopt" and any(TRACE_OPTION.fullmatch(argument) for argument in normalized[1:]))
+    ):
         return True
     if normalized[0] == "eval" and len(words) > 1:
         return _sensitive_command(" ".join(words[1:]))
@@ -482,7 +520,11 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
     arguments = _without_global_options(executable, normalized[1:])
     first = arguments[0] if arguments else ""
     second = arguments[1] if len(arguments) > 1 else ""
+    raw_arguments = _without_global_options(executable, words[1:])
+    startup_operand = bool(raw_arguments) and STARTUP_FILE_PATTERN.search(" " + raw_arguments[0]) is not None
     if executable in {"coderabbit", "cr"} and first in {"auth", "doctor", "stats", "usage"}:
+        return True
+    if executable in SEARCH_COMMANDS and _searches_home(executable, words[1:]):
         return True
     if executable == "ps" and re.fullmatch(r"-?[a-z]*e[a-z]*", first):
         return True
@@ -518,11 +560,13 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
         return True
     if executable == "ssh-add" and any(argument in {"-l", "-L"} for argument in arguments):
         return True
+    if startup_operand:
+        return False
     if first == "doctor" or first == "whoami":
         return True
     if first == "status" and executable != "git":
         return True
-    if executable not in {"source", "."} and first in GENERIC_PRIVATE_SUBCOMMANDS and (not second or second in GENERIC_PRIVATE_ACTIONS):
+    if first in GENERIC_PRIVATE_SUBCOMMANDS and (not second or second in GENERIC_PRIVATE_ACTIONS):
         return True
     if first == "config" and any(argument in GENERIC_PRIVATE_ACTIONS or argument in {"--list", "-l", "dump", "view"} for argument in arguments[1:]):
         return True
@@ -546,14 +590,18 @@ def _expand_braces(word: str) -> list[str] | None:
 # Globs and braces are expanded against the real folders, the way the shell would, so `cat ~/.z*` is seen for what it reads.
 def _glob_names_startup_file(text: str) -> bool:
     # A shell never expands a glob inside quotes, so quoted text (a sed script, a grep pattern) is not looked at; a quoted
-    # home folder in front of an unquoted glob still counts as the home folder. find matches its quoted patterns itself,
-    # so when it runs something on the matches or feeds a pipe, the quoted patterns are looked at too.
-    unquoted = re.sub(r'"\$\{?HOME\}?"', "~", text)
-    if not (re.search(r"\bfind\b", text) and re.search(r"-exec|-ok|\|", text)):
-        unquoted = re.sub(r"'[^']*'|\"[^\"]*\"", " ", unquoted)
-    words = [word for word in re.findall(r"[^\s;&|()<>\"'`]+", unquoted) if any(character in word for character in "*?[{")]
+    # home folder in front of an unquoted glob still counts as the home folder.
+    unquoted = re.sub(r"'[^']*'|\"[^\"]*\"", " ", re.sub(r'"\$\{?HOME\}?"', "~", text))
+    # Only a word that can be a path to a startup file is expanded (it starts like a path or has a folder in it) and is
+    # short enough to be one; that keeps ordinary code, with its many brackets and braces, out of the filesystem.
+    words = [
+        word
+        for word in re.findall(r"[^\s;&|()<>\"'`]+", unquoted)
+        if len(word) <= MAX_GLOB_WORD_CHARS and GLOB_SYNTAX_PATTERN.search(word) and (word[0] in "~$/.{" or "/" in word)
+    ]
     if len(words) > MAX_GLOB_WORDS:
         return True
+    from_home = re.search(r"\b(?:cd|pushd)\b", text) is not None or os.path.realpath(os.getcwd()) == USER_HOME
     for word in words:
         variants = _expand_braces(word)
         if variants is None:
@@ -563,7 +611,7 @@ def _glob_names_startup_file(text: str) -> bool:
             if not any(character in expanded for character in "*?["):
                 candidates = [expanded]
             else:
-                patterns = [expanded] if os.path.isabs(expanded) else [expanded, os.path.join(USER_HOME, expanded)]
+                patterns = [expanded] if os.path.isabs(expanded) else [expanded] + ([os.path.join(USER_HOME, expanded)] if from_home else [])
                 candidates = [match for pattern in patterns for match in itertools.islice(glob.iglob(pattern), MAX_GLOB_MATCHES)]
             for candidate in candidates:
                 shown = candidate + "/" if os.path.isdir(candidate) else candidate
@@ -572,15 +620,44 @@ def _glob_names_startup_file(text: str) -> bool:
     return False
 
 
+# find matches its own patterns, including hidden files, and can run a reader on every match.
+def _find_names_startup_file(text: str) -> bool:
+    if re.search(r"\bfind\b", text) is None or (PIPELINE_OPERATOR_PATTERN.search(text) is None and PIPELINE_WORD_PATTERN.search(text) is None):
+        return False
+    for match in FIND_NAME_PATTERN.finditer(text):
+        pattern = (match.group(1) or match.group(2) or match.group(3) or "").rsplit("/", 1)[-1].lower()
+        if any(fnmatch.fnmatchcase(sample, pattern) for sample in STARTUP_SAMPLE_NAMES):
+            return True
+    return False
+
+
+# Quotes, backslashes and percent escapes inside a name do not change the file the shell or a URL opens.
+def _mentions_startup_file(text: str) -> bool:
+    return any(STARTUP_FILE_PATTERN.search(variant) for variant in (text, re.sub(r"[\"'\\]", "", text), unquote(text)))
+
+
+def _pipeline_context(text: str) -> bool:
+    return PIPELINE_OPERATOR_PATTERN.search(text) is not None or PIPELINE_WORD_PATTERN.search(re.sub(r"'[^']*'|\"[^\"]*\"", " ", text)) is not None
+
+
+# A sourced path is exempt only when it names one startup file or folder: it cannot climb out with .., use a brace or glob,
+# or also name a history file, because sourcing a history file runs its lines and prints them as errors.
+def _safe_source(match: re.Match) -> str:
+    token = match.group(0)
+    if ".." in token or any(character in token for character in "{}*?[,") or STARTUP_HISTORY_PATTERN.search(token):
+        return token
+    return " "
+
+
 def _reads_startup_file(command: str) -> bool:
     if HISTORY_VARIABLE_PATTERN.search(command):
         return True
-    if STARTUP_FILE_PATTERN.search(command) is None and not _glob_names_startup_file(command):
+    if not (_mentions_startup_file(command) or _glob_names_startup_file(command) or _find_names_startup_file(command)):
         return False
-    remainder = HAS_KEY_STARTUP_PATTERN.sub(" ", SOURCE_STARTUP_PATTERN.sub(" ", command))
-    if PIPELINE_CONTEXT_PATTERN.search(command) is None:
+    remainder = HAS_KEY_STARTUP_PATTERN.sub(" ", SOURCE_STARTUP_PATTERN.sub(_safe_source, command))
+    if not _pipeline_context(command):
         remainder = METADATA_STARTUP_PATTERN.sub(" ", remainder)
-    return STARTUP_FILE_PATTERN.search(remainder) is not None or _glob_names_startup_file(remainder)
+    return _mentions_startup_file(remainder) or _glob_names_startup_file(remainder) or _find_names_startup_file(remainder)
 
 
 def _sensitive_command(command: str) -> bool:
@@ -606,7 +683,7 @@ def _sensitive_command(command: str) -> bool:
 # The same holds for a startup file: the agent needs the two safe alternatives, not the generic refusal.
 def _blocked_only_by_startup_file(command: str) -> bool:
     neutral = STARTUP_NAME_PATTERN.sub(".neutral", command)
-    return neutral != command and not _sensitive_command(neutral)
+    return _reads_startup_file(command) and neutral != command and not _sensitive_command(neutral)
 
 
 # When the proxy prefix is the only problem the agent needs the one-line fix, not the generic refusal.
@@ -1231,24 +1308,48 @@ def _startup_key_file(requested: str | None) -> str | None:
     return expanded
 
 
-def _assigned_names(line: str) -> list[str]:
-    try:
-        tokens = shlex.split(line, comments=True)
-    except ValueError:
-        return []
-    keyword = bool(tokens) and tokens[0] in {"export", "readonly", "declare", "typeset"}
-    if keyword:
-        tokens = tokens[1:]
-        while tokens and re.fullmatch(r"-[A-Za-z]+", tokens[0]):
-            tokens = tokens[1:]
-    names = []
-    for token in tokens:
-        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.+)", token, re.DOTALL)
+def _apply_command(words: list[str], found: set[str]) -> None:
+    while words and words[0] in {"then", "do", "else", "!"}:
+        words = words[1:]
+    if not words:
+        return
+    if words[0] == "unset":
+        found.difference_update(word for word in words[1:] if not word.startswith("-"))
+        return
+    keyword = words[0] in {"export", "readonly", "declare", "typeset"}
+    rest = words[1:] if keyword else words
+    while keyword and rest and re.fullmatch(r"-[A-Za-z]+", rest[0]):
+        rest = rest[1:]
+    assignments = []
+    for token in rest:
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\+?=(.*)", token, re.DOTALL)
         if match:
-            names.append(match.group(1))
-        elif not keyword and "=" not in token:
-            return []
-    return names if keyword or len(names) == len(tokens) else []
+            assignments.append((match.group(1), match.group(2)))
+        elif not keyword:
+            return
+    for name, value in assignments:
+        if value:
+            found.add(name)
+        else:
+            found.discard(name)
+
+
+def _apply_line(line: str, found: set[str]) -> None:
+    try:
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        tokens = list(lexer)
+    except ValueError:
+        return
+    command: list[str] = []
+    for token in tokens:
+        if token and all(character in ";&|" for character in token):
+            _apply_command(command, found)
+            command = []
+        else:
+            command.append(token)
+    _apply_command(command, found)
 
 
 def _keys_set_in(path: str) -> tuple[set[str], bool]:
@@ -1258,7 +1359,7 @@ def _keys_set_in(path: str) -> tuple[set[str], bool]:
             for number, line in enumerate(handle):
                 if number >= MAX_STARTUP_FILE_LINES:
                     return found, False
-                found.update(_assigned_names(line))
+                _apply_line(line, found)
     except OSError:
         return set(), True
     return found, True
