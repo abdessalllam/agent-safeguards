@@ -108,7 +108,7 @@ CLI_GLOBAL_VALUE_OPTIONS = {
     ),
 }
 SAFE_PROXY_COMMANDS = frozenset(
-    {"awk", "cmp", "diff", "du", "find", "git", "grep", "head", "ls", "rg", "sed", "stat", "tail", "wc"}
+    {"awk", "cat", "cmp", "diff", "du", "find", "git", "grep", "head", "ls", "rg", "sed", "stat", "tail", "wc"}
 )
 DIRECT_IDENTITY_COMMANDS = frozenset(
     {"env", "finger", "groups", "logname", "printenv", "users", "whoami"}
