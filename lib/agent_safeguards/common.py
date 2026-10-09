@@ -44,6 +44,7 @@ COMMAND_BOUNDARY = " \t\n;&|("
 OPERAND_END = " \t\n;&|<>()"
 REDIRECTION_SUFFIX = "&|-"
 REDIRECTION_MARKER = "\x1f"
+OPENING_QUOTE_MARKER = "\x01"
 MAX_SPLIT_STRING_EXPANSIONS = 64
 MAX_COMMAND_CHARS = 256 * 1024
 GIT_VALUE_OPTIONS = frozenset(
@@ -130,12 +131,17 @@ class UnresolvableCommand(Exception):
     pass
 
 
-def _skip_quoted(command: str, index: int) -> int:
+def _closing_quote(command: str, index: int) -> int | None:
     quote = command[index]
     index += 1
     while index < len(command) and command[index] != quote:
         index += 2 if command[index] == "\\" and quote == '"' else 1
-    return min(index + 1, len(command))
+    return index if index < len(command) else None
+
+
+def _skip_quoted(command: str, index: int) -> int:
+    closing = _closing_quote(command, index)
+    return len(command) if closing is None else closing + 1
 
 
 def _skip_operand(command: str, index: int) -> int:
@@ -197,6 +203,61 @@ def normalize_command(command: str) -> str:
         else:
             kept.append(character)
             at_word_start = character in COMMAND_BOUNDARY
+            index += 1
+    return "".join(kept)
+
+
+# What the shell would expand: quoted spans and comments become a space, an escaped character becomes an underscore and an
+# escaped newline disappears. Redirections stay, unlike in normalize_command, because their operands can name files too.
+def unquoted_text(command: str) -> str:
+    length = len(command)
+    kept: list[str] = []
+    index = 0
+    at_word_start = True
+    while index < length:
+        character = command[index]
+        closing = _closing_quote(command, index) if character in "'\"" else None
+        if closing is not None:
+            kept.append(" ")
+            index, at_word_start = closing + 1, False
+        elif character == "\\":
+            if command[index + 1 : index + 2] != "\n":
+                kept.append("_")
+                at_word_start = False
+            index += 2
+        elif character == "#" and at_word_start:
+            while index < length and command[index] != "\n":
+                index += 1
+        else:
+            kept.append(character)
+            at_word_start = character in COMMAND_BOUNDARY
+            index += 1
+    return "".join(kept)
+
+
+# A quote can pair with one in a later line (an apostrophe in a here-document body), which would blank the lines between
+# them, so checks that must not miss a command look at each line on its own.
+def unquoted_lines(command: str) -> list[str]:
+    return [unquoted_text(line) for line in command.replace("\\\n", "").split("\n")]
+
+
+# The same text with each opening quote replaced by a marker of equal length, so a pattern can tell a quote that opens a
+# string from one that closes it without changing any offset.
+def mark_opening_quotes(command: str) -> str:
+    length = len(command)
+    kept: list[str] = []
+    index = 0
+    while index < length:
+        character = command[index]
+        closing = _closing_quote(command, index) if character in "'\"" else None
+        if closing is not None:
+            kept.append(OPENING_QUOTE_MARKER + command[index + 1 : closing + 1])
+            index = closing + 1
+        elif character == "\\":
+            kept.append(command[index : index + 2])
+            index += 2
+        else:
+            kept.append(character)
             index += 1
     return "".join(kept)
 
