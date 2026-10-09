@@ -5,7 +5,7 @@ Website screenshots that stay inside fixed limits: PNG only, at most 1568 pixels
 | File | What it does |
 | --- | --- |
 | `web-shot` | Takes a screenshot of an `http` or `https` page with headless Chrome (or Chromium, Edge, Brave), keeps it within the limits, saves it as a new PNG, and prints the path. The agent then reads that file with the image reader. |
-| `limit-browser-screenshot.py` | A Claude Code `PreToolUse` hook for the in-app browser and the Claude in Chrome extension. It denies a `screenshot` or `zoom` that does not ask for `scale` 0.5 or lower, and tells the agent how to retry. Clicks, typing and every other action are not touched. |
+| `limit-browser-screenshot.py` | A Claude Code `PreToolUse` hook for the in-app browser and the Claude in Chrome extension. It denies a `screenshot` or `zoom` that does not ask for a `scale` above 0 and at most 0.5, and tells the agent how to retry. Clicks, typing and every other action are not touched, unless the request is too large or too deeply nested to check. |
 
 ## Why
 
@@ -19,7 +19,7 @@ Every screenshot stays in the chat and is sent again with each new message. The 
 | Default viewport | 1280 by 800 |
 | Longest side | 1568 pixels at most (`--width` and `--height` accept 100 to 1568) |
 | File size | 1 MB at most. A heavier capture is shrunk in 20% steps until it fits, and refused if it cannot get under 1 MB above 320 pixels. |
-| Browser tool scale | 0.5 or lower |
+| Browser tool scale | above 0, at most 0.5 |
 
 These values come from `lib/agent_safeguards/screenshot.py` and the hook, and the simulator extras share them.
 
@@ -64,13 +64,13 @@ web-shot https://example.com --width 1024 --height 768
 ```
 
 - Only `http` and `https` addresses are accepted. `file:`, `javascript:`, `data:` and similar schemes are refused, because a screenshot of a local file would put its content in front of the model, and an address with a username or password is refused so credentials never reach a log.
-- It only creates new `.png` files. It refuses to overwrite an existing file or to write any other extension, and a page that answers with a file to download is kept inside the throwaway browser profile, which is deleted. It still makes web requests to the address it is given, as `curl` does, so granting the allow rule gives an agent the same reach as an allowed `curl`. Link-local addresses, which cloud metadata services use, are refused.
+- It only creates new `.png` files. It refuses to overwrite an existing file or to write any other extension, and a page that answers with a file to download is kept inside the throwaway browser profile, which is deleted. It still makes web requests to the address it is given, as `curl` does, so granting the allow rule gives an agent the same reach as an allowed `curl`. Link-local addresses, the known cloud metadata hosts and addresses (also written as decimal, octal or hex numbers) and any host name or address that is not plain ASCII are refused; a host name that resolves to such an address, and a redirect to one, are not checked.
 - It starts the browser with a fresh temporary profile, waits for the finished PNG, stops the browser, and removes the profile. A termination signal also stops the browser and removes the temporary files.
 - It captures the viewport, not the whole page, and waits up to 5 seconds of page time for scripts to settle. A page that needs a login or interaction is out of reach, so use a browser tool for that and keep its screenshots small.
 
 ## The browser hook
 
-The in-app browser and the Claude in Chrome extension return the image straight into the chat, so a hook cannot see or change what comes back. It limits the request instead: a `screenshot` or `zoom` must carry `scale` 0.5 or lower, including inside a `browser_batch` call. The tools already cap an unscaled image to a token budget, and this keeps it well below that.
+The in-app browser and the Claude in Chrome extension return the image straight into the chat, so a hook cannot see or change what comes back. It limits the request instead: a `screenshot` or `zoom` must carry a `scale` above 0 and at most 0.5, including inside a `browser_batch` call. The tools already cap an unscaled image to a token budget, and this keeps it well below that.
 
 - Older versions of the Claude in Chrome extension ignore `scale` and return a full-size image.
 - If your host names these tools differently, change the `matcher`.

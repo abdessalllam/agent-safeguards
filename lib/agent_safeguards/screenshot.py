@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import stat
 import struct
 import subprocess
@@ -27,6 +28,19 @@ _CLAIMED: dict[str, tuple[int, int]] = {}
 
 class ScreenshotError(Exception):
     """A failure whose text is already localized and ready to show."""
+
+
+# Shared by the commands that start helper processes and temporary files: the default action would end the process
+# before they are cleaned up, and a second signal must not interrupt the cleanup the first one started.
+def _terminate(signal_number: int, frame: object) -> None:
+    for name in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(name, signal.SIG_IGN)
+    raise SystemExit(128 + signal_number)
+
+
+def exit_on_termination() -> None:
+    for name in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(name, _terminate)
 
 
 def png_size(path: str) -> tuple[int, int] | None:
@@ -106,7 +120,7 @@ def _write_at(source: str, destination: str, side: int, source_side: int) -> Non
 def _publish(source: str, destination: str) -> None:
     # The final write goes through the descriptor of a file whose identity is checked, never through the path alone.
     try:
-        descriptor = os.open(destination, os.O_WRONLY | os.O_NOFOLLOW)
+        descriptor = os.open(destination, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         raise ScreenshotError(message("screenshot.error.not_writable", path=destination)) from None
     with os.fdopen(descriptor, "wb") as writer:
@@ -139,6 +153,8 @@ def fit_png(source: str, destination: str, max_side: int, max_bytes: int = MAX_B
             side = int(max(written) * SHRINK_STEP)
             if side < FLOOR_SIDE:
                 raise ScreenshotError(message("screenshot.error.too_big", pixels=max_side, kilobytes=max_bytes // 1024))
+    except OSError:
+        raise ScreenshotError(message("screenshot.error.not_writable", path=destination)) from None
     finally:
         try:
             os.remove(work)

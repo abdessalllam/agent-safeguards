@@ -19,7 +19,7 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "lib"))
 
 from agent_safeguards.common import find_executable, message  # noqa: E402
-from agent_safeguards.screenshot import MAX_SIDE, MIN_SIDE, ScreenshotError, discard, fit_png, reserve_output  # noqa: E402
+from agent_safeguards.screenshot import MAX_SIDE, MIN_SIDE, ScreenshotError, discard, exit_on_termination, fit_png, reserve_output  # noqa: E402
 
 TOOL_NAME = "sim-shot"
 XCRUN = find_executable("xcrun")
@@ -58,6 +58,7 @@ def main(arguments: list[str]) -> int:
         fail(message("sim_shot.error.no_tools"))
     if not MIN_SIDE <= args.max_side <= MAX_SIDE:
         fail(message("sim_shot.error.range", low=MIN_SIDE, high=MAX_SIDE))
+    exit_on_termination()
 
     output = None
     full = None

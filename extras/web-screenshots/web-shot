@@ -15,6 +15,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -26,7 +27,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "lib"))
 
 from agent_safeguards.common import find_executable, message  # noqa: E402
-from agent_safeguards.screenshot import MAX_SIDE, MIN_SIDE, ScreenshotError, discard, fit_png, reserve_output  # noqa: E402
+from agent_safeguards.screenshot import MAX_SIDE, MIN_SIDE, ScreenshotError, discard, exit_on_termination, fit_png, reserve_output  # noqa: E402
 
 TOOL_NAME = "web-shot"
 DEFAULT_WIDTH = 1280
@@ -38,6 +39,10 @@ POLL_SECONDS = 0.25
 PNG_END = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 ALLOWED_SCHEMES = ("http", "https")
 METADATA_HOSTS = frozenset({"metadata", "metadata.google.internal", "instance-data", "instance-data.ec2.internal"})
+METADATA_ADDRESSES = frozenset({ipaddress.ip_address("100.100.100.200"), ipaddress.ip_address("fd00:ec2::254")})
+# The browser rewrites percent escapes, full-width digits, other dots and backslashes in the host before it connects, so
+# only the plain spelling is accepted and the checks below see the host the browser will use.
+PLAIN_AUTHORITY = re.compile(r"[A-Za-z0-9._:\[\]-]+")
 BROWSER_PATHS = (
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
@@ -84,10 +89,11 @@ def checked_url(url: str) -> str:
     except ValueError:
         hostname = None
     clean = len(url) <= MAX_URL_CHARS and all(32 < ord(character) != 127 for character in url)
-    if not clean or hostname is None or parts.scheme not in ALLOWED_SCHEMES or "@" in parts.netloc:
+    if not clean or hostname is None or parts.scheme not in ALLOWED_SCHEMES or not PLAIN_AUTHORITY.fullmatch(parts.netloc):
         raise ScreenshotError(message("web_shot.error.bad_url"))
+    hostname = hostname.lower().rstrip(".")
     address = _address_of(hostname)
-    if hostname.lower().rstrip(".") in METADATA_HOSTS or (address is not None and address.is_link_local):
+    if hostname in METADATA_HOSTS or (address is not None and (address.is_link_local or address in METADATA_ADDRESSES)):
         raise ScreenshotError(message("web_shot.error.link_local"))
     return url
 
@@ -160,11 +166,6 @@ def capture(browser: str, url: str, width: int, height: int, destination: str) -
         raise ScreenshotError(message("web_shot.error.capture"))
 
 
-# The default action would end the process before the browser and the temporary files are cleaned up.
-def _terminate(signal_number: int, frame: object) -> None:
-    raise SystemExit(128 + signal_number)
-
-
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(prog=TOOL_NAME, usage=message("web_shot.usage"), add_help=False)
     parser.add_argument("url")
@@ -174,8 +175,7 @@ def main(arguments: list[str]) -> int:
     args = parser.parse_args(arguments)
     if not (MIN_SIDE <= args.width <= MAX_SIDE and MIN_SIDE <= args.height <= MAX_SIDE):
         fail(message("web_shot.error.range", low=MIN_SIDE, high=MAX_SIDE))
-    for name in ("SIGTERM", "SIGHUP"):
-        signal.signal(getattr(signal, name), _terminate)
+    exit_on_termination()
 
     output = None
     full = None

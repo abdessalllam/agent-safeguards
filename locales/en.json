@@ -1,5 +1,5 @@
 {
-  "browser_hook.reason": "Browser screenshots must ask for scale {scale} or lower, so the image stays small. Retry the same call with `scale` set to {scale} or lower, or run `web-shot <url>` for a PNG file within the limits and read the path it prints.",
+  "browser_hook.reason": "Browser screenshots must ask for a `scale` above 0 and at most {scale}, so the image stays small. Retry the same call with `scale` set to {scale} or lower (split a very large or deeply nested batch into smaller calls), or run `web-shot <url>` for a PNG file within the limits and read the path it prints.",
   "delete_guard.cli.usage": "usage: delete-guard hook <claude|codex> | delete-guard self-test",
   "delete_guard.deny": "Delete guard: {reason}. Delete only literal paths inside the current repository or worktree, or a temp folder. Remove a worktree with `git worktree remove <path>`; move anything else to the Trash with `trash <path>` (`trash-put <path>` or `gio trash <path>` on Linux). Resolve variables and globs first and pass the literal path. If this deletion is really needed, ask the user.",
   "delete_guard.deny_input": "Delete guard could not read this command and blocked it. Ask the user to run it outside the agent.",
@@ -46,9 +46,9 @@
   "sim_shot.hint": "Run `xcrun simctl list devices booted` to see what is running. If the capture is refused, skip the screenshot.",
   "sim_shot.usage": "sim-shot [--device <name|udid>] [--max-side <pixels>] [new-file.png]",
   "simulator_hook.reason": "The simulator control tool's screenshot returns an image the API rejects, and one such image breaks this chat for good. Approve only if you, the user, want to run it anyway. Agents: do not retry. Run `sim-shot` (optionally with a new .png path in a temp or scratchpad folder), then read the path it prints with the image reader. If sim-shot fails, skip the screenshot.",
-  "web_shot.error.bad_url": "only http and https addresses without a username or password are allowed",
+  "web_shot.error.bad_url": "only http and https addresses with a plain host name or address, and without a username or password, are allowed",
   "web_shot.error.capture": "the browser did not produce a screenshot",
-  "web_shot.error.link_local": "addresses in the link-local range, which cloud metadata services use, are refused",
+  "web_shot.error.link_local": "link-local addresses and the known cloud metadata hosts and addresses are refused",
   "web_shot.error.no_browser": "no Chrome, Chromium, Edge or Brave was found to take the screenshot",
   "web_shot.error.range": "--width and --height must be between {low} and {high}",
   "web_shot.error.timeout": "the browser did not finish within {seconds} seconds",
