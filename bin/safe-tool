@@ -164,6 +164,9 @@ PIPELINE_OPERATOR_PATTERN = re.compile(r"(?<!\|)\|(?!\|)|`|\$\(|[<>]\(")
 PIPELINE_WORD_PATTERN = re.compile(r"\b(?:xargs|while|for|eval|exec|parallel)\b|-exec|-ok(?:dir)?\b")
 HISTORY_VARIABLE_PATTERN = re.compile(r"\$\{?histfile\b", re.IGNORECASE)
 PROCESS_ENVIRONMENT_PATTERN = re.compile(r"/proc/\S{0,80}environ")
+# A revision:path operand names a file's content, never a commit, so showing it prints no author. A revision with braces
+# (`HEAD@{2020-01-01_10:00}`) or the `:/text` search form can name a commit, so they do not match.
+GIT_BLOB_SPEC = re.compile(r"[A-Za-z0-9_./~^@+-]{0,200}:(?!/)\S{1,500}")
 # One-element list so the message code can switch the startup rules off to ask whether they alone caused a refusal.
 _STARTUP_RULES = [True]
 MAX_GLOB_WORDS = 20
@@ -439,6 +442,16 @@ def _safe_history_arguments(arguments: list[str], *, show: bool) -> bool:
     return effective in SAFE_LOG_FORMATS
 
 
+def _shows_only_blobs(arguments: list[str]) -> bool:
+    operands = []
+    for argument in arguments:
+        if argument == "--":
+            break
+        if not argument.startswith("-"):
+            operands.append(argument)
+    return bool(operands) and all(GIT_BLOB_SPEC.fullmatch(operand) for operand in operands)
+
+
 def _sensitive_git_command(words: list[str]) -> bool:
     subcommand, arguments = _git_subcommand(words)
     if subcommand in {"blame", "cat-file", "commit", "config", "format-patch", "request-pull", "send-email", "shortlog", "whatchanged"}:
@@ -448,7 +461,7 @@ def _sensitive_git_command(words: list[str]) -> bool:
     if subcommand == "log":
         return not _safe_history_arguments(arguments, show=False)
     if subcommand == "show":
-        return not _safe_history_arguments(arguments, show=True)
+        return not (_safe_history_arguments(arguments, show=True) or _shows_only_blobs(arguments))
     if subcommand == "remote":
         return any(argument in {"-v", "--verbose", "get-url"} for argument in arguments)
     if subcommand == "rev-list":
