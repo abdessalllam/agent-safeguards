@@ -8,6 +8,7 @@ import pwd
 import re
 import shlex
 import sys
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -45,6 +46,9 @@ OPERAND_END = " \t\n;&|<>()"
 REDIRECTION_SUFFIX = "&|-"
 REDIRECTION_MARKER = "\x1f"
 OPENING_QUOTE_MARKER = "\x01"
+MAX_HEREDOCS = 16
+MAX_HEREDOC_NESTING = 8
+HEREDOC_DELIMITER_END = " \t\n;&|()<>"
 MAX_SPLIT_STRING_EXPANSIONS = 64
 MAX_COMMAND_CHARS = 256 * 1024
 GIT_VALUE_OPTIONS = frozenset(
@@ -260,6 +264,190 @@ def mark_opening_quotes(command: str) -> str:
             kept.append(character)
             index += 1
     return "".join(kept)
+
+
+# One here-document: where its marker sits, which logical line holds it, and the span of its body and terminator line.
+# `outer` is set when the marker is inside a command substitution: (start of the enclosing logical line, index of the
+# `$(`, the double quote it sits in or an empty string).
+@dataclass(frozen=True)
+class HereDocument:
+    line_start: int
+    marker_start: int
+    delimiter_end: int
+    line_end: int
+    body_start: int
+    body_end: int
+    end: int
+    quoted: bool
+    outer: tuple[int, int, str] | None
+
+
+def _read_delimiter(command: str, index: int) -> tuple[str, bool, int] | None:
+    length = len(command)
+    pieces: list[str] = []
+    quoted = False
+    while index < length and command[index] not in HEREDOC_DELIMITER_END:
+        character = command[index]
+        if character in "'\"":
+            closing = _closing_quote(command, index)
+            if closing is None:
+                return None
+            pieces.append(command[index + 1 : closing])
+            quoted, index = True, closing + 1
+        elif character == "\\":
+            if index + 1 >= length:
+                return None
+            pieces.append(command[index + 1])
+            quoted, index = True, index + 2
+        else:
+            pieces.append(character)
+            index += 1
+    return "".join(pieces), quoted, index
+
+
+# The shell ends a body at the first line that equals the delimiter (after leading tabs for <<-), so this stops no later
+# than the shell does and never hides a line the shell would run.
+def _find_terminator(command: str, start: int, delimiter: str, strip_tabs: bool) -> tuple[int, int] | None:
+    length = len(command)
+    position = start
+    while position < length:
+        newline = command.find("\n", position)
+        line_end = length if newline == -1 else newline
+        line = command[position:line_end]
+        if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+            return position, (length if newline == -1 else newline + 1)
+        if newline == -1:
+            return None
+        position = newline + 1
+    return None
+
+
+def _read_bodies(command: str, newline: int, pending: list, found: list) -> int:
+    position = newline + 1
+    documents = []
+    for line_start, marker_start, delimiter_end, delimiter, strip_tabs, quoted, outer in pending:
+        located = _find_terminator(command, position, delimiter, strip_tabs)
+        if located is None:
+            return newline + 1
+        terminator_start, end = located
+        documents.append(HereDocument(line_start, marker_start, delimiter_end, newline, position, terminator_start, end, quoted, outer))
+        position = end
+    found.extend(documents)
+    return position
+
+
+def _scan_double_quoted(command: str, index: int, found: list, depth: int, line_start: int) -> int:
+    length = len(command)
+    while index < length:
+        character = command[index]
+        if character == "\\":
+            index += 2
+        elif character == '"':
+            return index + 1
+        elif command.startswith("$(", index):
+            index = _scan_code(command, index + 2, True, found, depth + 1, (line_start, index, '"'))
+        elif character == "`":
+            index = _closing_backtick(command, index + 1) + 1
+        else:
+            index += 1
+    return length
+
+
+def _scan_code(command: str, index: int, nested: bool, found: list, depth: int, outer: tuple[int, int, str] | None) -> int:
+    length = len(command)
+    if depth > MAX_HEREDOC_NESTING:
+        return length
+    line_start = index
+    pending: list = []
+    parentheses = 0
+    while index < length:
+        character = command[index]
+        if character == "\n":
+            newline = index
+            index += 1
+            if pending:
+                index = _read_bodies(command, newline, pending, found)
+                pending = []
+            line_start = index
+        elif character == "'":
+            closing = _closing_quote(command, index)
+            index = length if closing is None else closing + 1
+        elif character == '"':
+            index = _scan_double_quoted(command, index + 1, found, depth, line_start)
+        elif character == "\\":
+            index += 2
+        elif character == "`":
+            index = _closing_backtick(command, index + 1) + 1
+        elif character == "#" and (index == line_start or command[index - 1] in " \t;&|("):
+            while index < length and command[index] != "\n":
+                index += 1
+        elif command.startswith("$(", index):
+            index = _scan_code(command, index + 2, True, found, depth + 1, (line_start, index, ""))
+        elif character == "(":
+            parentheses += 1
+            index += 1
+        elif character == ")":
+            if nested and parentheses == 0:
+                return index + 1
+            parentheses = max(parentheses - 1, 0)
+            index += 1
+        elif command.startswith("<<<", index):
+            index += 3
+        elif command.startswith("<<", index):
+            cursor = index + 2
+            strip_tabs = command.startswith("-", cursor)
+            cursor += 1 if strip_tabs else 0
+            while cursor < length and command[cursor] in " \t":
+                cursor += 1
+            parsed = _read_delimiter(command, cursor)
+            if parsed is None or not parsed[0]:
+                index += 2
+            else:
+                delimiter, quoted, delimiter_end = parsed
+                # Inside plain parentheses the body can feed a process substitution or a subshell, which this scan
+                # does not follow, so such a marker gets an outer that never qualifies as data.
+                pending.append((line_start, index, delimiter_end, delimiter, strip_tabs, quoted, outer if parentheses == 0 else (-1, -1, "")))
+                index = delimiter_end
+        else:
+            index += 1
+    return length
+
+
+# Every here-document whose terminator line is found, in the order of their bodies. A marker the scan cannot place with
+# certainty (inside quotes, a comment, an unterminated body) is left out, so its lines stay ordinary code.
+def heredocs(command: str) -> list[HereDocument]:
+    found: list[HereDocument] = []
+    _scan_code(command, 0, False, found, 0, None)
+    found.sort(key=lambda document: document.body_start)
+    return found if len(found) <= MAX_HEREDOCS else []
+
+
+# Inside an unquoted here-document the quotes are plain characters, but `$(...)` and backticks still run.
+def body_substitutions(body: str) -> list[str]:
+    bodies: list[str] = []
+    length = len(body)
+    index = 0
+    while index < length:
+        character = body[index]
+        if character == "\\":
+            index += 2
+        elif character == "`":
+            end = _closing_backtick(body, index + 1)
+            bodies.append(body[index + 1 : end])
+            index = end + 1
+        elif body.startswith("$(", index):
+            depth, cursor = 1, index + 2
+            while cursor < length and depth:
+                if body[cursor] == "\\":
+                    cursor += 2
+                    continue
+                depth += (body[cursor] == "(") - (body[cursor] == ")")
+                cursor += 1
+            bodies.append(body[index + 2 : cursor - 1] if depth == 0 else body[index + 2 :])
+            index = cursor if depth == 0 else length
+        else:
+            index += 1
+    return bodies
 
 
 def _closing_parenthesis(command: str, start: int) -> int:

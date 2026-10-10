@@ -37,6 +37,7 @@ from agent_safeguards.common import (  # noqa: E402
     TRUSTED_PATH,
     USER_HOME,
     UnresolvableCommand,
+    body_substitutions,
     command_substitutions,
     emit,
     emit_decision,
@@ -44,6 +45,7 @@ from agent_safeguards.common import (  # noqa: E402
     env_list,
     fail_open,
     find_executable,
+    heredocs,
     mark_opening_quotes,
     message,
     normalize_command,
@@ -167,6 +169,13 @@ PROCESS_ENVIRONMENT_PATTERN = re.compile(r"/proc/\S{0,80}environ")
 # A revision:path operand names a file's content, never a commit, so showing it prints no author. A revision with braces
 # (`HEAD@{2020-01-01_10:00}`) or the `:/text` search form can name a commit, so they do not match.
 GIT_BLOB_SPEC = re.compile(r"[A-Za-z0-9_./~^@+-]{0,200}:(?!/)\S{1,500}")
+# These only read text from a here-document, so its body is data and not a list of commands to check. A shell or an
+# interpreter runs its body, so it is not here, and neither is anything that pipes the text on.
+HEREDOC_DATA_COMMANDS = frozenset({"cat", "diff", "gh", "git", "grep", "head", "jq", "nl", "rg", "sort", "tail", "tee", "uniq", "wc"})
+# A substitution that holds a here-document becomes an argument of its command, which must not run it. Git is left out:
+# `git -c core.pager="$(...)" log` runs the value.
+HEREDOC_ARGUMENT_COMMANDS = {"gh": frozenset({"api", "gist", "issue", "pr", "release"})}
+HEREDOC_MARKER = "__heredoc_marker__"
 # One-element list so the message code can switch the startup rules off to ask whether they alone caused a refusal.
 _STARTUP_RULES = [True]
 MAX_GLOB_WORDS = 20
@@ -622,11 +631,11 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
     if normalized[0] in TRACE_COMMANDS and _traces_commands(normalized[0], words[1:]):
         return True
     if normalized[0] == "eval" and len(words) > 1:
-        return _sensitive_command(" ".join(words[1:]))
+        return _sensitive_command(" ".join(words[1:]), False)
     if normalized[0] in {"bash", "sh", "zsh"}:
         for index, argument in enumerate(words[:-1]):
             if SHELL_COMMAND_OPTION.fullmatch(argument):
-                return _sensitive_command(words[index + 1])
+                return _sensitive_command(words[index + 1], False)
     if used_proxy and normalized[0] not in SAFE_PROXY_COMMANDS:
         return True
     if normalized[0] in DIRECT_IDENTITY_COMMANDS:
@@ -858,9 +867,70 @@ def _prints_secret_variable(command: str) -> bool:
     return False
 
 
-def _sensitive_command(command: str) -> bool:
+# The command a here-document or substitution belongs to: the words of its simple command with a placeholder where the
+# marker is, so a command that follows the marker (`<<'EOF' bash`) counts as much as one before it.
+def _owner_words(line: str) -> list[str] | None:
+    for chunk in _tokenize(line):
+        if HEREDOC_MARKER in chunk:
+            words = [word for word in chunk if word != HEREDOC_MARKER]
+            while words and words[0] in SHELL_KEYWORDS:
+                words = words[1:]
+            try:
+                words, _ = _unwrap(words) if words else (words, False)
+            except UnresolvableCommand:
+                return None
+            return [_normalized(words[0]), *words[1:]] if words else None
+    return None
+
+
+def _is_data_heredoc(command: str, document: Any) -> bool:
+    tail = command[document.delimiter_end : document.line_end]
+    if PIPELINE_OPERATOR_PATTERN.search(tail):
+        return False
+    owner = _owner_words(command[document.line_start : document.marker_start] + " " + HEREDOC_MARKER + " " + tail)
+    if owner is None or owner[0] not in HEREDOC_DATA_COMMANDS:
+        return False
+    if document.outer is None:
+        return True
+    line_start, opening, quote = document.outer
+    if opening < 0:
+        return False
+    outer = _owner_words(command[line_start:opening] + quote + " " + HEREDOC_MARKER + " ")
+    return outer is not None and len(outer) > 1 and outer[1] in HEREDOC_ARGUMENT_COMMANDS.get(outer[0], frozenset())
+
+
+# The code view leaves out every data body, so a line of prose is not read as a command and an odd apostrophe cannot make
+# the whole command unparseable. The text view also leaves out quoted bodies, which nothing expands; an unquoted body
+# stays in it because the shell expands variables there, and its substitutions are returned to be checked as commands.
+def _heredoc_views(command: str) -> tuple[str, str, list[str]]:
+    documents = [document for document in heredocs(command) if _is_data_heredoc(command, document)]
+    if not documents:
+        return command, command, []
+    code: list[str] = []
+    view: list[str] = []
+    expanded: list[str] = []
+    position = 0
+    for document in documents:
+        if document.body_start < position:
+            continue
+        segment = command[position : document.body_start]
+        code.append(segment)
+        view.append(segment)
+        if not document.quoted:
+            view.append(command[document.body_start : document.end])
+            expanded.extend(body_substitutions(command[document.body_start : document.body_end]))
+        position = document.end
+    code.append(command[position:])
+    view.append(command[position:])
+    return "".join(code), "".join(view), expanded
+
+
+# Text that is run as a command by something else (a substitution, a string given to eval or `bash -c`) is checked
+# whole: whether a here-document in it is data depends on the command around it, which is only known at the top level.
+def _sensitive_command(command: str, data_heredocs: bool = True) -> bool:
     if len(command) > MAX_COMMAND_CHARS:
         return True
+    code, command, expanded = _heredoc_views(command) if data_heredocs else (command, command, [])
     lowered = command.lower()
     if (
         DEFINITION_PARAMETER_PATTERN.search(lowered)
@@ -873,10 +943,10 @@ def _sensitive_command(command: str) -> bool:
         return True
     if re.search(r"(?<![\w.-])\.env(?!\.(?:dist|example|sample|template)\b)(?:\b|$)", lowered):
         return True
-    chunks = _tokenize(command)
+    chunks = _tokenize(code)
     if not chunks or any(_sensitive_chunk(chunk) for chunk in chunks):
         return True
-    return any(_sensitive_command(body) for body in command_substitutions(command) if body.strip())
+    return any(_sensitive_command(body, False) for body in command_substitutions(code) + expanded if body.strip())
 
 
 # The same holds for a startup file (a name, a glob, a find, a search from the home folder): the agent needs the two safe

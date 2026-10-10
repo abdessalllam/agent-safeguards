@@ -24,8 +24,8 @@ The message reads `Sensitive-output command blocked. Use safe-tool or ask the us
 
 | Trigger | Rewrite |
 | --- | --- |
-| The command cannot be parsed (unbalanced quotes, often an apostrophe inside a heredoc or inline text) | Write the script or text to a file with your file-editing tool, then run the file. Or remove the apostrophe. |
-| A multi-line command or heredoc with a line that looks like an identity command (each line is checked as its own command) | Write the text to a file with your file-editing tool instead of a heredoc. |
+| The command cannot be parsed (unbalanced quotes, often an apostrophe inside inline text or inside a heredoc that a shell or interpreter runs) | Write the script or text to a file with your file-editing tool, then run the file. Or remove the apostrophe. Text given to `cat`, `tee`, `gh` and similar through a quoted heredoc (`<<'EOF'`) is not affected. |
+| A multi-line command, or a heredoc that a shell or interpreter runs or that is piped onward, with a line that looks like an identity command (each of those lines is checked as its own command) | Write the text to a file with your file-editing tool, or give it to `cat > file <<'EOF'` on its own line without a pipe. |
 | `env`, alone or with only options and variables | `env` prints the environment. To run a program with a variable, put the program last: `env FOO=1 ./build.sh`. To check that a variable is set, see the next rows. |
 | `git log` or `git show` without a safe format | `git log --oneline -n 20`, `git log --format=%h%x09%s`, `git log --format=%H%x09%ct%x09%s`; `git show --format= --stat <rev>`, `git show --format= <rev> -- <path>`. A file at a revision (`git show <rev>:<path>`) is never refused, because it prints content and no author. |
 | `git commit` | `safe-tool git commit -m "<subject>" -m "<body>"` |
