@@ -282,12 +282,19 @@ class HereDocument:
     outer: tuple[int, int, str] | None
 
 
+class _Unplaceable(Exception):
+    """A here-document the scan cannot place with certainty; the whole command is then left to the ordinary checks."""
+
+
 def _read_delimiter(command: str, index: int) -> tuple[str, bool, int] | None:
     length = len(command)
     pieces: list[str] = []
     quoted = False
     while index < length and command[index] not in HEREDOC_DELIMITER_END:
         character = command[index]
+        # A shell reads $'EOF' and $"EOF" as EOF, and an expansion in a delimiter is not worth following.
+        if character in "$`":
+            return None
         if character in "'\"":
             closing = _closing_quote(command, index)
             if closing is None:
@@ -328,7 +335,7 @@ def _read_bodies(command: str, newline: int, pending: list, found: list) -> int:
     for line_start, marker_start, delimiter_end, delimiter, strip_tabs, quoted, outer in pending:
         located = _find_terminator(command, position, delimiter, strip_tabs)
         if located is None:
-            return newline + 1
+            raise _Unplaceable
         terminator_start, end = located
         documents.append(HereDocument(line_start, marker_start, delimiter_end, newline, position, terminator_start, end, quoted, outer))
         position = end
@@ -413,41 +420,19 @@ def _scan_code(command: str, index: int, nested: bool, found: list, depth: int, 
     return length
 
 
-# Every here-document whose terminator line is found, in the order of their bodies. A marker the scan cannot place with
-# certainty (inside quotes, a comment, an unterminated body) is left out, so its lines stay ordinary code.
+# Every here-document of the command, in the order of their bodies. A marker inside quotes or a comment is not one; a
+# marker whose body has no terminator line makes the scan give up (an empty list), so a command it cannot place is left to
+# the ordinary checks and a long run of unterminated markers is not rescanned.
 def heredocs(command: str) -> list[HereDocument]:
     found: list[HereDocument] = []
-    _scan_code(command, 0, False, found, 0, None)
+    try:
+        _scan_code(command, 0, False, found, 0, None)
+    except _Unplaceable:
+        return []
     found.sort(key=lambda document: document.body_start)
     return found if len(found) <= MAX_HEREDOCS else []
 
 
-# Inside an unquoted here-document the quotes are plain characters, but `$(...)` and backticks still run.
-def body_substitutions(body: str) -> list[str]:
-    bodies: list[str] = []
-    length = len(body)
-    index = 0
-    while index < length:
-        character = body[index]
-        if character == "\\":
-            index += 2
-        elif character == "`":
-            end = _closing_backtick(body, index + 1)
-            bodies.append(body[index + 1 : end])
-            index = end + 1
-        elif body.startswith("$(", index):
-            depth, cursor = 1, index + 2
-            while cursor < length and depth:
-                if body[cursor] == "\\":
-                    cursor += 2
-                    continue
-                depth += (body[cursor] == "(") - (body[cursor] == ")")
-                cursor += 1
-            bodies.append(body[index + 2 : cursor - 1] if depth == 0 else body[index + 2 :])
-            index = cursor if depth == 0 else length
-        else:
-            index += 1
-    return bodies
 
 
 def _closing_parenthesis(command: str, start: int) -> int:
