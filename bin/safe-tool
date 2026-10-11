@@ -14,6 +14,7 @@ if __name__ == "__main__" and not sys.flags.isolated and sys.executable:
 import fcntl
 import fnmatch
 import glob
+import ipaddress
 import itertools
 import json
 import os
@@ -248,6 +249,26 @@ PRIVATE_ADDRESS_V6 = re.compile(
     r"|(?::[0-9a-f]{1,4}){5}:\d{1,3}(?:\.\d{1,3}){3}|(?::[0-9a-f]{1,4}){0,4}::(?:[0-9a-f]{1,4}:){0,3}\d{1,3}(?:\.\d{1,3}){3})(?![\w:])",
     re.IGNORECASE,
 )
+# A login over SSH prints the machine's name and address in its banner (the Ubuntu message of the day, the last-login
+# line, the known-hosts notice). A public address is not in the ranges above, so these are matched by their shape, as are
+# addresses behind a label and the answer of a service that reports the caller's address.
+LOGIN_BANNER_PATTERN = re.compile(
+    r"Welcome to (?:Ubuntu|Debian|Fedora|CentOS|Amazon Linux|Alpine|Red Hat|Rocky|AlmaLinux|openSUSE|Arch|FreeBSD|Raspbian)\b"
+    r"|System information as of "
+    r"|\bIPv[46] address for [^\s:]{1,32}:"
+    r"|Last login: [^\n]{0,80} from \S"
+    r"|Warning: Permanently added "
+    r"|The authenticity of host "
+    r"|\bConnection to \S{1,255} closed"
+    r"|\bConnecting to \S{1,255} \["
+    r"|ssh: (?:connect to host|Could not resolve hostname) \S"
+)
+LABELLED_ADDRESS = re.compile(
+    r"(?i)\b(?:inet|ipv4 address(?: for [^\s:]{1,32})?|ip address(?:es)?|public ip|external ip|server ip|remote ip)\b"
+    r"(?:[ \t]{0,16}[:=][ \t]{0,16}|[ \t]{1,16})(\d{1,3}(?:\.\d{1,3}){3})(?![\w.])"
+)
+ADDRESS_LOOKUP_COMMAND = re.compile(r"(?i)ifconfig\.(?:me|co)|icanhazip|ipinfo\.io|ipify|checkip\.|ident\.me|myexternalip|ip-api\.com|ipecho|wtfismyip|whatismyip")
+BARE_ADDRESS = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w.])")
 EMULATOR_ADDRESS = re.compile(r"(?<![\w.])10\.0\.(?:2\.\d{1,3}|3\.2)(?!\w|\.\d)")
 SENSITIVE_FLAGS = frozenset(
     {
@@ -1085,6 +1106,27 @@ def _shows_private_address(text: str) -> bool:
     return PRIVATE_ADDRESS_V4.search(stripped) is not None or PRIVATE_ADDRESS_V6.search(stripped) is not None
 
 
+def _reportable_address(candidate: str) -> bool:
+    try:
+        address = ipaddress.IPv4Address(candidate)
+    except ValueError:
+        return False
+    return not (address.is_loopback or address.is_unspecified or address.is_multicast or candidate == "255.255.255.255")
+
+
+def _shows_host_details(command: str, text: str) -> bool:
+    if env_flag("AGENT_SAFEGUARDS_SHOW_ADDRESSES"):
+        return False
+    if LOGIN_BANNER_PATTERN.search(text):
+        return True
+    stripped = EMULATOR_ADDRESS.sub(" ", text)
+    if any(_reportable_address(found.group(1)) for found in LABELLED_ADDRESS.finditer(stripped)):
+        return True
+    return ADDRESS_LOOKUP_COMMAND.search(command) is not None and any(
+        _reportable_address(found.group(1)) for found in BARE_ADDRESS.finditer(stripped)
+    )
+
+
 def _sensitive_output(command: str, response: Any) -> bool:
     text = _response_text(response)
     if contains_secret(_response_values(response)):
@@ -1104,6 +1146,7 @@ def _sensitive_output(command: str, response: Any) -> bool:
         or (identity_context and labeled_non_email_identity)
         or DEFINITION_OUTPUT_PATTERN.search(values) is not None
         or _shows_private_address(values)
+        or _shows_host_details(command, values)
     )
 
 
