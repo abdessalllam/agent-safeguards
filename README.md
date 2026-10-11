@@ -109,9 +109,13 @@ It also ships a small command surface for the things it blocks:
 safe-tool git identity                        # configured | identity_missing | not_repository
 safe-tool git commit -m "subject" -m "body"   # commits what is staged, prints JSON only
 safe-tool status coderabbit                   # ready | unauthenticated | unavailable
+safe-tool remote-readonly 'tail -n 50 app.log | grep ERROR'   # exit 0 for one read-only pipeline, else 1 and the reason
+safe-tool redact < output.txt                 # addresses, hosts, URLs and user@host become placeholders
 safe-tool has-key OPENAI_API_KEY GITHUB_TOKEN # OPENAI_API_KEY=pass and GITHUB_TOKEN=fail, never the value
 safe-tool self-test
 ```
+
+`remote-readonly` and `redact` are the two halves of a wrapper for a machine an agent reaches through an ssh alias (a script such as `vm.sh` runs the first, runs the command with no terminal and a time and size limit, and pipes the output through the second). `remote-readonly` accepts one pipeline of read commands (`grep`, `zgrep`, `jq`, `head`, `tail`, `cat`, `wc`, `sort`, `uniq`, `ls`, `stat`, `find` without `-exec` or `-delete`, `journalctl`, `systemctl status`, `docker ps` and `docker logs`, `pm2 logs`, `df`, `du`, `ps`, `date` and a few more, with `sudo` only in front of them) and refuses anything that writes, redirects, chains with `;`, `&&`, `||` or `&`, substitutes, follows a log forever or reads credentials, the environment, a startup file or a secret path. `redact` turns addresses, host names, URLs and `user@host` into placeholders, keeps times such as `20:33:32`, and withholds everything when the text holds a secret or an SSH login banner. Neither command opens a connection.
 
 ### delete-guard
 
