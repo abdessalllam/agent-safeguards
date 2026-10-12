@@ -82,7 +82,9 @@ The refusal reads `Delete guard: <reason>.` It blocks:
 - recursive targets built from variables (`$X`), command substitution, or a bare glob such as `*`;
 - `xargs rm`, `git clean` (except a `-n` dry run), inline code that deletes folders recursively (`shutil.rmtree`, `fs.rmSync` with `recursive`), and disk-erase commands (`mkfs`, `shred`, `diskutil erase...`, `dd of=/dev/...`);
 - a recursive delete of a Git worktree folder, outside temp folders;
-- a glob before the last path component, a `dd` onto a device, and delete commands hidden behind `sudo`, `env`, `timeout`, or other wrappers.
+- a glob before the last path component, a `dd` onto a device, and delete commands hidden behind `sudo`, `env`, `timeout`, or other wrappers;
+- `gio trash` of a protected folder, and the same deletes inside a script you wrote or changed (`bash file`, `./file`, `source file`): the refusal names the script. Rewrite the delete with a literal path, or have the script call a wrapper that vets its deletes;
+- a delete on another machine (after `ssh`, an `ssh_*` alias or a wrapper such as `wsl.sh`) unless the target is a literal path written as `~/...` or `/...` strictly inside the allowed folders (`~/ci` and `/tmp` by default), with no `..`, variable, glob, brace or substitution. Resolve the name first, check it, and pass the literal path.
 
 Rewrites:
 

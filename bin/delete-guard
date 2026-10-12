@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 from typing import NamedTuple
 
@@ -79,7 +80,7 @@ SYSTEM_ROOTS = (
 MOUNT_PARENTS = ("/Volumes", "/mnt", "/media")
 HOOK_EVENTS = frozenset({"PreToolUse", "PostToolUse", "SessionStart"})
 QUICK_SCAN = re.compile(
-    r"\b(rm|rmtree|removedirs|rmSync|rmdirSync|remove_dir_all|rm_rf|find|xargs|trash|diskutil|dd|mkfs|newfs|shred|srm|rsync|clean)\b"
+    r"\b(rm|rmtree|removedirs|rmSync|rmdirSync|remove_dir_all|rm_rf|find|xargs|trash|gio|diskutil|dd|mkfs|newfs|shred|srm|rsync|clean)\b"
     r"|\b(?:mkfs|newfs)[._]"
 )
 INLINE_RECURSIVE_DELETE = re.compile(r"rmtree|removedirs|rmSync|rmdirSync|remove_dir_all|rm_rf|rm\s+-[a-zA-Z]*[rR]")
@@ -93,6 +94,25 @@ XARGS_VALUE_OPTIONS = frozenset(
 )
 ERASE_TOOL = re.compile(r"(?:mkfs|newfs|shred|srm)(?:[._].*)?")
 TRASH_TOOLS = frozenset({"trash", "trash-put"})
+# A delete on another machine cannot be resolved here, so it must be a literal path written from the home folder or the
+# root and strictly inside an allowed folder; the shell on the other side then has nothing left to expand.
+DEFAULT_REMOTE_ROOTS = ("~/ci", "/tmp")
+REMOTE_UNSAFE_PATH = re.compile(r"[$`\\*?\[\]{}!;&|<>()'\"\s\x00-\x1f]")
+REMOTE_COMMAND_NAMES = frozenset({"mosh", "ssh"})
+REMOTE_COMMAND_PATTERN = re.compile(r"ssh[_-].+")
+SSH_VALUE_OPTIONS = frozenset({"-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w"})
+# A script that checks what it is asked to delete before it runs the command says so, and its command strings are then
+# judged when they run, with every variable already expanded.
+VETTED_MARKER = "delete-guard check-remote"
+MAX_SCRIPT_BYTES = 256 * 1024
+MAX_SCRIPT_DEPTH = 3
+SYSTEM_PROGRAM_FOLDERS = ("/bin/", "/sbin/", "/usr/", "/opt/", "/Library/", "/System/", "/Applications/")
+# A command that starts a script, a shell on a file, ssh or a remote alias can delete without any delete word in its text.
+SCRIPT_HINT = re.compile(
+    r"(?:^|[;&|(\n])[ \t]*(?:(?:sudo|env|command|nohup|time)[ \t]+)*"
+    r"(?:\./|\.\./|~/|/(?!bin/|usr/|sbin/|opt/|Library/|System/|Applications/)|[\w.-]+\.sh\b|(?:source|\.|bash|sh|zsh|dash|fish|ssh|mosh|ssh[_-][\w-]+)[ \t])"
+)
+SHELL_SHEBANG = re.compile(r"#!\s*\S*(?:/env\s+)?(?:ba|z|da|k)?sh\b")
 DISKUTIL_ERASE = re.compile(r"(?i)^(erase|zero|secureerase|partitiondisk|reformat|deletevolume|deletecontainer|apfs)")
 
 
@@ -101,8 +121,33 @@ class Denied(Exception):
     pass
 
 
-def _emit_deny(reason: str) -> None:
-    emit_decision("deny", message("delete_guard.deny", reason=reason))
+class RemoteDenied(Denied):
+    pass
+
+
+# Set to the allowed folders while a command meant for another machine is checked, and to None otherwise.
+_REMOTE: list[tuple[str, ...] | None] = [None]
+_SCRIPT_STACK: list[str] = []
+
+
+def _remote_roots() -> tuple[str, ...]:
+    configured = os.environ.get("AGENT_SAFEGUARDS_REMOTE_DELETE_ROOTS")
+    entries = DEFAULT_REMOTE_ROOTS if configured is None else tuple(entry for entry in re.split(r"[:,\s]+", configured) if entry)
+    roots = []
+    for entry in entries:
+        entry = entry.rstrip("/")
+        parts = entry.split("/")
+        anchored = entry.startswith("~/") or entry.startswith("/")
+        if anchored and len(parts) >= 2 and not REMOTE_UNSAFE_PATH.search(entry) and all(part not in {"", ".", ".."} for part in parts[1:]) and entry not in SYSTEM_ROOTS:
+            roots.append(entry)
+    return tuple(roots)
+
+
+def _emit_deny(denial: Denied) -> None:
+    if isinstance(denial, RemoteDenied):
+        emit_decision("deny", message("delete_guard.deny_remote", reason=str(denial), roots=", ".join(_remote_roots())))
+    else:
+        emit_decision("deny", message("delete_guard.deny", reason=str(denial)))
 
 
 # Each command keeps the separators around it so a directory change is only trusted where it surely runs.
@@ -114,9 +159,26 @@ class Chunk(NamedTuple):
     redirected: bool
 
 
+# `name() {`, `name () {` and `function name {` only define what follows; the command inside is what the guard must see.
+def _function_header_length(words: list[str]) -> int:
+    if words[:1] == ["function"] and len(words) > 1:
+        length = 3 if words[2:3] == ["()"] else 2
+    elif len(words) > 1 and words[1] == "()":
+        length = 2
+    elif words and re.fullmatch(r"[A-Za-z_][\w.:-]*\(\)", words[0]):
+        length = 1
+    else:
+        return 0
+    while words[length : length + 1] == ["{"]:
+        length += 1
+    return length
+
+
 def _chunk(raw_words: list[str], before: str | None, after: str | None, redirected: bool) -> Chunk:
     words = [word for word in raw_words if word]
-    opened = bool(words) and (words[0].startswith("(") or words[0] == "{")
+    header = _function_header_length(words)
+    opened = header > 0 or (bool(words) and (words[0].startswith("(") or words[0] == "{"))
+    words = words[header:]
     while words and words[0].startswith("("):
         words[0] = words[0][1:]
         if not words[0]:
@@ -224,7 +286,25 @@ def _repository_root(cwd: str | None) -> str | None:
     return None if not root or _protected(root) else root
 
 
+def _check_remote_target(raw: str, verb: str) -> None:
+    path = raw if raw == "/" else raw.rstrip("/")
+    anchored = path.startswith("~/") or path.startswith("/")
+    components = path.split("/")[1:] if anchored else []
+    refused = (
+        not anchored
+        or REMOTE_UNSAFE_PATH.search(path) is not None
+        or not components
+        or any(part in {"", ".", ".."} for part in components)
+        or not any(path.startswith(root + "/") for root in _REMOTE[0] or ())
+    )
+    if refused:
+        raise RemoteDenied(message("delete_guard.reason.remote_target", verb=verb, raw=raw))
+
+
 def _check_target(raw: str, cwd: str | None, *, recursive: bool, verb: str) -> None:
+    if _REMOTE[0] is not None:
+        _check_remote_target(raw, verb)
+        return
     if _is_computed(raw):
         if recursive:
             raise Denied(message("delete_guard.reason.computed_path", verb=verb, raw=raw))
@@ -279,6 +359,9 @@ def _rm(words: list[str], cwd: str | None) -> None:
 
 def _trash(words: list[str], cwd: str | None) -> None:
     for target in (word for word in words[1:] if not word.startswith("-")):
+        if _REMOTE[0] is not None:
+            _check_remote_target(target, "trash")
+            continue
         if _is_computed(target):
             continue
         resolved = _expand(_glob_base(target), cwd)
@@ -316,6 +399,85 @@ def _xargs(words: list[str]) -> None:
         raise Denied(message("delete_guard.reason.xargs_rm"))
 
 
+def _is_reviewed_script(path: str) -> bool:
+    root = _repository_root(os.path.dirname(path))
+    if root is None or GIT_PATH is None or not _inside(path, root):
+        return False
+    relative = os.path.relpath(path, root)
+    environment = {"PATH": "/usr/bin:/bin", "HOME": USER_HOME, "LC_ALL": "C"}
+    try:
+        tracked = subprocess.run(
+            [GIT_PATH, "-C", root, "ls-files", "--error-unmatch", "--", relative],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=3, check=False, env=environment,
+        ).returncode == 0
+        return tracked and subprocess.run(
+            [GIT_PATH, "-C", root, "diff", "--quiet", "HEAD", "--", relative],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=3, check=False, env=environment,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+# A script nobody has reviewed (not tracked, or changed since the last commit) is read before it runs and its deletes are
+# held to the same rules as a typed command, because its variables and loops hide what a quick look at the command cannot.
+def _check_script(raw: str, cwd: str | None, *, shell: bool) -> None:
+    resolved = _expand(raw, cwd)
+    if resolved is None or resolved in _SCRIPT_STACK or len(_SCRIPT_STACK) >= MAX_SCRIPT_DEPTH:
+        return
+    # Startup files hold keys and aliases and are never shown, so a denial message must not be able to quote one.
+    if (os.path.dirname(resolved) == USER_HOME and os.path.basename(resolved).startswith(".")) or _inside(resolved, "/etc"):
+        return
+    try:
+        if not os.path.isfile(resolved) or os.path.getsize(resolved) > MAX_SCRIPT_BYTES:
+            return
+        with open(resolved, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return
+    if "\x00" in text[:1024] or not (shell or SHELL_SHEBANG.match(text)) or _is_reviewed_script(resolved):
+        return
+    _SCRIPT_STACK.append(resolved)
+    try:
+        _check_command(text, cwd)
+    except Denied as denial:
+        raise type(denial)(message("delete_guard.reason.in_script", script=resolved, reason=str(denial))) from None
+    finally:
+        _SCRIPT_STACK.pop()
+
+
+def _search_path(name: str) -> str | None:
+    return shutil.which(name, path=os.pathsep.join((os.environ.get("PATH", ""), os.path.join(USER_HOME, ".local", "bin"))))
+
+
+@functools.lru_cache(maxsize=32)
+def _vets_deletes(path: str | None) -> bool:
+    if path is None:
+        return False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return VETTED_MARKER in handle.read(65536)
+    except OSError:
+        return False
+
+
+def _remote_command_text(name: str, words: list[str]) -> str:
+    rest = words[1:]
+    if name in REMOTE_COMMAND_NAMES:
+        while rest and rest[0].startswith("-"):
+            rest = rest[2:] if rest[0] in SSH_VALUE_OPTIONS else rest[1:]
+        rest = rest[1:]
+    return " ".join(rest)
+
+
+def _check_remote_command(text: str) -> None:
+    previous = _REMOTE[0]
+    _REMOTE[0] = _remote_roots()
+    try:
+        _check_command(text, None)
+    finally:
+        _REMOTE[0] = previous
+
+
 def _rsync(words: list[str], cwd: str | None) -> None:
     if not any(word.startswith("--delete") or word == "--remove-source-files" for word in words):
         return
@@ -342,7 +504,7 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
     if name == "popd":
         return None, False
     if name in {"cd", "pushd"}:
-        if wrapped:
+        if wrapped or _REMOTE[0] is not None:
             return None, False
         targets = [word for word in words[1:] if word == "-" or not word.startswith("-")]
         if not targets:
@@ -362,6 +524,21 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
             if word in {"-c", "-lc", "-ic"}:
                 _check_command(words[index + 1], cwd)
                 break
+        else:
+            operands = [word for word in words[1:] if not word.startswith("-")]
+            if operands and _REMOTE[0] is None:
+                _check_script(operands[0], shell_cwd, shell=True)
+        return shell_cwd, False
+    if name in {"source", "."} and len(words) > 1 and _REMOTE[0] is None:
+        _check_script(words[1], shell_cwd, shell=True)
+        return shell_cwd, False
+    wrapper = (words[0] if "/" in words[0] else _search_path(words[0])) if name.endswith(".sh") else None
+    vetted = _vets_deletes(wrapper)
+    if name in REMOTE_COMMAND_NAMES or REMOTE_COMMAND_PATTERN.fullmatch(name) or name in _configured_remote_names() or vetted:
+        text = _remote_command_text(name, words)
+        # A vetted wrapper judges the expanded text itself when it runs, so a variable here is left to it.
+        if text and not (vetted and re.search(r"[$`]", text)):
+            _check_remote_command(text)
         return shell_cwd, False
     if name == "eval":
         _check_command(" ".join(words[1:]), cwd)
@@ -392,8 +569,12 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
                 resolved = _expand(word[3:], cwd)
                 if resolved is None or _inside(resolved, "/dev"):
                     raise Denied(message("delete_guard.reason.dd_device"))
+    elif name == "gio" and words[1:2] in (["trash"], ["remove"]):
+        _trash(words[1:], cwd)
     elif name == "git":
         _git_clean(words)
+    elif _REMOTE[0] is None and (words[0].startswith(("./", "../", "~/")) or (os.path.isabs(words[0]) and not words[0].startswith(SYSTEM_PROGRAM_FOLDERS)) or (wrapper and "/" not in words[0])):
+        _check_script(words[0] if "/" in words[0] else wrapper, shell_cwd, shell=False)
     return shell_cwd, False
 
 
@@ -430,8 +611,13 @@ def _git_clean(words: list[str]) -> None:
         raise Denied(message("delete_guard.reason.git_clean"))
 
 
+def _configured_remote_names() -> frozenset[str]:
+    return frozenset(name for name in re.split(r"[:,\s]+", os.environ.get("AGENT_SAFEGUARDS_REMOTE_COMMANDS", "")) if name)
+
+
 def _check_command(command: str, cwd: str | None) -> None:
-    if not QUICK_SCAN.search(command):
+    configured = any(re.search(r"(?:^|[\s;&|(])" + re.escape(name) + r"(?:\s|$)", command) for name in _configured_remote_names())
+    if not (QUICK_SCAN.search(command) or SCRIPT_HINT.search(command) or configured):
         return
     if len(command) > MAX_COMMAND_CHARS:
         raise Denied(message("delete_guard.reason.too_large"))
@@ -497,10 +683,22 @@ def _run_hook() -> int:
     try:
         _check_command(command, cwd)
     except Denied as denial:
-        _emit_deny(str(denial))
+        _emit_deny(denial)
     except Exception:
         if not fail_open():
             emit_decision("deny", message("delete_guard.deny_internal"))
+    return 0
+
+
+def _check_remote_cli(command: str) -> int:
+    try:
+        _check_remote_command(command)
+    except Denied as denial:
+        sys.stderr.write(message("delete_guard.deny_remote", reason=str(denial), roots=", ".join(_remote_roots())) + "\n")
+        return 1
+    except Exception:
+        sys.stderr.write(message("delete_guard.deny_internal") + "\n")
+        return 1
     return 0
 
 
@@ -526,6 +724,7 @@ def _self_test() -> int:
         "diskutil eraseDisk APFS X disk4",
         "dd if=/dev/zero of=/dev/disk4",
         "trash ~/Documents",
+        "gio trash ~/Documents",
         "rm -rf *",
         "rsync -a --delete src/ ~/Documents/",
         "git clean -fdx",
@@ -572,6 +771,8 @@ def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "self-test":
         return _self_test()
     arguments = sys.argv[1:]
+    if arguments[:1] == ["check-remote"] and len(arguments) == 2:
+        return _check_remote_cli(arguments[1])
     if arguments[:1] == ["hook"] and 2 <= len(arguments) <= 3 and arguments[1] in {"claude", "codex"}:
         if len(arguments) == 2 or arguments[2] in HOOK_EVENTS:
             return _run_hook()
