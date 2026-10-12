@@ -204,24 +204,31 @@ REMOTE_FORBIDDEN_LONG = {
     "free": ("--seconds",),
     "journalctl": (
         "--flush", "--follow", "--relinquish-var", "--rotate", "--setup-keys", "--smart-relinquish-var", "--sync",
-        "--update-catalog", "--vacuum-files", "--vacuum-size", "--vacuum-time", "--cursor-file",
+        "--update-catalog", "--vacuum-files", "--vacuum-size", "--vacuum-time", "--cursor-file", "--machine",
     ),
+    "systemctl": ("--host", "--machine"),
     "sort": ("--compress-program", "--output"),
     "tail": ("--follow",),
 }
 # The same options as letters of a bundle (-us, -bC, -qf): set the clock, compile a database, sample forever, follow, write.
-REMOTE_FORBIDDEN_LETTERS = {"date": "s", "file": "C", "free": "s", "journalctl": "f", "sort": "o", "tail": "fF"}
+REMOTE_FORBIDDEN_LETTERS = {"date": "s", "file": "C", "free": "s", "journalctl": "fM", "sort": "o", "systemctl": "HM", "tail": "fF"}
 # Letters that take the rest of the bundle as their value (-ufoo.service, -T/tmp/out), which is not a list of options.
 # An exact long option wins over any longer option it begins, so these are not taken for the forbidden ones.
 REMOTE_EXACT_LONG = {"journalctl": frozenset({"--cursor"})}
 REMOTE_VALUE_LETTERS = {"date": "dfrs", "file": "fmeFP", "free": "cs", "journalctl": "DMutpcSUnogF", "sort": "tTkSo", "tail": "ncs"}
+DOCKER_STATS_VALUE_OPTIONS = frozenset({"--format"})
 BOOLEAN_TRUE = frozenset({"1", "t", "T", "true", "TRUE", "True"})
 BOOLEAN_FALSE = frozenset({"0", "f", "F", "false", "FALSE", "False"})
 # ps reads words without a dash as BSD options too; these take the next word (or the rest of the word) as their value.
-PS_UNIX_VALUE_LETTERS = frozenset("CGgOopqstUu")
-PS_BSD_VALUE_LETTERS = frozenset("NOopqtU")
+PS_PROFILES = (
+    (frozenset("CGgOopqstUu"), frozenset("NOopqtU")),
+    (frozenset("OoGgupUt"), frozenset("OoGgupUt")),
+)
 PS_LONG_VALUE_OPTIONS = frozenset(
-    {"--cols", "--columns", "--format", "--group", "--Group", "--lines", "--pid", "--ppid", "--quick-pid", "--rows", "--sid", "--sort", "--tty", "--user", "--User", "--width"}
+    {
+        "--cols", "--columns", "--date-format", "--format", "--group", "--Group", "--lines", "--pid", "--ppid", "--quick-pid", "--rows",
+        "--sid", "--sort", "--tty", "--user", "--User", "--width",
+    }
 )
 # Options that take a value, so the value is not mistaken for a subcommand or an operand.
 DOCKER_VALUE_LETTERS = frozenset("Hcl")
@@ -246,7 +253,7 @@ REMOTE_SECRET_PATHS = re.compile(
     re.IGNORECASE,
 )
 # What a remote command is checked and its output cleaned with: addresses and hosts in logs are infrastructure details too.
-REDACT_URL = re.compile(r"(?i)\b(?:https?|ssh|tcp|wss?|ftp)://[^\s\"'<>`]+")
+REDACT_URL = re.compile(r"(?i)\b[a-z][a-z0-9+.-]{1,15}://[^\s\"'<>`]+")
 REDACT_USER_HOST = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}")
 REDACT_IPV4 = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?(?![\w.])")
 REDACT_IPV6 = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}(?:[0-9A-Fa-f]{0,4}|\d{1,3}(?:\.\d{1,3}){3})(?![\w:.])")
@@ -918,9 +925,14 @@ def _reads_startup_file(command: str) -> bool:
     return _mentions_startup_file(remainder) or _glob_names_startup_file(remainder) or _find_names_startup_file(remainder)
 
 
-# `e` shows the environment of every process: as a BSD word (`ps ax eww`, also after other options) and, on macOS, as
-# a dashed letter. The words that an option takes as its value are skipped.
+# `e` shows the environment of every process: as a BSD word (`ps ax eww`, `ps e1`, also after other options) and as a dashed
+# letter. The words that an option takes as its value are skipped, and Linux and macOS disagree about which options take one
+# (-C, -q and -s do on Linux only), so the arguments are read both ways.
 def _ps_shows_environment(arguments: list[str]) -> bool:
+    return any(_ps_walk(arguments, unix_values, bsd_values) for unix_values, bsd_values in PS_PROFILES)
+
+
+def _ps_walk(arguments: list[str], unix_values: frozenset[str], bsd_values: frozenset[str]) -> bool:
     index = 0
     while index < len(arguments):
         word = arguments[index]
@@ -933,10 +945,9 @@ def _ps_shows_environment(arguments: list[str]) -> bool:
             continue
         dashed = word.startswith("-") and len(word) > 1
         body = word[1:] if dashed else word
-        if not re.fullmatch(r"[A-Za-z]+", body):
-            continue
-        values = PS_UNIX_VALUE_LETTERS if dashed else PS_BSD_VALUE_LETTERS
-        for position, letter in enumerate(body):
+        prefix = re.match(r"[A-Za-z]*", body).group(0)
+        values = unix_values if dashed else bsd_values
+        for position, letter in enumerate(prefix):
             if letter in "eE":
                 return True
             if letter in values:
@@ -1884,7 +1895,19 @@ def _remote_stages(command: str) -> list[list[str]] | None:
 # What a refusal prints is a name from the tables or a plain word, never text the caller typed after it: an attached value or an
 # operand could be a secret that the refusal would then show.
 def _shown(value: str) -> str:
-    return value if re.fullmatch(r"[A-Za-z0-9_.+:-]{0,40}", value) and not contains_secret(value) else "?"
+    return value if re.fullmatch(r"(?:[A-Za-z][A-Za-z0-9_+-]{0,30})?", value) and not contains_secret(value) else "?"
+
+
+# Whether an option could take the next word as its value: a long option without an attached value, or a short one that ends
+# in a letter that takes a value.
+def _may_take_next(argument: str, values: str) -> bool:
+    if argument.startswith("--"):
+        return len(argument) > 2 and "=" not in argument
+    if argument.startswith("-") and len(argument) > 1:
+        for position, letter in enumerate(argument[1:], 1):
+            if letter in values:
+                return position + 1 == len(argument)
+    return False
 
 
 def _remote_option_problem(name: str, arguments: list[str]) -> str | None:
@@ -1896,10 +1919,15 @@ def _remote_option_problem(name: str, arguments: list[str]) -> str | None:
     letters = REMOTE_FORBIDDEN_LETTERS.get(name, "")
     values = REMOTE_VALUE_LETTERS.get(name, "")
     exact_long = REMOTE_EXACT_LONG.get(name, frozenset())
+    previous = ""
     for argument in arguments:
         # find reads its expression after the starting points, so a -- before them does not end the options that matter.
         if argument == "--" and name != "find":
+            # The option before it may take it as its value, and the options after it are then still options.
+            if _may_take_next(previous, values):
+                return refused("--")
             break
+        previous = argument
         if argument in exact:
             return refused(argument)
         if argument.startswith("--"):
@@ -1941,12 +1969,18 @@ def _remote_option_problem(name: str, arguments: list[str]) -> str | None:
 
 
 # A boolean flag counts as set when its last mention before any -- says so (--no-stream, --no-stream=false).
-def _flag_is_set(arguments: list[str], flag: str) -> bool:
+def _flag_is_set(arguments: list[str], flag: str, value_options: frozenset[str] = frozenset()) -> bool:
     state = False
-    for argument in arguments:
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        index += 1
         if argument == "--":
             break
         option, equals, value = argument.partition("=")
+        if option in value_options and not equals:
+            index += 1
+            continue
         if option != flag:
             continue
         if not equals or value in BOOLEAN_TRUE:
@@ -1964,6 +1998,11 @@ def _remote_docker_problem(arguments: list[str]) -> str | None:
     subcommand = arguments[index] if index is not None else ""
     if subcommand not in REMOTE_SUBCOMMANDS["docker"]:
         return message("safe_tool.remote.reason.subcommand", name="docker", subcommand=_shown(subcommand))
+    # The options before the subcommand can point docker at another machine or another configuration.
+    for argument in arguments[:index]:
+        named = argument[:2] if argument.startswith(("-H", "-c")) else argument.split("=", 1)[0]
+        if named in {"-H", "-c", "--host", "--context", "--config"}:
+            return message("safe_tool.remote.reason.option", name="docker", option=named)
     rest = arguments[index + 1 :] if index is not None else []
     effective = subcommand
     if subcommand == "compose":
@@ -1974,7 +2013,7 @@ def _remote_docker_problem(arguments: list[str]) -> str | None:
         rest = rest[position + 1 :]
     if effective == "logs" and any(DOCKER_FOLLOW.fullmatch(argument) for argument in rest if argument != "--"):
         return message("safe_tool.remote.reason.option", name="docker logs", option="-f")
-    if subcommand == "stats" and not _flag_is_set(rest, "--no-stream"):
+    if subcommand == "stats" and not _flag_is_set(rest, "--no-stream", DOCKER_STATS_VALUE_OPTIONS):
         return message("safe_tool.remote.reason.option", name="docker stats", option="without --no-stream")
     return None
 
@@ -2003,6 +2042,7 @@ def _remote_check(command: str) -> str | None:
         or REMOTE_SECRET_PATHS.search(plain)
         or _sensitive_command(command, False)
         or _sensitive_command(decoded, False)
+        or _sensitive_command(plain, False)
     ):
         return message("safe_tool.remote.reason.sensitive")
     return None

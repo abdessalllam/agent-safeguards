@@ -559,7 +559,7 @@ def command_substitutions(command: str) -> list[str]:
 
 MAX_GLOB_VARIANTS = 256
 MAX_GLOB_MATCHES = 2000
-BRACE_PATTERN = re.compile(r"\{([^{}]*,[^{}]*)\}|\{(-?\d{1,6}|[A-Za-z])\.\.(-?\d{1,6}|[A-Za-z])(?:\.\.-?\d{1,6})?\}")
+BRACE_PATTERN = re.compile(r"\{([^{}]*,[^{}]*)\}|\{(-?\d{1,6}|[A-Za-z])\.\.(-?\d{1,6}|[A-Za-z])(?:\.\.(-?\d{1,6}))?\}")
 
 
 def brace_options(found: re.Match) -> list[str] | None:
@@ -570,10 +570,17 @@ def brace_options(found: re.Match) -> list[str] | None:
     if numeric != end.lstrip("-").isdigit():
         return ["_"]
     first, last = (int(start), int(end)) if numeric else (ord(start), ord(end))
-    if abs(last - first) >= MAX_GLOB_VARIANTS:
+    increment = abs(int(found.group(4) or 1)) or 1
+    if abs(last - first) // increment >= MAX_GLOB_VARIANTS:
         return None
-    values = range(first, last + (1 if last >= first else -1), 1 if last >= first else -1)
-    return [str(value) if numeric else chr(value) for value in values]
+    direction = increment if last >= first else -increment
+    values = range(first, last + (1 if last >= first else -1), direction)
+    if not numeric:
+        return [chr(value) for value in values]
+    # A number written with a leading zero keeps its width in every term, the way the shell prints the sequence.
+    padded = any(len(digits) > 1 and digits.startswith("0") for digits in (start.lstrip("-"), end.lstrip("-")))
+    width = max(len(start), len(end)) if padded else 0
+    return ["%0*d" % (width, value) for value in values]
 
 
 # A word with braces stands for several words; None means there are more than the scan can follow.
@@ -621,11 +628,11 @@ def _option_value(option: str, name: str, words: list[str], index: int) -> str:
 
 
 # Both tools classify the command that actually runs, so assignments, shell keywords and wrappers come off first.
-# The second result is None unless a wrapper option changes the working or root directory for the command that follows;
-# then it is the value of the last such option, or an empty string for a root change, which has no folder to resolve.
-def strip_wrappers_with_directory(words: list[str], keep: frozenset[str] = frozenset()) -> tuple[list[str], str | None]:
+# The second result lists, in the order the wrappers run, the value of each option that changes the working or root directory
+# for the command that follows; an empty string stands for a root change, which has no folder to resolve.
+def strip_wrappers_with_directory(words: list[str], keep: frozenset[str] = frozenset()) -> tuple[list[str], list[str]]:
     words = list(words)
-    moved: str | None = None
+    moved: list[str] = []
     expansions = 0
     index = 0
     while index < len(words):
@@ -659,7 +666,7 @@ def strip_wrappers_with_directory(words: list[str], keep: frozenset[str] = froze
                 changed = DIRECTORY_OPTIONS.get(base, frozenset()) & set(names)
                 if changed:
                     name = sorted(changed)[-1]
-                    moved = "" if name in CHROOT_OPTIONS else _option_value(option, name, words, index)
+                    moved.append("" if name in CHROOT_OPTIONS else _option_value(option, name, words, index))
                 if base == "env" and SPLIT_STRING_OPTIONS & set(names):
                     expansions += 1
                     if expansions > MAX_SPLIT_STRING_EXPANSIONS:

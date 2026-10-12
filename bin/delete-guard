@@ -32,7 +32,6 @@ from agent_safeguards.common import (  # noqa: E402
     GIT_VALUE_OPTIONS,
     HEREDOC_FORBIDDEN,
     MAX_COMMAND_CHARS,
-    MAX_GLOB_MATCHES,
     REDIRECTION_MARKER,
     SHELL_KEYWORDS,
     USER_HOME,
@@ -123,22 +122,35 @@ KDE_TRASH_TOOL = re.compile(r"ktrash\d*")
 KIO_TOOL = re.compile(r"kioclient\d*")
 KIO_REMOVE_VERBS = frozenset({"del", "delete", "remove", "rm"})
 TRASH_VALUE_OPTIONS = frozenset({"--trash-dir"})
-MAX_TRASH_SCAN = 2000
+TRASH_FILE_NAME = re.compile(r"\.trashed-.+")
+# What is looked through before a folder or a glob is let through is bounded, and running out of the bound is a refusal.
+MAX_TRASH_SCAN = 20000
+MAX_MATCHES = 20000
 LOCATION_SCHEME = re.compile(r"(?i)[a-z][a-z0-9+.-]*:/")
 XARGS_DELETERS = frozenset({"rm", "unlink", "rmdir", "shred", "srm", "gvfs-rm"})
+KIO_COMMANDS = KIO_REMOVE_VERBS | frozenset({"cat", "copy", "cp", "exec", "ls", "move", "mv", "openProperties", "properties"})
+GIO_DELETE_VERBS = frozenset({"remove", "rm", "trash"})
 FIND_FOLLOW_OPTIONS = frozenset({"-L", "-follow"})
-HADOOP_PURGE_OPTIONS = frozenset({"-expunge", "-skipTrash"})
-# The macOS Finder, the Windows shell and PowerShell empty the Trash by name, and Windows keeps it in $Recycle.Bin. Quoted
-# text (a dialog, an echo, a help request) only names the command, so a match needs it where a statement starts.
-APPLESCRIPT_STRING = re.compile(r'"(?:[^"\\\n]|\\.)*"')
-FINDER_EMPTY_TRASH = re.compile(r"(?i)\bempty\b[^\n]{0,40}\btrash\b|\bdelete\b[^\n]{0,80}\btrash\b")
-WINDOWS_SHELLS = frozenset({"powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe"})
-WINDOWS_STATEMENT = r"(?i)(?:^|[;&|({\n]|\s/[ck]\s|\s-c(?:ommand)?\s)\s*(?:&\s*)?"
-WINDOWS_EMPTY_BIN = re.compile(
-    WINDOWS_STATEMENT
-    + r"(?:clear-recyclebin\b|(?:remove-item|ri|del|erase|rd|rmdir|rm)\b[^;&|\n]*(?:\$recycle\.bin|\brecycler\b|\brecycled\b))"
-    r"|(?i:\bshemptyrecyclebin\w*\s*\()"
+FIND_GLOBAL_OPTIONS = frozenset({"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"})
+FIND_EXEC_PREDICATES = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+FIND_VALUE_PREDICATES = frozenset(
+    {
+        "-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex", "-lname", "-ilname", "-type", "-xtype",
+        "-perm", "-size", "-user", "-group", "-uid", "-gid", "-newer", "-anewer", "-cnewer", "-mtime", "-atime", "-ctime", "-mmin",
+        "-amin", "-cmin", "-maxdepth", "-mindepth", "-samefile", "-printf", "-fprintf", "-fprint", "-fprint0", "-fls", "-links",
+        "-inum", "-used", "-context", "-regextype", "-files0-from", "-D", "-O",
+    }
 )
+FIND_NEWER_PREDICATE = re.compile(r"-newer[aBcmt][aBcmt]")
+# A name that find or xargs supplies is unknown here. It stands for itself in a path only as the whole word or with a suffix that
+# stays in the same folder.
+MATCH_MARK = "\ue000match\ue001"
+HADOOP_PURGE_OPTIONS = frozenset({"-expunge", "-skipTrash"})
+# The macOS Finder and the Windows shell empty the Trash by name. A command for them that mentions the Trash or an empty
+# command at all is refused, so no spelling of the statement (a quoted name, an abbreviated parameter, a prefix) gets past.
+FINDER_TEXT = re.compile(r"(?i)trash|\bempty\b")
+WINDOWS_SHELLS = frozenset({"powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe"})
+WINDOWS_TEXT = re.compile(r"(?i)recycle")
 # A remote path under these cannot be judged by its depth, so none of it is moved to the Trash.
 REMOTE_TRASH_SYSTEM_TREES = frozenset(
     {"/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/proc", "/run", "/sbin", "/snap", "/sys", "/usr", "/System", "/Library", "/Applications"}
@@ -235,7 +247,7 @@ def _run_with_budget(check) -> None:
 _REMOTE: list[tuple[str, ...] | None] = [None]
 _SCRIPT_STACK: list[str] = []
 # Permanent delete targets of a remote command that passed the lexical rule, for the machine to check physically.
-_REMOTE_TARGETS: list[str] = []
+_REMOTE_TARGETS: list[tuple[str, bool]] = []
 # Scripts already read in this run and found clean, by path, size, modification time and folder.
 _SCRIPT_CACHE: dict[tuple, bool] = {}
 
@@ -389,29 +401,77 @@ def _trash_roots() -> tuple[str, ...]:
     return tuple(dict.fromkeys(roots + [os.path.realpath(root) for root in roots]))
 
 
-# A folder with a Trash directly inside it (the top of a volume) would take the Trash along when it is deleted or moved.
+# A folder with a Trash directly inside it (the top of a volume) would take the Trash along when it is deleted or moved. A
+# folder that cannot be looked through completely is not shown to be free of one.
 def _holds_trash(path: str) -> bool:
     try:
         with os.scandir(path) as entries:
-            return any(TRASH_FOLDER.fullmatch(entry.name) for entry in itertools.islice(entries, MAX_TRASH_SCAN))
-    except OSError:
+            for count, entry in enumerate(entries):
+                if count >= MAX_TRASH_SCAN:
+                    return True
+                if TRASH_FOLDER.fullmatch(entry.name) and (TRASH_FILE_NAME.fullmatch(entry.name) or _is_folder(entry)):
+                    return True
+    except (FileNotFoundError, NotADirectoryError):
         return False
+    except OSError:
+        return True
+    return False
 
 
-# A glob can name a Trash that the text does not, so what it matches in the real folders is looked at before anything is
-# removed; the matches are bounded, and the text of a pattern with no match removes nothing.
-def _check_matches(raw: str, cwd: str | None, key: str, verb: str, *, folders: bool) -> None:
+def _is_folder(entry: os.DirEntry) -> bool:
+    try:
+        return entry.is_dir()
+    except OSError:
+        return True
+
+
+# What a glob matches in the real folders (`**` included), so that every name it stands for meets the same rules as a typed one.
+# More matches than the bound is a refusal: the bound limits the work, it does not widen what is allowed.
+def _glob_matches(raw: str, cwd: str | None, verb: str) -> list[str]:
     if not re.search(r"[*?\[]", raw):
-        return
+        return []
     pattern = _home_expanded(raw)
     if not os.path.isabs(pattern):
         if cwd is None:
-            return
+            return []
         pattern = os.path.join(cwd, pattern)
-    for match in itertools.islice(glob.iglob(pattern), MAX_GLOB_MATCHES):
-        resolved = os.path.realpath(match)
-        if _names_trash(match) or _in_trash(resolved) or (folders and os.path.isdir(resolved) and _holds_trash(resolved)):
-            raise Denied(message(key, verb=verb, path=match))
+    matches = list(itertools.islice(glob.iglob(pattern, recursive=True), MAX_MATCHES + 1))
+    if len(matches) > MAX_MATCHES:
+        raise Denied(message("delete_guard.reason.expansion", verb=verb, raw=raw))
+    return matches
+
+
+# A name from find or xargs is unknown: it may be the whole word or have a suffix that stays in its folder, nothing else.
+def _check_match_mark(raw: str, verb: str) -> None:
+    if MATCH_MARK not in raw:
+        return
+    rest = raw.replace(MATCH_MARK, "")
+    if raw.startswith(MATCH_MARK) and raw.count(MATCH_MARK) == 1 and "/" not in rest:
+        return
+    raise Denied(message("delete_guard.reason.match_path", verb=verb, raw=raw.replace(MATCH_MARK, "{}")))
+
+
+def _check_resolved(resolved: str, cwd: str | None, recursive: bool, verb: str) -> None:
+    if _protected(resolved):
+        raise Denied(message("delete_guard.reason.protected_folder", verb=verb, path=resolved))
+    if any(_inside(resolved, root) for root in TEMP_ROOTS):
+        return
+    root = _repository_root(cwd)
+    if root is None or not _inside(resolved, root):
+        raise Denied(message("delete_guard.reason.outside_repository", verb=verb, path=resolved))
+    if resolved == root:
+        raise Denied(message("delete_guard.reason.repository_root", verb=verb, path=resolved))
+    if resolved == os.path.join(root, ".git") or _inside(resolved, os.path.join(root, ".git")):
+        raise Denied(message("delete_guard.reason.git_metadata", verb=verb, path=resolved))
+    if recursive and os.path.isdir(resolved) and os.path.isfile(os.path.join(resolved, ".git")):
+        raise Denied(message("delete_guard.reason.worktree", path=resolved))
+
+
+def _check_sendable(resolved: str) -> None:
+    if _in_trash(resolved) or any(_inside(root, resolved) for root in _trash_roots()):
+        raise Denied(message("delete_guard.reason.trash_inside", path=resolved))
+    if _protected(resolved):
+        raise Denied(message("delete_guard.reason.trash_protected", path=resolved))
 
 
 # gio, gvfs and kio take locations as well as paths. A file: location is the path it names; any other place (sftp:, smb:)
@@ -485,7 +545,9 @@ def _check_remote_target(raw: str, verb: str) -> None:
     path = _remote_literal(raw)
     if path is None or not any(path.startswith(root + "/") for root in _REMOTE[0] or ()):
         raise RemoteDenied(message("delete_guard.reason.remote_target", verb=verb, raw=raw))
-    _REMOTE_TARGETS.append(path)
+    # A folder written with a trailing slash, and the folder rsync fills, are entered, so a link there leads out; any other
+    # target is removed itself, and a link to remove is no escape.
+    _REMOTE_TARGETS.append((path, raw.endswith("/") and raw != "/" or verb.startswith("rsync")))
 
 
 def _check_remote_trash_target(raw: str) -> None:
@@ -501,6 +563,9 @@ def _check_target(raw: str, cwd: str | None, *, recursive: bool, verb: str) -> N
         raise Denied(message("delete_guard.reason.trash_purge", verb=verb, path=raw))
     if _REMOTE[0] is not None:
         _check_remote_target(raw, verb)
+        return
+    _check_match_mark(raw, verb)
+    if MATCH_MARK in raw:
         return
     if "{" in raw and BRACE_PATTERN.search(raw):
         variants = expand_braces(raw)
@@ -526,7 +591,11 @@ def _check_target(raw: str, cwd: str | None, *, recursive: bool, verb: str) -> N
         raise Denied(message("delete_guard.reason.unresolvable", verb=verb, raw=raw))
     if _in_trash(resolved):
         raise Denied(message("delete_guard.reason.trash_purge", verb=verb, path=resolved))
-    _check_matches(raw, cwd, "delete_guard.reason.trash_purge", verb, folders=recursive)
+    for match in _glob_matches(raw, cwd, verb):
+        found = os.path.realpath(match)
+        if _names_trash(match) or _in_trash(found) or (recursive and os.path.isdir(found) and _holds_trash(found)):
+            raise Denied(message("delete_guard.reason.trash_purge", verb=verb, path=match))
+        _check_resolved(found, cwd, recursive, verb)
     if recursive and base == raw and os.path.isdir(resolved) and _holds_trash(resolved):
         raise Denied(message("delete_guard.reason.trash_holder", verb=verb, path=resolved))
     # A glob under a temp root is cleanup of scratch folders only when a literal name comes before the first wildcard.
@@ -534,19 +603,7 @@ def _check_target(raw: str, cwd: str | None, *, recursive: bool, verb: str) -> N
         first_component = raw[len(base) :].lstrip("/").split("/")[0]
         if re.search(r"[A-Za-z0-9_]", re.split(r"[*?\[]", first_component)[0]):
             return
-    if _protected(resolved):
-        raise Denied(message("delete_guard.reason.protected_folder", verb=verb, path=resolved))
-    if any(_inside(resolved, root) for root in TEMP_ROOTS):
-        return
-    root = _repository_root(cwd)
-    if root is None or not _inside(resolved, root):
-        raise Denied(message("delete_guard.reason.outside_repository", verb=verb, path=resolved))
-    if resolved == root:
-        raise Denied(message("delete_guard.reason.repository_root", verb=verb, path=resolved))
-    if resolved == os.path.join(root, ".git") or _inside(resolved, os.path.join(root, ".git")):
-        raise Denied(message("delete_guard.reason.git_metadata", verb=verb, path=resolved))
-    if recursive and os.path.isdir(resolved) and os.path.isfile(os.path.join(resolved, ".git")):
-        raise Denied(message("delete_guard.reason.worktree", path=resolved))
+    _check_resolved(resolved, cwd, recursive, verb)
 
 
 def _rm(words: list[str], cwd: str | None) -> None:
@@ -602,16 +659,18 @@ def _trash(words: list[str], cwd: str | None) -> None:
 def _trash_one(target: str, cwd: str | None) -> None:
     if _names_trash(target):
         raise Denied(message("delete_guard.reason.trash_inside", path=target))
-    if _is_computed(target):
+    _check_match_mark(target, "trash")
+    if MATCH_MARK in target or _is_computed(target):
         return
     resolved = _expand(_glob_base(target), cwd)
     if resolved is None:
         return
-    if _in_trash(resolved) or any(_inside(root, resolved) for root in _trash_roots()):
-        raise Denied(message("delete_guard.reason.trash_inside", path=resolved))
-    if _protected(resolved):
-        raise Denied(message("delete_guard.reason.trash_protected", path=resolved))
-    _check_matches(target, cwd, "delete_guard.reason.trash_inside", "trash", folders=True)
+    _check_sendable(resolved)
+    for match in _glob_matches(target, cwd, "trash"):
+        found = os.path.realpath(match)
+        if _names_trash(match) or (os.path.isdir(found) and _holds_trash(found)):
+            raise Denied(message("delete_guard.reason.trash_inside", path=match))
+        _check_sendable(found)
     if _glob_base(target) == target and os.path.isdir(resolved) and _holds_trash(resolved):
         raise Denied(message("delete_guard.reason.trash_inside", path=resolved))
 
@@ -626,6 +685,12 @@ def _gio(words: list[str], cwd: str | None) -> None:
             _check_target(_location_path(operand, "gio remove"), cwd, recursive=False, verb="gio remove")
 
 
+# The first word of a command after its wrappers, and the first KIO command among its operands.
+def _kio_command(words: list[str]) -> str | None:
+    operands = split_options(words[1:], "", frozenset())
+    return next((operand for operand in operands if operand in KIO_COMMANDS), None)
+
+
 # Whether a command that find or xargs runs deletes or sends files away, which makes the folder find starts in a target.
 def _deletes_files(command: list[str]) -> bool:
     try:
@@ -635,32 +700,70 @@ def _deletes_files(command: list[str]) -> bool:
     if not stripped:
         return False
     name = _base(stripped[0])
-    return name in XARGS_DELETERS or name in TRASH_TOOLS or name == "gio" or KIO_TOOL.fullmatch(name) is not None
+    if name in XARGS_DELETERS or name in TRASH_TOOLS:
+        return True
+    if name == "gio":
+        return stripped[1:2] != [] and stripped[1] in GIO_DELETE_VERBS
+    if KIO_TOOL.fullmatch(name):
+        return _kio_command(stripped) in KIO_REMOVE_VERBS
+    return False
 
 
-# The command that find runs is checked like a typed one. Its {} stands for the match and is no operand of its own, and -execdir
-# runs in the folder of each match, which is not known here.
-def _find(words: list[str], cwd: str | None) -> None:
-    deleting = "-delete" in words
-    executions: list[tuple[list[str], bool]] = []
-    for index, word in enumerate(words):
-        if word in {"-exec", "-execdir", "-ok", "-okdir"} and index + 1 < len(words):
+# The commands find is told to run, each without its terminator.
+def _find_executions(words: list[str]) -> list[tuple[str, list[str]]]:
+    executions: list[tuple[str, list[str]]] = []
+    index = 1
+    while index < len(words):
+        if words[index] in FIND_EXEC_PREDICATES:
             end = next((position for position in range(index + 1, len(words)) if words[position] in {";", "\\;", "+"}), len(words))
-            command = [argument.replace("{}", "x") for argument in words[index + 1 : end] if argument != "{}"]
-            if command:
-                deleting = deleting or _deletes_files(command)
-                executions.append((command, word.startswith("-execdir") or word.startswith("-okdir")))
-    for command, in_match_folder in executions:
-        _check_chunk(command, None if in_match_folder else cwd, " ".join(command), trusted=False)
+            executions.append((words[index], words[index + 1 : end]))
+            index = end
+        index += 1
+    return executions
+
+
+def _find_deleting(words: list[str]) -> bool:
+    return "-delete" in words or any(command and _deletes_files(command) for _, command in _find_executions(words))
+
+
+# find follows links with -L and -follow (and, for the folder it starts in, with -H); the words that are values of a predicate
+# or belong to the command it runs are not its options.
+def _find_follow_option(words: list[str], follow: frozenset[str]) -> str | None:
+    index = 1
+    while index < len(words) and (words[index] in FIND_GLOBAL_OPTIONS or words[index].startswith(("-D", "-O"))):
+        if words[index] in follow:
+            return words[index]
+        index += 2 if words[index] in {"-D", "-O"} else 1
+    while index < len(words):
+        word = words[index]
+        if word in FIND_EXEC_PREDICATES:
+            index = next((position for position in range(index + 1, len(words)) if words[position] in {";", "\\;", "+"}), len(words))
+        elif word in FIND_VALUE_PREDICATES or FIND_NEWER_PREDICATE.fullmatch(word):
+            index += 1
+        elif word == "-follow":
+            return word
+        index += 1
+    return None
+
+
+# The command that find runs is checked like a typed one. Its {} stands for the match: a whole {} is no operand of its own (the
+# folders find starts in are the targets), and a path built from it is checked by what the name may be. -execdir runs in the
+# folder of each match, which is not known here.
+def _find(words: list[str], cwd: str | None) -> None:
+    deleting = _find_deleting(words)
+    for predicate, body in _find_executions(words):
+        command = [argument.replace("{}", MATCH_MARK) for argument in body if argument != "{}"]
+        if command:
+            _check_chunk(command, None if predicate in {"-execdir", "-okdir"} else cwd, " ".join(command), trusted=False)
     if not deleting:
         return
     follow = FIND_FOLLOW_OPTIONS | ({"-H"} if _REMOTE[0] is not None else set())
-    option = next((word for word in words if word in follow), None)
+    option = _find_follow_option(words, frozenset(follow))
     if option:
         raise Denied(message("delete_guard.reason.find_follow", option=option))
     starts: list[str] = []
     for word in words[1:]:
-        if word in {"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"} and not starts:
+        if word in FIND_GLOBAL_OPTIONS and not starts:
             continue
         if word.startswith("-") or word in {"(", "!", "\\("}:
             break
@@ -669,11 +772,24 @@ def _find(words: list[str], cwd: str | None) -> None:
         _check_target(start, cwd, recursive=True, verb="find -delete")
 
 
-# The names xargs is given are not known, so a command that deletes them is refused; anything else is checked as typed.
+# The names xargs is given are not known, so a command that deletes them is refused, and so is a find or an rsync that would
+# take its starting folders from them; anything else is checked as typed, with the replace string standing for an unknown name.
 def _xargs(words: list[str], cwd: str | None) -> None:
     rest = words[1:]
+    replace = None
     while rest and rest[0].startswith("-") and len(rest[0]) > 1 and rest[0] != "--":
-        rest = rest[2:] if option_names(rest[0], XARGS_VALUE_OPTIONS)[1] else rest[1:]
+        option = rest[0]
+        if option == "-I" and len(rest) > 1:
+            replace = rest[1]
+        elif option.startswith("-I") and not option.startswith("--"):
+            replace = option[2:]
+        elif option in {"-i", "--replace"}:
+            replace = "{}"
+        elif option.startswith("-i") and not option.startswith("--"):
+            replace = option[2:]
+        elif option.startswith("--replace="):
+            replace = option.split("=", 1)[1]
+        rest = rest[2:] if option_names(option, XARGS_VALUE_OPTIONS)[1] else rest[1:]
     if rest[:1] == ["--"]:
         rest = rest[1:]
     rest = strip_wrappers(rest)
@@ -681,10 +797,13 @@ def _xargs(words: list[str], cwd: str | None) -> None:
         return
     name = _base(rest[0])
     removes_places = name == "gio" and rest[1:2] in (["remove"], ["rm"])
-    removes_places = removes_places or (KIO_TOOL.fullmatch(name) is not None and any(word in KIO_REMOVE_VERBS for word in rest[1:]))
-    if name in XARGS_DELETERS or removes_places:
+    removes_places = removes_places or (KIO_TOOL.fullmatch(name) is not None and _kio_command(rest) in KIO_REMOVE_VERBS)
+    deletes_by_find = name == "find" and _find_deleting(rest)
+    deletes_by_rsync = name == "rsync" and any(word.startswith("--delete") or word == "--remove-source-files" for word in rest)
+    if name in XARGS_DELETERS or removes_places or deletes_by_find or deletes_by_rsync:
         raise Denied(message("delete_guard.reason.xargs_rm"))
-    command = [argument.replace("{}", "x") for argument in rest if argument != "{}"]
+    marker = replace or "{}"
+    command = [argument.replace(marker, MATCH_MARK) for argument in rest if argument != marker]
     _check_chunk(command, cwd, " ".join(command), trusted=False)
 
 
@@ -911,10 +1030,19 @@ def _wrapper_directory(value: str, base: str | None) -> str | None:
     return resolved if resolved is not None and os.path.isdir(resolved) else None
 
 
+# Wrappers inside wrappers each move from the folder the one before left; after a root change nothing can be resolved here.
+def _wrapper_directories(values: list[str], start: str | None) -> str | None:
+    folder, lost = start, False
+    for value in values:
+        lost = lost or not value
+        folder = None if lost else _wrapper_directory(value, folder)
+    return folder
+
+
 # The result is the shell's folder after the command and whether this command was a directory change that is known.
 def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: bool = True) -> tuple[str | None, bool]:
     try:
-        stripped, directory = strip_wrappers_with_directory(words)
+        stripped, directories = strip_wrappers_with_directory(words)
     except UnresolvableCommand:
         # A command with no delete word in it was never looked at before, so an odd wrapper there is not a reason to refuse.
         if QUICK_SCAN.search(command_text):
@@ -926,8 +1054,8 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
     words = stripped
     # A wrapper that changes directory only affects its own command, so the shell's folder is restored afterwards.
     shell_cwd = cwd
-    if directory is not None:
-        cwd = _wrapper_directory(directory, cwd)
+    if directories:
+        cwd = _wrapper_directories(directories, cwd)
     name = _base(words[0])
     if name == "popd":
         return None, False
@@ -973,7 +1101,7 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
     if name.rstrip("0123456789.") in INTERPRETERS:
         if INLINE_RECURSIVE_DELETE.search(" ".join(words[1:])) or INLINE_RECURSIVE_DELETE.search(heredoc):
             raise Denied(message("delete_guard.reason.inline_delete"))
-        if name == "osascript" and FINDER_EMPTY_TRASH.search(APPLESCRIPT_STRING.sub('""', " ".join(words[1:]) + "\n" + heredoc)):
+        if name == "osascript" and FINDER_TEXT.search(" ".join(words[1:]) + "\n" + heredoc):
             raise Denied(message("delete_guard.reason.trash_empty", name=name))
     if name in {"rm", "unlink", "rmdir"}:
         _rm(words, cwd)
@@ -989,14 +1117,14 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
             _check_target(_location_path(operand, "gvfs-rm"), cwd, recursive=False, verb="gvfs-rm")
     elif KIO_TOOL.fullmatch(name):
         operands = split_options(words[1:], "", frozenset())
-        verb = next((operand for operand in operands if operand in KIO_REMOVE_VERBS), None)
-        if verb:
+        verb = _kio_command(words)
+        if verb in KIO_REMOVE_VERBS:
             for operand in operands[operands.index(verb) + 1 :]:
                 _check_target(_location_path(operand, "kioclient " + verb), cwd, recursive=True, verb="kioclient " + verb)
     elif name in {"hadoop", "hdfs"}:
         if HADOOP_PURGE_OPTIONS & set(words[1:]):
             raise Denied(message("delete_guard.reason.trash_empty", name=name))
-    elif name.lower() == "clear-recyclebin" or (name.lower() in WINDOWS_SHELLS and WINDOWS_EMPTY_BIN.search(" " + " ".join(words[1:]) + "\n" + heredoc)):
+    elif name.lower() == "clear-recyclebin" or (name.lower() in WINDOWS_SHELLS and WINDOWS_TEXT.search(" ".join(words[1:]) + "\n" + heredoc)):
         raise Denied(message("delete_guard.reason.trash_empty", name=name))
     elif name == "find":
         _find(words, cwd)
@@ -1027,6 +1155,20 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
     return shell_cwd, False
 
 
+# Every file the command line reads with `<`, whatever redirections come before or after it and however its name is written.
+# One that cannot be read the same way falls back to the first plain `sh < file`.
+def _input_redirect_files(command_text: str) -> list[str]:
+    try:
+        lexer = shlex.shlex(_without_heredoc_bodies(command_text), posix=True, punctuation_chars=True)
+        lexer.whitespace = " \t\r\n"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return [next(group for group in found.groups() if group) for found in STDIN_SCRIPT.finditer(command_text)]
+    return [tokens[index + 1] for index, token in enumerate(tokens[:-1]) if token == "<"]
+
+
 # A shell runs a command string (-c), a script file (after its own options and their values), or what it reads on stdin.
 def _check_shell(words: list[str], cwd: str | None, command_text: str) -> None:
     script = None
@@ -1055,8 +1197,8 @@ def _check_shell(words: list[str], cwd: str | None, command_text: str) -> None:
     if script is not None and not reads_stdin:
         _check_script(script, cwd, shell=True)
     else:
-        for match in STDIN_SCRIPT.finditer(command_text):
-            _check_script(next(group for group in match.groups() if group), cwd, shell=True)
+        for name in _input_redirect_files(command_text):
+            _check_script(name, cwd, shell=True)
 
 
 # Ignored files hold machine-local notes and archives, so a real `git clean` run is never automatic.
@@ -1199,11 +1341,16 @@ def _remote_preflight_script() -> str:
     roots = _remote_roots()
     if not targets or not roots:
         return ""
+    removed = " ".join(path for path, entered in targets if not entered)
+    entered = " ".join(path for path, entered in targets if entered)
     return (
-        "fail=0; for t in " + " ".join(targets) + "; do d=$(dirname -- \"$t\"); b=$(basename -- \"$t\"); [ -d \"$d\" ] || continue; "
-        "r=$(cd -P -- \"$d\" && pwd)/$b; ok=0; for root in " + " ".join(roots) + "; do "
-        "rr=$(cd -P -- \"$root\" 2>/dev/null && pwd) || continue; case \"$r\" in \"$rr\"/*) ok=1;; esac; done; "
-        "[ \"$ok\" = 1 ] || { echo \"PREFLIGHT_REFUSED $t\"; fail=1; }; done; [ \"$fail\" = 0 ] && echo PREFLIGHT_OK"
+        "fail=0; check() { ok=0; for root in " + " ".join(roots) + "; do rr=$(cd -P -- \"$root\" 2>/dev/null && pwd) || continue; "
+        "case \"$1\" in \"$rr\"/?*) ok=1;; esac; done; "
+        "[ \"$ok\" = 1 ] || { echo \"PREFLIGHT_REFUSED $2\"; fail=1; }; }; "
+        "for t in " + removed + "; do d=$(dirname -- \"$t\"); b=$(basename -- \"$t\"); [ -d \"$d\" ] || continue; "
+        "check \"$(cd -P -- \"$d\" && pwd)/$b\" \"$t\"; done; "
+        "for t in " + entered + "; do [ -d \"$t\" ] || continue; check \"$(cd -P -- \"$t\" && pwd)\" \"$t\"; done; "
+        "[ \"$fail\" = 0 ] && echo PREFLIGHT_OK"
     )
 
 
