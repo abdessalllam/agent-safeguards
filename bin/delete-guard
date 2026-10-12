@@ -230,7 +230,6 @@ MOSH_VALUE_LETTERS = frozenset("p")
 MOSH_LONG_FLAGS = frozenset({"--help", "--local", "--no-init", "--no-ssh-pty", "--predict-overwrite", "--verbose", "--version"})
 MOSH_LONG_VALUES = frozenset({"--bind-server", "--client", "--experimental-remote-ip", "--family", "--port", "--predict", "--server", "--ssh"})
 # Shells take a value after these options, so the next word is not the script.
-SHELL_LONG_VALUES = frozenset({"--rcfile", "--init-file"})
 STDIN_OPERATORS = frozenset({"<", "<>"})
 # A tilde that is quoted or escaped is not a home folder, so what follows it is a relative path.
 QUOTED_TILDE = re.compile(r"(?:^|[\s;&|(])(?:(?:['\"]+|\\)~|~['\"\\])")
@@ -1484,37 +1483,37 @@ def _line_input_files(command: str) -> list[tuple[str, str | None]]:
     return names
 
 
-# A shell runs a command string (-c), a script file (after its own options and their values), or what it reads on stdin.
-# A shell reads its options first (every o and O letter takes a word, -c and -s set the mode wherever they stand), then what is
-# left: with -c the first word is the command string, with -s or with no word at all the input is read, otherwise the first
-# word is the script.
+# Bash, zsh, fish and dash disagree about which options take a value, how a sign changes a letter and whether a long option
+# has one dash or two, so the options are not parsed. Every word that is not an option is read as a possible script, and when an
+# option can mean a command string (a `c`, `C` or `command` in a dashed word) it is checked as command text too; text inside
+# an option word (`--command='cmd'`, `-c'cmd'`) is checked as well. The input files are read when no word can be a script or an
+# `s` appears in an option. This reads more files than the shell does (an argument that names a script is read as one).
 def _check_shell(words: list[str], cwd: str | None) -> None:
-    index = 1
-    command_mode = stdin_mode = False
-    while index < len(words):
-        word = words[index]
-        if word == "--" or word == "-":
-            index += 1
+    options: list[str] = []
+    operands: list[str] = []
+    for index, word in enumerate(words[1:], 1):
+        if word == "--":
+            operands.extend(words[index + 1 :])
             break
-        if word.startswith("--"):
-            index += 2 if word in SHELL_LONG_VALUES else 1
-        elif len(word) > 1 and word[0] in "-+":
-            if word[0] == "-":
-                command_mode = command_mode or "c" in word
-                stdin_mode = stdin_mode or "s" in word
-            index += 1 + word.count("o") + word.count("O")
+        if len(word) > 1 and word[0] in "-+":
+            options.append(word)
         else:
-            break
-    operands = words[index:]
-    if command_mode:
-        if operands:
-            _check_command(operands[0], cwd)
-        return
+            operands.append(word)
+    command_options = [option for option in options if "command" in option or (not option.startswith("--") and ("c" in option or "C" in option))]
+    for option in options:
+        if re.search(r"[\s;|&=]", option):
+            # The text may start after the letters of the option (`-c'cmd'`, `--command=cmd`), wherever they end.
+            prefix = re.match(r"[-+]+[A-Za-z-]{0,40}=?", option).group(0)
+            for cut in range(1, len(prefix) + 1):
+                _check_command(option[cut:], cwd)
+    if command_options:
+        for operand in operands:
+            _check_command(operand, cwd)
     if _REMOTE[0] is not None:
         return
-    if operands and not stdin_mode:
-        _check_script(operands[0], cwd, shell=True)
-    else:
+    for operand in operands:
+        _check_script(operand, cwd, shell=True)
+    if not operands or any(not option.startswith("--") and "s" in option for option in options):
         for name, folder in _STDIN_FILES[0]:
             _check_script(name, folder, shell=True)
 

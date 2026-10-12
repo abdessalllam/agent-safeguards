@@ -41,6 +41,8 @@ First release.
 - Fixes in safe-tool after the seventh Codex reviews: `systemctl -P` takes its value, `user@host` takes the whole run of labels, and an attached `ps -C` command name is a filter on Linux and not an environment option.
 - Fixes after the eighth Codex reviews: a shell's options are read in full before its command string, script or input is chosen (`bash -co pipefail 'cmd'`, `-oe`, `-oo a b script`, `-so pipefail` with its input), and GNU `xargs` long options are read with their value rules (`--eof` and `--max-lines` take a value only when attached) and unambiguous abbreviations, a name that cannot be read being refused.
 - Fixes in safe-tool after the eighth Codex reviews: `redact` replaces a user with an IPv6 host (plain, bracketed or `git@[...]:path`) as one `<user@host>`.
+- Fixes after the ninth Codex reviews: the options of a shell are no longer parsed (bash, zsh and fish disagree about values, signs and dashes): every non-option word is read as a possible script, a command option makes them command text too, and text inside an option word (`--command='cmd'`, `-c'cmd'`) is checked.
+- Fixes in safe-tool after the ninth Codex reviews: a dollar-quoted word (`sort $'-o'`) in a remote command is refused, `redact` takes a dotted tail and a scope id (`fe80::1%eth0`) into the address before it decides what the user and host are, and `date -Iseconds` is not read as a clock setting.
 - Optional RTK enforcement: the `require_rtk` plugin setting on Claude Code, or `AGENT_SAFEGUARDS_REQUIRE_RTK` on any host, denies commands that `rtk rewrite` would change. `safe-tool status rtk` reports readiness and whether it is on.
 - Plugin for Claude Code and Codex with a fail-closed launcher.
 - Skills `command-guards` and `setup-agent-safeguards`.
