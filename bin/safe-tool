@@ -228,7 +228,7 @@ REMOTE_VALUE_LETTERS = {
 REMOTE_ATTACHED_LETTERS = {"date": "I"}
 # Long options that take no value, so a -- after one of them is a terminator.
 REMOTE_FLAG_LONG = {
-    "date": frozenset({"--debug", "--help", "--rfc-2822", "--rfc-822", "--rfc-email", "--universal", "--utc", "--version"}),
+    "date": frozenset({"--debug", "--help", "--iso-8601", "--rfc-2822", "--rfc-822", "--rfc-email", "--universal", "--utc", "--version"}),
     "file": frozenset(
         {"--apple", "--brief", "--dereference", "--extension", "--help", "--keep-going", "--mime", "--mime-encoding", "--mime-type", "--no-dereference", "--no-pad", "--preserve-date", "--raw", "--special-files", "--uncompress", "--version"}
     ),
@@ -250,6 +250,9 @@ DOCKER_STATS_VALUE_OPTIONS = frozenset({"--format"})
 BOOLEAN_TRUE = frozenset({"1", "t", "T", "true", "TRUE", "True"})
 BOOLEAN_FALSE = frozenset({"0", "f", "F", "false", "FALSE", "False"})
 # ps reads words without a dash as BSD options too; these take the next word (or the rest of the word) as their value.
+PS_ENVIRON_FIELD = re.compile(
+    r"(?i)(?<![A-Za-z0-9_=.-])environ(?![A-Za-z0-9_-])|(?<=[oO])environ(?![A-Za-z0-9_-])|(?<=--format=)environ(?![A-Za-z0-9_-])"
+)
 PS_PROFILES = {
     "linux": (frozenset("CGgOopqstUu"), frozenset("NOopqtU")),
     "darwin": (frozenset("OoGgupUt"), frozenset("OoGgupUt")),
@@ -964,7 +967,7 @@ def _reads_startup_file(command: str) -> bool:
 # options that take a value differ between Linux (-C, -q and -s do) and macOS, so the target decides; a remote check is Linux.
 def _ps_shows_environment(arguments: list[str]) -> bool:
     # procps has a format field (`-o environ`) that prints the environment, in any spelling of the option that carries it.
-    if any("environ" in argument.lower() for argument in arguments):
+    if any(PS_ENVIRON_FIELD.search(argument) for argument in arguments):
         return True
     unix_values, bsd_values = PS_PROFILES[_PS_TARGET[0]]
     return _ps_walk(arguments, unix_values, bsd_values)
@@ -2062,9 +2065,25 @@ def _remote_option_problem(name: str, arguments: list[str]) -> str | None:
         subcommand = operands[0] if operands else ""
         if subcommand not in REMOTE_SUBCOMMANDS[name]:
             return message("safe_tool.remote.reason.subcommand", name=name, subcommand=_shown(subcommand))
-        if subcommand == "logs" and "--nostream" not in arguments:
+        if subcommand == "logs" and not _pm2_no_stream(arguments):
             return message("safe_tool.remote.reason.option", name="pm2 logs", option="without --nostream")
     return None
+
+
+# pm2 logs ends instead of following only with --nostream as an option: not as the value of an option that takes one (--lines,
+# --name, --namespace), and not after --.
+def _pm2_no_stream(arguments: list[str]) -> bool:
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        index += 1
+        if argument == "--":
+            return False
+        if argument in {"--lines", "--name", "--namespace", "-n"}:
+            index += 1
+        elif argument == "--nostream":
+            return True
+    return False
 
 
 # A boolean flag counts as set when its last mention before any -- says so (--no-stream, --no-stream=false).
@@ -2104,11 +2123,20 @@ def _docker_follows(arguments: list[str]) -> bool:
                 continue
         elif argument.startswith("-") and len(argument) > 1:
             letters, equals, value = argument[1:].partition("=")
-            position = letters.find("f")
-            if position == -1 or "n" in letters[:position]:
-                continue
-            if position != len(letters) - 1:
-                equals = ""
+            for position, letter in enumerate(letters):
+                if letter == "n":
+                    break
+                if letter != "f":
+                    continue
+                if position != len(letters) - 1 or not equals:
+                    state = True
+                elif value in BOOLEAN_TRUE:
+                    state = True
+                elif value in BOOLEAN_FALSE:
+                    state = False
+                else:
+                    return True
+            continue
         else:
             continue
         if not equals or value in BOOLEAN_TRUE:

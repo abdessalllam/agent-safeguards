@@ -97,6 +97,10 @@ QUICK_SCAN = re.compile(
 )
 INLINE_RECURSIVE_DELETE = re.compile(r"rmtree|removedirs|rmSync|rmdirSync|remove_dir_all|rm_rf|rm\s+-[a-zA-Z]*[rR]")
 INTERPRETERS = frozenset({"python", "python3", "node", "perl", "ruby", "deno", "bun", "osascript", "swift"})
+BASH_SINGLE_DASH_LONG = frozenset(
+    {"-debugger", "-dump-po-strings", "-dump-strings", "-help", "-init-file", "-login", "-noediting", "-noprofile", "-norc", "-nolineediting", "-posix", "-pretty-print", "-rcfile", "-restricted", "-verbose", "-version"}
+)
+SHELL_LONG_WITH_VALUE = frozenset({"--rcfile", "--init-file", "-rcfile", "-init-file", "--emulate", "--command", "--init-command"})
 SHELLS = frozenset({"bash", "sh", "zsh", "dash", "fish"})
 ERASE_TOOL = re.compile(r"(?:mkfs|newfs|shred|srm)(?:[._].*)?")
 TRASH_TOOLS = frozenset({"trash", "trash-put", "gvfs-trash"})
@@ -221,7 +225,7 @@ SYSTEM_PROGRAM_FOLDERS = ("/bin/", "/sbin/", "/usr/", "/opt/", "/Library/", "/Sy
 # A command that starts a script, a shell on a file, ssh or a remote alias can delete without any delete word in its text.
 # Any path, any .sh name and any word that can start or wrap another command is enough to look closer.
 SCRIPT_HINT = re.compile(
-    r"/|\.sh\b|(?:^|[\s;&|(])(?:source|\.|bash|sh|zsh|dash|ksh|fish|ssh|mosh|exec|env|timeout|sudo|nice|nohup|time|command|xargs|ssh[_-][\w-]+)(?=[\s;&|)]|$)"
+    r"/|\.sh\b|(?:^|[\s;&|(])[\\'\"]?(?:source|\.|bash|sh|zsh|dash|ksh|fish|ssh|mosh|exec|env|timeout|sudo|nice|nohup|time|command|xargs|ssh[_-][\w-]+)[\\'\"]?(?=[\s;&|)]|$)"
 )
 # ssh and mosh read their options before the host and again after it; these are the letters and names that take a value.
 SSH_FLAG_LETTERS = frozenset("46AaCfGgKkMNnqsTtVvXxYy")
@@ -370,7 +374,9 @@ def _protect_escaped_separators(text: str) -> str:
             if character == quote:
                 quote = ""
             elif quote == '"' and character == "\\":
-                out.append(text[index : index + 2])
+                # The backslash stays a character of the word before anything but $ ` " \ and a line break.
+                following = text[index + 1 : index + 2]
+                out.append("\\" + ESCAPED_SEPARATORS[following] if following in ESCAPED_SEPARATORS and following != "\n" else text[index : index + 2])
                 index += 2
                 continue
             elif character in ESCAPED_SEPARATORS:
@@ -1025,13 +1031,56 @@ def _shell_gets_a_name(command: list[str], marker: str, appended: bool) -> bool:
         return False
     if not stripped or _base(stripped[0]) not in SHELLS:
         return False
-    options = [word for word in stripped[1:] if len(word) > 1 and word[0] in "-+"]
-    operands = [word for word in stripped[1:] if not (len(word) > 1 and word[0] in "-+")]
-    if any(not option.startswith("--") and "c" in option for option in options):
+    options, operands = _shell_words(stripped[1:])
+    if any(_is_command_option(option) for option in options):
         return False
     if any(marker in operand for operand in operands):
         return True
-    return appended and not operands and not any(not option.startswith("--") and "s" in option for option in options)
+    # A `-s` that no `+s` clears makes the shell read its input; otherwise an appended name becomes its script.
+    reads_input = any(_is_short(option) and "s" in option and option[0] == "-" for option in options) and not any(
+        _is_short(option) and "s" in option and option[0] == "+" for option in options
+    )
+    return appended and not operands and not reads_input
+
+
+def _is_short(option: str) -> bool:
+    return not option.startswith("--") and option not in BASH_SINGLE_DASH_LONG
+
+
+# `c` is the command string's option, as a letter of a short bundle or as fish's `--command`; the single-dash long names of bash
+# (`-norc`) only contain one.
+def _is_command_option(option: str) -> bool:
+    return option == "--command" or option.startswith("--command=") or (_is_short(option) and ("c" in option or "C" in option))
+
+
+# The words after a shell's name split into options (with the values some of them take set aside) and operands.
+def _shell_words(words: list[str]) -> tuple[list[str], list[str]]:
+    options: list[str] = []
+    operands: list[str] = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        index += 1
+        if word == "--":
+            operands.extend(words[index:])
+            break
+        if len(word) > 1 and word[0] in "-+":
+            options.append(word)
+            if word in SHELL_LONG_WITH_VALUE:
+                index += 1
+            elif _is_short(word):
+                index += word.count("o") + word.count("O")
+        else:
+            operands.append(word)
+    return options, operands
+
+
+def _moves_and_deletes(command: list[str]) -> bool:
+    try:
+        stripped, directories = strip_wrappers_with_directory(command)
+    except UnresolvableCommand:
+        return False
+    return bool(directories) and bool(stripped) and _deletes_files(stripped)
 
 
 def _find(words: list[str], cwd: str | None) -> None:
@@ -1042,6 +1091,9 @@ def _find(words: list[str], cwd: str | None) -> None:
         if command:
             if _shell_gets_a_name(body, "{}", False):
                 raise Denied(message("delete_guard.reason.match_path", verb="a shell", raw="{}"))
+            # A wrapper that moves to another folder reads the name find gives it from there, which is not the folder it was found in.
+            if "{}" in body and _moves_and_deletes(body):
+                raise Denied(message("delete_guard.reason.match_path", verb="a command in another folder", raw="{}"))
             if _deletes_from_names(command):
                 raise Denied(message("delete_guard.reason.xargs_rm"))
             # What find runs reads the standard input find was given, opened in the folder find runs in.
@@ -1499,6 +1551,31 @@ def _check_one_chunk(words: list[str], cwd: str | None, command_text: str, trust
 _STDIN_FILES: list[list[tuple[str, str | None]]] = [[]]
 
 
+# The places the command line writes to with a redirection (`> /dev/disk3`), for those that are devices.
+DEVICE_WRITE_OK = re.compile(r"/dev/(?:null|zero|full|stdout|stderr|stdin|tty|random|urandom|ptmx|fd/\d+|pts/\d+|shm(?:/.*)?)")
+
+
+def _check_device_writes(command: str, cwd: str | None) -> None:
+    redirects: list[tuple[str, str, str]] = []
+    normalize_command(command, redirects)
+    for _, operator, operand in redirects:
+        if not operator.startswith(">") or operator.startswith((">&", ">(")) and operand.rstrip("-").isdigit():
+            continue
+        try:
+            words = shlex.split(operand)
+        except ValueError:
+            continue
+        if not words or not words[0]:
+            continue
+        if _is_computed(words[0]):
+            if operator.startswith(">") and words[0].startswith(("/dev/", "$")) and "/dev" in words[0]:
+                raise Denied(message("delete_guard.reason.computed_path", verb="a redirection", raw=words[0]))
+            continue
+        resolved = _expand(words[0], cwd)
+        if resolved is not None and _inside(resolved, "/dev") and not DEVICE_WRITE_OK.fullmatch(resolved):
+            raise Denied(message("delete_guard.reason.device_redirect", path=resolved))
+
+
 def _line_input_files(command: str) -> list[tuple[str, str | None]]:
     redirects: list[tuple[str, str, str]] = []
     normalize_command(command, redirects)
@@ -1602,6 +1679,7 @@ def _check_command(command: str, cwd: str | None) -> None:
     outer_files = _STDIN_FILES[0]
     _STDIN_FILES[0] = outer_files + _line_input_files(command)
     try:
+        _check_device_writes(command, cwd)
         for body in command_substitutions(command):
             if body.strip():
                 _check_command(body, substitution_cwd)

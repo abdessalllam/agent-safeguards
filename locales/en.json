@@ -9,6 +9,7 @@
   "delete_guard.reason.bare_glob": "`{verb}` with a bare glob ({raw}) depends on the current folder",
   "delete_guard.reason.computed_path": "`{verb}` with a computed path ({raw}) can expand to the wrong folder",
   "delete_guard.reason.dd_device": "`dd` onto a device erases it",
+  "delete_guard.reason.device_redirect": "a redirection onto the device {path} overwrites it",
   "delete_guard.reason.diskutil": "`diskutil` erase and delete operations are irreversible",
   "delete_guard.reason.erase_tool": "`{name}` erases data irreversibly",
   "delete_guard.reason.expansion": "`{verb}` target {raw} expands to more names than the guard can check, or through a folder it cannot list",
