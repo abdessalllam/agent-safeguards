@@ -121,6 +121,7 @@ MAX_MATCHES = 20000
 LOCATION_SCHEME = re.compile(r"(?i)[a-z][a-z0-9+.-]*:/")
 XARGS_DELETERS = frozenset({"rm", "unlink", "rmdir", "shred", "srm", "gvfs-rm"})
 XARGS_SHORT_VALUES = frozenset("adEIJLnPRSs")
+RM_LONG_OPTIONS = ("dir", "force", "help", "interactive", "no-preserve-root", "one-file-system", "preserve-root", "recursive", "verbose", "version")
 # GNU xargs: a value is required (`--arg-file F` or `--arg-file=F`), optional (only `--eof=E`), or absent. An unambiguous start
 # of a name stands for it.
 XARGS_LONG_OPTIONS = {
@@ -347,12 +348,13 @@ def _chunk(raw_words: list[str], before: str | None, after: str | None, redirect
         words[-1] = words[-1].rstrip(")")
         if not words[-1]:
             words.pop()
-    return Chunk(words, before, after, opened, redirected)
+    # Only now are the quoted and escaped parentheses given back, so that they were not taken for the end of a group.
+    return Chunk([word.translate(UNPROTECT_SEPARATORS) for word in words], before, after, opened, redirected)
 
 
 # An escaped or quoted separator (the \\; that ends a find command, the '|' given to env) is a word, not the end of the command,
 # so it is swapped for a private character the lexer leaves alone and swapped back in the words.
-ESCAPED_SEPARATORS = {";": "\ue010", "&": "\ue011", "|": "\ue012", "\n": "\ue013"}
+ESCAPED_SEPARATORS = {";": "\ue010", "&": "\ue011", "|": "\ue012", "\n": "\ue013", "(": "\ue014", ")": "\ue015"}
 
 
 UNPROTECT_SEPARATORS = {ord(private): original for original, private in ESCAPED_SEPARATORS.items()}
@@ -415,7 +417,7 @@ def _tokenize(command: str) -> list[Chunk] | None:
                 words, redirected = [], False
             before = separator
         else:
-            words.append(token.translate(UNPROTECT_SEPARATORS))
+            words.append(token)
     if words:
         chunks.append(_chunk(words, before, None, redirected))
     return [chunk for chunk in chunks if chunk.words or chunk.opened]
@@ -484,12 +486,16 @@ def _trash_roots() -> tuple[str, ...]:
 # A folder with a Trash directly inside it (the top of a volume) would take the Trash along when it is deleted or moved. A
 # folder that cannot be looked through completely is not shown to be free of one.
 def _holds_trash(path: str) -> bool:
+    roots = frozenset(_trash_roots())
     try:
         with os.scandir(path) as entries:
             for count, entry in enumerate(entries):
                 if count >= MAX_TRASH_SCAN:
                     return True
                 if TRASH_FOLDER.fullmatch(entry.name) and (TRASH_FILE_NAME.fullmatch(entry.name) or _is_folder(entry)):
+                    return True
+                # The Trash of this user has a plain name (Trash) when the data folder is moved, so its path is what tells.
+                if entry.path in roots or os.path.realpath(entry.path) in roots:
                     return True
     except (FileNotFoundError, NotADirectoryError):
         return False
@@ -831,7 +837,10 @@ def _rm(words: list[str], cwd: str | None) -> None:
         if not options_done and word == "--":
             options_done = True
         elif not options_done and word.startswith("--"):
-            recursive = recursive or word in {"--recursive", "--dir"}
+            name = word[2:].split("=", 1)[0]
+            matches = [option for option in RM_LONG_OPTIONS if option == name] or [option for option in RM_LONG_OPTIONS if option.startswith(name)]
+            # An option that cannot be told is taken for the recursive one: the stricter rules then apply.
+            recursive = recursive or len(matches) != 1 or matches[0] in {"recursive", "dir"}
         elif not options_done and word.startswith("-") and len(word) > 1:
             recursive = recursive or bool(set(word[1:]) & {"r", "R", "d"})
         else:
@@ -1007,12 +1016,32 @@ def _find_deleting(words: list[str]) -> bool:
 # The command that find runs is checked like a typed one. Its {} stands for the match: a whole {} is no operand of its own (the
 # folders find starts in are the targets), and a path built from it is refused. -execdir runs in the folder of each match,
 # which is not known here.
+# A shell that is handed a name by find or xargs (`sh {}`, `xargs sh`) runs that file as a script, and which file it is is not
+# known here; with a command string (-c) the names are only arguments.
+def _shell_gets_a_name(command: list[str], marker: str, appended: bool) -> bool:
+    try:
+        stripped = strip_wrappers(command)
+    except UnresolvableCommand:
+        return False
+    if not stripped or _base(stripped[0]) not in SHELLS:
+        return False
+    options = [word for word in stripped[1:] if len(word) > 1 and word[0] in "-+"]
+    operands = [word for word in stripped[1:] if not (len(word) > 1 and word[0] in "-+")]
+    if any(not option.startswith("--") and "c" in option for option in options):
+        return False
+    if any(marker in operand for operand in operands):
+        return True
+    return appended and not operands and not any(not option.startswith("--") and "s" in option for option in options)
+
+
 def _find(words: list[str], cwd: str | None) -> None:
     parts = _find_parts(words)
     deleting = parts.deletes or any(body and _deletes_files(body) for _, body in parts.executions)
     for predicate, body in parts.executions:
         command = [argument.replace("{}", MATCH_MARK) for argument in body if argument != "{}"]
         if command:
+            if _shell_gets_a_name(body, "{}", False):
+                raise Denied(message("delete_guard.reason.match_path", verb="a shell", raw="{}"))
             if _deletes_from_names(command):
                 raise Denied(message("delete_guard.reason.xargs_rm"))
             # What find runs reads the standard input find was given, opened in the folder find runs in.
@@ -1076,6 +1105,8 @@ def _xargs(words: list[str], cwd: str | None) -> None:
     if _deletes_files(stripped) or _deletes_from_names(stripped):
         raise Denied(message("delete_guard.reason.xargs_rm"))
     marker = replace or "{}"
+    if _shell_gets_a_name(rest, marker, True):
+        raise Denied(message("delete_guard.reason.match_path", verb="a shell", raw=marker))
     command = [argument.replace(marker, MATCH_MARK) for argument in rest if argument != marker]
     # The children get /dev/null for input, unless the names come from a file and the input stays theirs.
     outer_files = _STDIN_FILES[0]
@@ -1501,7 +1532,7 @@ def _check_shell(words: list[str], cwd: str | None) -> None:
             operands.append(word)
     command_options = [option for option in options if "command" in option or (not option.startswith("--") and ("c" in option or "C" in option))]
     for option in options:
-        if re.search(r"[\s;|&=]", option):
+        if option in command_options or re.search(r"[\s;|&=]", option):
             # The text may start after the letters of the option (`-c'cmd'`, `--command=cmd`), wherever they end.
             prefix = re.match(r"[-+]+[A-Za-z-]{0,40}=?", option).group(0)
             for cut in range(1, len(prefix) + 1):
@@ -1663,6 +1694,20 @@ def _check_remote_cli(command: str) -> int:
 
 # A lexical rule cannot see a link inside an allowed folder that leads out of it, so the machine itself resolves each
 # permanent delete target (its folder, so that deleting a link itself stays possible) and must find it inside a root.
+# The shell patterns of the folder names that make a path part of a Trash, for the machine to match its resolved path against.
+def _preflight_trash_patterns() -> str:
+    def folded(name: str) -> str:
+        return "".join("[%s%s]" % (letter.lower(), letter.upper()) if letter.isalpha() else letter for letter in name)
+
+    components = [
+        folded(".Trash"), folded(".Trash") + "-*", folded(".Trashes"), "\\$" + folded("Recycle.Bin"), "#" + folded("recycle"), "@" + folded("Recycle"),
+        folded("files_trashbin"), "RECYCLER", "RECYCLED", "Recycled", ".recycle", ".FilesByGoogleTrash", ".trashed-*",
+    ]
+    patterns = ["*/" + component + suffix for component in components for suffix in ("", "/*")]
+    patterns += ["*/.local/share/Trash", "*/.local/share/Trash/*", "/boot/trash", "/boot/trash/*"]
+    return "|".join(patterns)
+
+
 def _remote_preflight_script() -> str:
     targets = list(dict.fromkeys(_REMOTE_TARGETS))
     roots = _remote_roots()
@@ -1671,7 +1716,8 @@ def _remote_preflight_script() -> str:
     removed = " ".join(path for path, entered in targets if not entered)
     entered = " ".join(path for path, entered in targets if entered)
     return (
-        "fail=0; check() { ok=0; for root in " + " ".join(roots) + "; do rr=$(cd -P -- \"$root\" 2>/dev/null && pwd) || continue; "
+        "fail=0; check() { case \"$1\" in " + _preflight_trash_patterns() + ") echo \"PREFLIGHT_REFUSED $2\"; fail=1; return;; esac; "
+        "ok=0; for root in " + " ".join(roots) + "; do rr=$(cd -P -- \"$root\" 2>/dev/null && pwd) || continue; "
         "case \"$1\" in \"$rr\"/?*) ok=1;; esac; done; "
         "[ \"$ok\" = 1 ] || { echo \"PREFLIGHT_REFUSED $2\"; fail=1; }; }; "
         "for t in " + removed + "; do d=$(dirname -- \"$t\"); b=$(basename -- \"$t\"); [ -d \"$d\" ] || continue; "

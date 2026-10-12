@@ -224,6 +224,8 @@ REMOTE_VALUE_LETTERS = {
     "systemctl": "HMPnopst",
     "tail": "ncs",
 }
+# Letters whose value, if any, is attached to them (date -Iseconds), so a -- after one is a terminator.
+REMOTE_ATTACHED_LETTERS = {"date": "I"}
 # Long options that take no value, so a -- after one of them is a terminator.
 REMOTE_FLAG_LONG = {
     "date": frozenset({"--debug", "--help", "--rfc-2822", "--rfc-822", "--rfc-email", "--universal", "--utc", "--version"}),
@@ -276,7 +278,6 @@ REMOTE_SUBCOMMANDS = {
     "systemctl": frozenset({"is-active", "is-enabled", "is-failed", "list-timers", "list-unit-files", "list-units", "status"}),
 }
 REMOTE_COMPOSE_SUBCOMMANDS = frozenset({"logs", "ps"})
-DOCKER_FOLLOW = re.compile(r"-[0-9A-Za-z]*f[0-9A-Za-z]*|--follow(?:=.*)?")
 REMOTE_SECRET_PATHS = re.compile(
     r"/etc/(?:shadow|gshadow|sudoers|ssh/ssh_host|ssl/private)|/root(?:/|\b)|/proc/|\.ssh(?:/|\b)|\.git-credentials|\.docker/config|\.kube/|\.aws/|\.gnupg|/\.config/",
     re.IGNORECASE,
@@ -284,11 +285,11 @@ REMOTE_SECRET_PATHS = re.compile(
 # What a remote command is checked and its output cleaned with: addresses and hosts in logs are infrastructure details too.
 REDACT_URL = re.compile(r"(?i)(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s\"'<>`]+")
 REDACT_USER_IPV6 = re.compile(
-    r"[A-Za-z0-9._%+-]{1,64}@(\[)?((?:[0-9A-Fa-f]{0,4}:){2,7}(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]{0,4})(?:%[A-Za-z0-9_.-]{1,32})?)(?(1)\]|(?![\w:.]))"
+    r"[A-Za-z0-9._%+-]{1,64}@(\[)?((?:[0-9A-Fa-f]{0,4}:){2,7}(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]{0,4})(?:%[A-Za-z0-9_.-]{1,32})?)(?(1)\]|(?![\w:]|\.\w))"
 )
 REDACT_USER_HOST = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})*")
-REDACT_IPV4 = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?(?![\w.])")
-REDACT_IPV6 = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]{0,4})(?:%[A-Za-z0-9_.-]{1,32})?(?![\w:.])")
+REDACT_IPV4 = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?(?!\w|\.\w)")
+REDACT_IPV6 = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]{0,4})(?:%[A-Za-z0-9_.-]{1,32})?(?![\w:]|\.\w)")
 # One-element list so the message code can switch the startup rules off to ask whether they alone caused a refusal.
 _STARTUP_RULES = [True]
 MAX_GLOB_WORDS = 20
@@ -962,6 +963,9 @@ def _reads_startup_file(command: str) -> bool:
 # the whole line as BSD options and macOS may read the option as one that takes none, so it is looked at as options. The
 # options that take a value differ between Linux (-C, -q and -s do) and macOS, so the target decides; a remote check is Linux.
 def _ps_shows_environment(arguments: list[str]) -> bool:
+    # procps has a format field (`-o environ`) that prints the environment, in any spelling of the option that carries it.
+    if any("environ" in argument.lower() for argument in arguments):
+        return True
     unix_values, bsd_values = PS_PROFILES[_PS_TARGET[0]]
     return _ps_walk(arguments, unix_values, bsd_values)
 
@@ -1892,11 +1896,18 @@ def _remote_stages(command: str) -> list[list[str]] | None:
     braces: list[bool] = []
     comment = False
     word_start = True
+    word_begin = 0
     while index < length:
         character = command[index]
         if character == "#" and word_start:
             comment = True
         was_start = word_start
+        if was_start and character not in " \t|":
+            word_begin = index
+        # A wildcard in the first part of a word expands to names that can begin with a dash (`sort -? out`), which are options
+        # the remote shell would then pass on; with a folder in front (`/var/log/*.log`) every name begins with that folder.
+        if character in "*?[" and not comment and "/" not in command[word_begin:index]:
+            return None
         word_start = character in " \t|"
         if character == "\\":
             word_start = False
@@ -1959,14 +1970,14 @@ def _shown(value: str) -> str:
 
 # Whether an option could take the next word as its value: a long option without an attached value, or a short one that ends
 # in a letter that takes a value.
-def _may_take_next(argument: str, values: str, flags: frozenset[str]) -> bool:
+def _may_take_next(argument: str, values: str, flags: frozenset[str], attached_only: str = "") -> bool:
     if argument.startswith("--"):
         # An unambiguous start of a long flag names it, the way the program reads it.
         return len(argument) > 2 and "=" not in argument and not any(flag.startswith(argument) for flag in flags)
     if argument.startswith("-") and len(argument) > 1:
         for position, letter in enumerate(argument[1:], 1):
             if letter in values:
-                return position + 1 == len(argument)
+                return position + 1 == len(argument) and letter not in attached_only
     return False
 
 
@@ -2008,7 +2019,7 @@ def _remote_option_problem(name: str, arguments: list[str]) -> str | None:
         # find reads its expression after the starting points, so a -- before them does not end the options that matter.
         if argument == "--" and name != "find":
             # The option before it may take it as its value, and the options after it are then still options.
-            if (exact or long_options or letters) and _may_take_next(previous, values, REMOTE_FLAG_LONG.get(name, frozenset())):
+            if (exact or long_options or letters) and _may_take_next(previous, values, REMOTE_FLAG_LONG.get(name, frozenset()), REMOTE_ATTACHED_LETTERS.get(name, "")):
                 return refused("--")
             break
         previous = argument
@@ -2080,6 +2091,35 @@ def _flag_is_set(arguments: list[str], flag: str, value_options: frozenset[str] 
     return state
 
 
+# Whether the options of `docker logs` end up following the log: the last mention of the flag decides, a short one may stand in a
+# bundle and carry a value (`-f=false`), and a value that cannot be read counts as following.
+def _docker_follows(arguments: list[str]) -> bool:
+    state = False
+    for argument in arguments:
+        if argument == "--":
+            break
+        if argument.startswith("--"):
+            name, equals, value = argument.partition("=")
+            if name != "--follow":
+                continue
+        elif argument.startswith("-") and len(argument) > 1:
+            letters, equals, value = argument[1:].partition("=")
+            position = letters.find("f")
+            if position == -1 or "n" in letters[:position]:
+                continue
+            if position != len(letters) - 1:
+                equals = ""
+        else:
+            continue
+        if not equals or value in BOOLEAN_TRUE:
+            state = True
+        elif value in BOOLEAN_FALSE:
+            state = False
+        else:
+            return True
+    return state
+
+
 # docker takes its own options, then the subcommand; compose takes its own options again before its subcommand.
 def _remote_docker_problem(arguments: list[str]) -> str | None:
     index = first_operand(arguments, DOCKER_VALUE_LETTERS, DOCKER_VALUE_OPTIONS)
@@ -2106,7 +2146,7 @@ def _remote_docker_problem(arguments: list[str]) -> str | None:
         if effective not in REMOTE_COMPOSE_SUBCOMMANDS:
             return message("safe_tool.remote.reason.subcommand", name="docker compose", subcommand=_shown(effective))
         rest = rest[position + 1 :]
-    if effective == "logs" and any(DOCKER_FOLLOW.fullmatch(argument) for argument in rest if argument != "--"):
+    if effective == "logs" and _docker_follows(rest):
         return message("safe_tool.remote.reason.option", name="docker logs", option="-f")
     if subcommand == "stats" and not _flag_is_set(rest, "--no-stream", DOCKER_STATS_VALUE_OPTIONS):
         return message("safe_tool.remote.reason.option", name="docker stats", option="without --no-stream")
