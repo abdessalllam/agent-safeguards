@@ -979,8 +979,9 @@ def _ps_walk(arguments: list[str], unix_values: frozenset[str], bsd_values: froz
         prefix = re.match(r"[A-Za-z]*", body).group(0)
         values = unix_values if dashed else bsd_values
         position = next((place for place, letter in enumerate(prefix) if letter in values), None)
-        # Linux takes what follows the first letter that has a value as that value; macOS legacy words may mean flags there.
-        letters = prefix if position is None or _PS_TARGET[0] == "darwin" else prefix[: position + 1]
+        # What follows a format option (o, O) is its value in every mode. After any other option it is a value only until a
+        # word that does not parse is read again as BSD options, so those letters are looked at too.
+        letters = prefix[: position + 1] if position is not None and prefix[position] in "oO" else prefix
         if any(letter in "eE" for letter in letters):
             return True
         if position is not None and position == len(body) - 1 and index < len(arguments) and not arguments[index].startswith("-"):
@@ -1886,20 +1887,26 @@ def _remote_stages(command: str) -> list[list[str]] | None:
     # One entry per open brace: whether a comma or .. has been seen at its own level, which makes it a list the shell expands.
     braces: list[bool] = []
     comment = False
+    word_start = True
     while index < length:
         character = command[index]
-        if character == "#" and (index == 0 or command[index - 1] in " \t|"):
+        if character == "#" and word_start:
             comment = True
+        was_start = word_start
+        word_start = character in " \t|"
         if character == "\\":
+            word_start = False
             index += 2
             continue
         if character == "'":
+            word_start = False
             closing = command.find("'", index + 1)
             if closing == -1:
                 return None
             index = closing + 1
             continue
         if character == '"':
+            word_start = False
             index += 1
             while index < length and command[index] != '"':
                 index += 2 if command[index] == "\\" else 1
@@ -1956,6 +1963,30 @@ def _may_take_next(argument: str, values: str, flags: frozenset[str]) -> bool:
     return False
 
 
+# The full spelling of each long option, so that an accepted abbreviation takes its value the way the program reads it. An
+# option that is neither a known value option nor a known flag, or that starts more than one of them, cannot be read, and the
+# whole command is then refused.
+def _resolve_long_options(arguments: list[str], value_options: frozenset[str], flags: frozenset[str]) -> list[str] | None:
+    resolved: list[str] = []
+    for argument in arguments:
+        if argument == "--":
+            resolved.extend(arguments[len(resolved) :])
+            return resolved
+        if argument.startswith("--") and len(argument) > 2:
+            name, equals, value = argument.partition("=")
+            known = value_options | flags
+            if name in known:
+                candidates = [name]
+            else:
+                candidates = sorted(option for option in known if option.startswith(name))
+            if len(candidates) != 1:
+                return None
+            resolved.append(candidates[0] + equals + value)
+        else:
+            resolved.append(argument)
+    return resolved
+
+
 def _remote_option_problem(name: str, arguments: list[str]) -> str | None:
     def refused(option: str) -> str:
         return message("safe_tool.remote.reason.option", name=name, option=option)
@@ -2000,6 +2031,10 @@ def _remote_option_problem(name: str, arguments: list[str]) -> str | None:
     if name == "docker":
         return _remote_docker_problem(arguments)
     if name == "systemctl":
+        resolved = _resolve_long_options(arguments, SYSTEMCTL_VALUE_OPTIONS, REMOTE_FLAG_LONG["systemctl"])
+        if resolved is None:
+            return refused("--")
+        arguments = resolved
         index = first_operand(arguments, SYSTEMCTL_VALUE_LETTERS, SYSTEMCTL_VALUE_OPTIONS)
         subcommand = arguments[index] if index is not None else ""
         if subcommand not in REMOTE_SUBCOMMANDS[name]:

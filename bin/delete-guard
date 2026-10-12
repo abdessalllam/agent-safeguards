@@ -127,6 +127,7 @@ MAX_TRASH_SCAN = 20000
 MAX_MATCHES = 20000
 LOCATION_SCHEME = re.compile(r"(?i)[a-z][a-z0-9+.-]*:/")
 XARGS_DELETERS = frozenset({"rm", "unlink", "rmdir", "shred", "srm", "gvfs-rm"})
+XARGS_SHORT_VALUES = frozenset("adEIJLnPRSs")
 KIO_COMMANDS = KIO_REMOVE_VERBS | frozenset({"cat", "copy", "cp", "exec", "ls", "move", "mv", "openProperties", "properties"})
 GIO_DELETE_VERBS = frozenset({"remove", "rm", "trash"})
 FIND_GLOBAL_OPTIONS = frozenset({"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"})
@@ -145,18 +146,18 @@ FIND_NEWER_PREDICATE = re.compile(r"-newer[aBcmt][aBcmt]")
 MATCH_MARK = "\ue000match\ue001"
 GLOB_VISITS = 200000
 POSIX_CLASSES = {
-    "alnum": "a-zA-Z0-9",
-    "alpha": "a-zA-Z",
+    "alnum": "a-zA-Z0-9\\x80-\\U0010ffff",
+    "alpha": "a-zA-Z\\x80-\\U0010ffff",
     "blank": " \\t",
     "cntrl": "\\x00-\\x1f\\x7f",
     "digit": "0-9",
-    "graph": "!-~",
-    "lower": "a-z",
-    "print": " -~",
-    "punct": "!-/:-@\\[-`{-~",
+    "graph": "!-~\\x80-\\U0010ffff",
+    "lower": "a-z\\x80-\\U0010ffff",
+    "print": " -~\\x80-\\U0010ffff",
+    "punct": "!-/:-@\\[-`{-~\\x80-\\U0010ffff",
     "space": " \\t\\n\\r\\f\\v",
-    "upper": "A-Z",
-    "word": "a-zA-Z0-9_",
+    "upper": "A-Z\\x80-\\U0010ffff",
+    "word": "a-zA-Z0-9_\\x80-\\U0010ffff",
     "xdigit": "0-9A-Fa-f",
 }
 HADOOP_PURGE_OPTIONS = frozenset({"-expunge", "-skipTrash"})
@@ -202,11 +203,7 @@ MOSH_LONG_VALUES = frozenset({"--bind-server", "--client", "--experimental-remot
 SHELL_VALUE_OPTIONS = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
 SHELL_COMMAND_CLUSTER = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 SHELL_STDIN_CLUSTER = re.compile(r"-[A-Za-z]*s[A-Za-z]*")
-# The redirections that open a file for reading on a descriptor (`<`, `<>`), and the ones that copy one descriptor to another.
 STDIN_OPERATORS = frozenset({"<", "<>"})
-DUP_OPERATORS = frozenset({"<&", ">&"})
-GROUP_OPENERS = frozenset({"{", "while", "until", "for", "select", "if", "case"})
-GROUP_CLOSERS = frozenset({"}", "done", "fi", "esac"})
 # A tilde that is quoted or escaped is not a home folder, so what follows it is a relative path.
 QUOTED_TILDE = re.compile(r"(?:^|[\s;&|(])(?:(?:['\"]+|\\)~|~['\"\\])")
 # `f() {`, `f(){`, `f ( ) {` and `function f {` only define what follows.
@@ -295,9 +292,6 @@ class Chunk(NamedTuple):
     after: str | None
     opened: bool
     redirected: bool
-    redirects: tuple = ()
-    opens: int = 0
-    closes: int = 0
 
 
 # `name() {`, `name () {` and `function name {` only define what follows; the command inside is what the guard must see.
@@ -313,10 +307,8 @@ def _function_header_length(words: list[str]) -> int:
     return length
 
 
-def _chunk(raw_words: list[str], before: str | None, after: str | None, redirected: bool, redirects: tuple = ()) -> Chunk:
+def _chunk(raw_words: list[str], before: str | None, after: str | None, redirected: bool) -> Chunk:
     words = [word for word in raw_words if word]
-    opens = len(words[0]) - len(words[0].lstrip("(")) if words else 0
-    closes = len(words[-1]) - len(words[-1].rstrip(")")) if words else 0
     header = _function_header_length(words)
     opened = header > 0 or (bool(words) and (words[0].startswith("(") or words[0] == "{"))
     words = words[header:]
@@ -328,12 +320,12 @@ def _chunk(raw_words: list[str], before: str | None, after: str | None, redirect
         words[-1] = words[-1].rstrip(")")
         if not words[-1]:
             words.pop()
-    return Chunk(words, before, after, opened, redirected, redirects, opens, closes)
+    return Chunk(words, before, after, opened, redirected)
 
 
-# An escaped separator (the \\; that ends a find command) is a word, not the end of the command, so it is swapped for a private
-# character the lexer leaves alone and swapped back in the words.
-ESCAPED_SEPARATORS = {";": "\ue010", "&": "\ue011", "|": "\ue012"}
+# An escaped or quoted separator (the \\; that ends a find command, the '|' given to env) is a word, not the end of the command,
+# so it is swapped for a private character the lexer leaves alone and swapped back in the words.
+ESCAPED_SEPARATORS = {";": "\ue010", "&": "\ue011", "|": "\ue012", "\n": "\ue013"}
 
 
 UNPROTECT_SEPARATORS = {ord(private): original for original, private in ESCAPED_SEPARATORS.items()}
@@ -352,6 +344,10 @@ def _protect_escaped_separators(text: str) -> str:
                 out.append(text[index : index + 2])
                 index += 2
                 continue
+            elif character in ESCAPED_SEPARATORS:
+                out.append(ESCAPED_SEPARATORS[character])
+                index += 1
+                continue
         elif character in "'\"":
             quote = character
         elif character == "\\" and text[index + 1 : index + 2] in ESCAPED_SEPARATORS:
@@ -368,9 +364,8 @@ def _protect_escaped_separators(text: str) -> str:
 
 
 def _tokenize(command: str) -> list[Chunk] | None:
-    redirects: list[tuple[str, str, str]] = []
     try:
-        lexer = shlex.shlex(_protect_escaped_separators(normalize_command(command, redirects)), posix=True, punctuation_chars=";&|\n")
+        lexer = shlex.shlex(_protect_escaped_separators(normalize_command(command)), posix=True, punctuation_chars=";&|\n")
         lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         lexer.commenters = ""
@@ -381,26 +376,21 @@ def _tokenize(command: str) -> list[Chunk] | None:
     words: list[str] = []
     before: str | None = None
     redirected = False
-    own: list[tuple[str, str, str]] = []
-    markers = 0
     for token in tokens:
         if token == REDIRECTION_MARKER:
             redirected = True
-            if markers < len(redirects):
-                own.append(redirects[markers])
-            markers += 1
         elif token and all(character in ";&|\n" for character in token):
             # A line break beside an operator only continues it, so "&&" plus a newline is still "&&".
             stripped = token.replace("\n", "")
             separator = stripped if stripped and set(stripped) != {";"} else ";"
             if words:
-                chunks.append(_chunk(words, before, separator, redirected, tuple(own)))
-                words, redirected, own = [], False, []
+                chunks.append(_chunk(words, before, separator, redirected))
+                words, redirected = [], False
             before = separator
         else:
             words.append(token.translate(UNPROTECT_SEPARATORS))
     if words:
-        chunks.append(_chunk(words, before, None, redirected, tuple(own)))
+        chunks.append(_chunk(words, before, None, redirected))
     return [chunk for chunk in chunks if chunk.words or chunk.opened]
 
 
@@ -522,7 +512,7 @@ def _glob_entries(base: str, visits: list[int], verb: str, raw: str) -> list[os.
 
 def _glob_walk(base: str, parts: list[str], matches: list[str], visits: list[int], verb: str, raw: str, folders_only: bool) -> None:
     if not parts:
-        if folders_only and not os.path.isdir(base):
+        if folders_only and not _is_folder_path(base, verb, raw):
             return
         matches.append(base)
         if len(matches) > MAX_MATCHES:
@@ -535,9 +525,9 @@ def _glob_walk(base: str, parts: list[str], matches: list[str], visits: list[int
             if not entry.name.startswith(".") and _is_plain_folder(entry, verb, raw):
                 _glob_walk(entry.path, parts, matches, visits, verb, raw, folders_only)
     elif re.search(r"[*?\[]", part):
-        expression = _glob_regex(part)
+        tokens = _glob_tokens(part)
         for entry in _glob_entries(base, visits, verb, raw):
-            if expression.match(entry.name) and (part.startswith(".") or not entry.name.startswith(".")):
+            if (part.startswith(".") or not entry.name.startswith(".")) and _glob_match(tokens, entry.name):
                 _glob_walk(entry.path, rest, matches, visits, verb, raw, folders_only)
     else:
         path = os.path.join(base, part)
@@ -545,19 +535,21 @@ def _glob_walk(base: str, parts: list[str], matches: list[str], visits: list[int
             _glob_walk(path, rest, matches, visits, verb, raw, folders_only)
 
 
-# A shell pattern as a regular expression: `*`, `?`, classes with `!` or `^` for negation, ranges and the named classes.
-def _glob_regex(pattern: str) -> re.Pattern:
-    out: list[str] = []
+# A shell pattern as tokens: `*`, `?`, literal characters and classes with `!` or `^` for negation, ranges and the named
+# classes. The named classes also take any non-ASCII character, because the shell's locale may count it as a letter.
+def _glob_tokens(pattern: str) -> list[tuple[str, object]]:
+    tokens: list[tuple[str, object]] = []
     index = 0
     length = len(pattern)
     while index < length:
         character = pattern[index]
         if character == "*":
-            out.append(".*")
+            if not tokens or tokens[-1][0] != "*":
+                tokens.append(("*", ""))
         elif character == "?":
-            out.append(".")
+            tokens.append(("?", ""))
         elif character == "\\" and index + 1 < length:
-            out.append(re.escape(pattern[index + 1]))
+            tokens.append(("lit", pattern[index + 1]))
             index += 1
         elif character == "[":
             position = index + 1
@@ -577,14 +569,55 @@ def _glob_regex(pattern: str) -> re.Pattern:
                 members.append("-" if pattern[position] == "-" else re.escape(pattern[position]))
                 position += 1
             if position >= length:
-                out.append(re.escape(character))
+                tokens.append(("lit", character))
             else:
-                out.append("[" + ("^" if negate else "") + "".join(members) + "]")
+                tokens.append(("set", re.compile("[" + ("^" if negate else "") + "".join(members) + "]")))
                 index = position
         else:
-            out.append(re.escape(character))
+            tokens.append(("lit", character))
         index += 1
-    return re.compile("".join(out) + r"\Z", re.DOTALL)
+    return tokens
+
+
+def _glob_token_matches(token: tuple[str, object], character: str) -> bool:
+    kind, value = token
+    if kind == "?":
+        return True
+    if kind == "lit":
+        return value == character
+    return value.fullmatch(character) is not None  # type: ignore[union-attr]
+
+
+# The usual two-pointer match: a star remembers where it was so the pattern can be tried again one name character further.
+def _glob_match(tokens: list[tuple[str, object]], name: str) -> bool:
+    token = position = 0
+    star = -1
+    mark = 0
+    while position < len(name):
+        if token < len(tokens) and tokens[token][0] != "*" and _glob_token_matches(tokens[token], name[position]):
+            token += 1
+            position += 1
+        elif token < len(tokens) and tokens[token][0] == "*":
+            star, mark = token, position
+            token += 1
+        elif star != -1:
+            token = star + 1
+            mark += 1
+            position = mark
+        else:
+            return False
+    while token < len(tokens) and tokens[token][0] == "*":
+        token += 1
+    return token == len(tokens)
+
+
+def _is_folder_path(path: str, verb: str, raw: str) -> bool:
+    try:
+        return stat.S_ISDIR(os.stat(path).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        raise Denied(message("delete_guard.reason.expansion", verb=verb, raw=raw)) from None
 
 
 def _is_plain_folder(entry: os.DirEntry, verb: str, raw: str) -> bool:
@@ -941,7 +974,7 @@ def _find_deleting(words: list[str]) -> bool:
 # The command that find runs is checked like a typed one. Its {} stands for the match: a whole {} is no operand of its own (the
 # folders find starts in are the targets), and a path built from it is refused. -execdir runs in the folder of each match,
 # which is not known here.
-def _find(words: list[str], cwd: str | None, redirects: tuple = ()) -> None:
+def _find(words: list[str], cwd: str | None) -> None:
     parts = _find_parts(words)
     deleting = parts.deletes or any(body and _deletes_files(body) for _, body in parts.executions)
     for predicate, body in parts.executions:
@@ -949,8 +982,8 @@ def _find(words: list[str], cwd: str | None, redirects: tuple = ()) -> None:
         if command:
             if _deletes_from_names(command):
                 raise Denied(message("delete_guard.reason.xargs_rm"))
-            # What find runs reads the standard input find was given.
-            _check_chunk(command, None if predicate in {"-execdir", "-okdir"} else cwd, " ".join(command), trusted=False, redirects=redirects)
+            # What find runs reads the standard input find was given, opened in the folder find runs in.
+            _check_chunk(command, None if predicate in {"-execdir", "-okdir"} else cwd, " ".join(command), trusted=False, redirect_cwd=cwd)
     if not deleting:
         return
     if parts.input_roots:
@@ -965,25 +998,37 @@ def _find(words: list[str], cwd: str | None, redirects: tuple = ()) -> None:
 
 # The names xargs is given are not known, so a command that deletes them is refused, and so is a find or an rsync that would
 # take its starting folders from them; anything else is checked as typed, with the replace string standing for an unknown name.
-def _xargs(words: list[str], cwd: str | None, redirects: tuple = ()) -> None:
+def _xargs(words: list[str], cwd: str | None) -> None:
     rest = words[1:]
     replace = None
     keeps_input = False
     while rest and rest[0].startswith("-") and len(rest[0]) > 1 and rest[0] != "--":
         option = rest[0]
-        if option == "-I" and len(rest) > 1:
-            replace = rest[1]
-        elif option.startswith("-I") and not option.startswith("--"):
-            replace = option[2:]
-        elif option in {"-i", "--replace"}:
-            replace = "{}"
-        elif option.startswith("-i") and not option.startswith("--"):
-            replace = option[2:]
-        elif option.startswith("--replace="):
-            replace = option.split("=", 1)[1]
-        # The children get /dev/null for input, unless the names come from a file and the input stays theirs.
-        keeps_input = keeps_input or option in {"-a", "-o", "--arg-file", "--open-tty"} or option.startswith("--arg-file=")
-        rest = rest[2:] if option_names(option, XARGS_VALUE_OPTIONS)[1] else rest[1:]
+        consumed = 1
+        if option.startswith("--"):
+            name, equals, value = option.partition("=")
+            if name == "--replace":
+                replace = value if equals else "{}"
+            elif name in XARGS_VALUE_OPTIONS and not equals:
+                consumed = 2
+            keeps_input = keeps_input or name in {"--arg-file", "--open-tty"}
+        else:
+            letters = option[1:]
+            for position, letter in enumerate(letters):
+                attached = letters[position + 1 :]
+                if letter in {"i", "e", "l"}:
+                    if letter == "i":
+                        replace = attached or "{}"
+                    break
+                if letter in XARGS_SHORT_VALUES:
+                    value = attached or (rest[1] if len(rest) > 1 else "")
+                    consumed = 1 if attached else 2
+                    if letter == "I":
+                        replace = value
+                    keeps_input = keeps_input or letter == "a"
+                    break
+                keeps_input = keeps_input or letter == "o"
+        rest = rest[consumed:]
     if rest[:1] == ["--"]:
         rest = rest[1:]
     if not rest:
@@ -991,12 +1036,18 @@ def _xargs(words: list[str], cwd: str | None, redirects: tuple = ()) -> None:
     stripped = strip_wrappers(rest)
     if not stripped:
         return
-    name = _base(stripped[0])
     if _deletes_files(stripped) or _deletes_from_names(stripped):
         raise Denied(message("delete_guard.reason.xargs_rm"))
     marker = replace or "{}"
     command = [argument.replace(marker, MATCH_MARK) for argument in rest if argument != marker]
-    _check_chunk(command, cwd, " ".join(command), trusted=False, redirects=redirects if keeps_input else ())
+    # The children get /dev/null for input, unless the names come from a file and the input stays theirs.
+    outer_files = _STDIN_FILES[0]
+    if not keeps_input:
+        _STDIN_FILES[0] = []
+    try:
+        _check_chunk(command, cwd, " ".join(command), trusted=False)
+    finally:
+        _STDIN_FILES[0] = outer_files
 
 
 # A script is reviewed when its bytes are exactly those of the file in the last commit. The index is not asked, because
@@ -1063,6 +1114,20 @@ def _without_text_heredocs(text: str) -> str:
 # A script nobody has reviewed (not tracked, or changed since the last commit) is read before it runs and its deletes are
 # held to the same rules as a typed command, because its variables and loops hide what a quick look at the command cannot.
 def _check_script(raw: str, cwd: str | None, *, shell: bool) -> None:
+    # A name with braces or wildcards stands for several files; each is read, since which of them is the script and which an
+    # argument is not worth following.
+    if ("{" in raw and BRACE_PATTERN.search(raw)) or re.search(r"[*?\[]", raw):
+        variants = expand_braces(raw)
+        if variants is None:
+            raise Denied(message("delete_guard.reason.expansion", verb="script", raw=raw))
+        for variant in variants:
+            for name in _glob_matches(variant, cwd, "script") or ([variant] if not re.search(r"[*?\[]", variant) else []):
+                _check_script_file(name, cwd, shell=shell)
+        return
+    _check_script_file(raw, cwd, shell=shell)
+
+
+def _check_script_file(raw: str, cwd: str | None, *, shell: bool) -> None:
     resolved = _expand(raw, cwd)
     if resolved is None or resolved in _SCRIPT_STACK or len(_SCRIPT_STACK) >= MAX_SCRIPT_DEPTH or _script_excluded(resolved):
         return
@@ -1232,7 +1297,11 @@ def _wrapper_directories(values: list[str], start: str | None) -> str | None:
 
 
 # The result is the shell's folder after the command and whether this command was a directory change that is known.
-def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: bool = True, redirects: tuple = ()) -> tuple[str | None, bool]:
+# The folder the redirections of a command are opened in is the folder of the shell that runs it, before any wrapper moves.
+SAME_FOLDER = object()
+
+
+def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: bool = True, redirect_cwd: object = SAME_FOLDER) -> tuple[str | None, bool]:
     try:
         stripped, directories = strip_wrappers_with_directory(words)
     except UnresolvableCommand:
@@ -1268,7 +1337,7 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
             return None, False
         return resolved, True
     if name in SHELLS:
-        _check_shell(words, cwd, redirects)
+        _check_shell(words, cwd, shell_cwd if redirect_cwd is SAME_FOLDER else redirect_cwd)
         return shell_cwd, False
     if name in {"source", "."} and len(words) > 1 and _REMOTE[0] is None:
         _check_script(words[1], cwd, shell=True)
@@ -1319,9 +1388,9 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
     elif name.lower() == "clear-recyclebin" or (name.lower() in WINDOWS_SHELLS and WINDOWS_TEXT.search(" ".join(words[1:]) + "\n" + heredoc)):
         raise Denied(message("delete_guard.reason.trash_empty", name=name))
     elif name == "find":
-        _find(words, cwd, redirects)
+        _find(words, cwd)
     elif name == "xargs":
-        _xargs(words, cwd, redirects)
+        _xargs(words, cwd)
     elif name == "rsync":
         _rsync(words, cwd)
     elif ERASE_TOOL.fullmatch(name):
@@ -1347,52 +1416,29 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
     return shell_cwd, False
 
 
-# The redirections of each group (`{ ...; } < file`, `while ...; done < file`, `( ... ) < file`) reach every command inside it,
-# so each chunk is given those of the groups that contain it, outermost first.
-def _group_redirects(chunks: list[Chunk]) -> list[tuple]:
-    extra: list[tuple] = [() for _ in chunks]
-    stack: list[int] = []
-    for index, chunk in enumerate(chunks):
-        first = chunk.words[0] if chunk.words else ""
-        stack.extend([index] * chunk.opens)
-        if first in GROUP_OPENERS:
-            stack.append(index)
-        for _ in range(chunk.closes + (1 if first in GROUP_CLOSERS else 0)):
-            if stack:
-                start = stack.pop()
-                if chunk.redirects:
-                    for inner in range(start, index + 1):
-                        extra[inner] = extra[inner] + chunk.redirects
-    return extra
+# The files the command line opens for reading, for a shell on the line that reads its standard input. Which of them is the
+# input depends on descriptors and groups, so every one is read as a possible script; a data file that holds a delete can be
+# refused. A command run by xargs without an argument file gets /dev/null, so it has none.
+_STDIN_FILES: list[list[str]] = [[]]
 
 
-# The files a shell reads on its standard input, following the redirections in the order the shell applies them: a file opened
-# on descriptor 0 (also written 00 or 000), or opened on another descriptor and copied or moved onto it.
-def _stdin_files(redirects: tuple) -> list[str]:
-    sources: dict[int, list[str]] = {}
-    for descriptor, operator, operand in redirects:
-        number = int(descriptor) if descriptor else None
-        if operator in STDIN_OPERATORS:
-            sources[0 if number is None else number] = [operand]
-        elif operator in DUP_OPERATORS:
-            origin = operand.rstrip("-")
-            if origin.isascii() and origin.isdigit():
-                sources[(0 if operator == "<&" else 1) if number is None else number] = sources.get(int(origin), [])
-                if operand.endswith("-"):
-                    sources.pop(int(origin), None)
+def _line_input_files(command: str) -> list[str]:
+    redirects: list[tuple[str, str, str]] = []
+    normalize_command(command, redirects)
     names: list[str] = []
-    for operand in sources.get(0, []):
-        try:
-            words = shlex.split(operand)
-        except ValueError:
-            continue
-        if words:
-            names.append(words[0])
+    for _, operator, operand in redirects:
+        if operator in STDIN_OPERATORS:
+            try:
+                words = shlex.split(operand)
+            except ValueError:
+                continue
+            if words:
+                names.append(words[0])
     return names
 
 
 # A shell runs a command string (-c), a script file (after its own options and their values), or what it reads on stdin.
-def _check_shell(words: list[str], cwd: str | None, redirects: tuple) -> None:
+def _check_shell(words: list[str], cwd: str | None, redirect_cwd: str | None) -> None:
     script = None
     reads_stdin = False
     index = 1
@@ -1419,8 +1465,8 @@ def _check_shell(words: list[str], cwd: str | None, redirects: tuple) -> None:
     if script is not None and not reads_stdin:
         _check_script(script, cwd, shell=True)
     else:
-        for name in _stdin_files(redirects):
-            _check_script(name, cwd, shell=True)
+        for name in _STDIN_FILES[0]:
+            _check_script(name, redirect_cwd, shell=True)
 
 
 # Ignored files hold machine-local notes and archives, so a real `git clean` run is never automatic.
@@ -1475,17 +1521,25 @@ def _check_command(command: str, cwd: str | None) -> None:
     for body in command_substitutions(command):
         if body.strip():
             _check_command(body, substitution_cwd)
+    outer_files = _STDIN_FILES[0]
+    _STDIN_FILES[0] = _line_input_files(command)
+    try:
+        _check_chunks(command, cwd)
+    finally:
+        _STDIN_FILES[0] = outer_files
+
+
+def _check_chunks(command: str, cwd: str | None) -> None:
     chunks = _tokenize(command)
     if chunks is None:
         if INLINE_RECURSIVE_DELETE.search(command) or re.search(r"-delete\b", command):
             raise Denied(message("delete_guard.reason.unparseable"))
         return
     current = os.path.realpath(cwd) if cwd else None
-    groups = _group_redirects(chunks)
     grouped = False
     previous_cd_known = False
     conditional = False
-    for position, chunk in enumerate(chunks):
+    for chunk in chunks:
         grouped = grouped or chunk.opened
         if not chunk.words:
             continue
@@ -1505,7 +1559,7 @@ def _check_command(command: str, cwd: str | None) -> None:
             and reached
             and chunk.after in {None, ";", "&&"}
         )
-        current, previous_cd_known = _check_chunk(chunk.words, current, command, trusted, groups[position] + chunk.redirects)
+        current, previous_cd_known = _check_chunk(chunk.words, current, command, trusted)
         if previous_cd_known and chunk.before == "&&" and chunk.after == "&&":
             conditional = True
 
