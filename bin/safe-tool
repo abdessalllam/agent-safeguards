@@ -237,9 +237,11 @@ REMOTE_FLAG_LONG = {
         {"--all", "--catalog", "--disk-usage", "--dmesg", "--full", "--header", "--help", "--list-boots", "--list-catalog", "--merge", "--no-full", "--no-hostname", "--no-pager", "--quiet", "--reverse", "--show-cursor", "--system", "--user", "--utc", "--verify", "--version"}
     ),
     "sort": frozenset(
-        {"--debug", "--dictionary-order", "--general-numeric-sort", "--help", "--human-numeric-sort", "--ignore-case", "--ignore-leading-blanks", "--ignore-nonprinting", "--merge", "--month-sort", "--numeric-sort", "--random-sort", "--reverse", "--stable", "--unique", "--version", "--version-sort", "--zero-terminated"}
+        {"--check", "--debug", "--dictionary-order", "--general-numeric-sort", "--help", "--human-numeric-sort", "--ignore-case", "--ignore-leading-blanks", "--ignore-nonprinting", "--merge", "--month-sort", "--numeric-sort", "--random-sort", "--reverse", "--stable", "--unique", "--version", "--version-sort", "--zero-terminated"}
     ),
-    "systemctl": frozenset({"--all", "--failed", "--full", "--help", "--no-legend", "--no-pager", "--no-warn", "--plain", "--quiet", "--system", "--user", "--version"}),
+    "systemctl": frozenset(
+        {"--all", "--failed", "--full", "--help", "--no-ask-password", "--no-legend", "--no-pager", "--no-warn", "--plain", "--quiet", "--recursive", "--show-types", "--system", "--user", "--value", "--version"}
+    ),
     "tail": frozenset({"--help", "--quiet", "--silent", "--verbose", "--version", "--zero-terminated"}),
 }
 DOCKER_STATS_VALUE_OPTIONS = frozenset({"--format"})
@@ -975,10 +977,13 @@ def _ps_walk(arguments: list[str], unix_values: frozenset[str], bsd_values: froz
         dashed = word.startswith("-") and len(word) > 1
         body = word[1:] if dashed else word
         prefix = re.match(r"[A-Za-z]*", body).group(0)
-        if any(letter in "eE" for letter in prefix):
-            return True
         values = unix_values if dashed else bsd_values
-        if prefix and len(prefix) == len(body) and prefix[-1] in values and index < len(arguments) and not arguments[index].startswith("-"):
+        position = next((place for place, letter in enumerate(prefix) if letter in values), None)
+        # Linux takes what follows the first letter that has a value as that value; macOS legacy words may mean flags there.
+        letters = prefix if position is None or _PS_TARGET[0] == "darwin" else prefix[: position + 1]
+        if any(letter in "eE" for letter in letters):
+            return True
+        if position is not None and position == len(body) - 1 and index < len(arguments) and not arguments[index].startswith("-"):
             index += 1
     return False
 
@@ -1878,8 +1883,13 @@ def _remote_stages(command: str) -> list[list[str]] | None:
     stages: list[str] = []
     start = index = 0
     length = len(command)
+    # One entry per open brace: whether a comma or .. has been seen at its own level, which makes it a list the shell expands.
+    braces: list[bool] = []
+    comment = False
     while index < length:
         character = command[index]
+        if character == "#" and (index == 0 or command[index - 1] in " \t|"):
+            comment = True
         if character == "\\":
             index += 2
             continue
@@ -1899,12 +1909,15 @@ def _remote_stages(command: str) -> list[list[str]] | None:
             continue
         if character in ";&<>()":
             return None
-        if character == "{":
-            # The remote shell expands a brace list into separate words, which are not the words checked here.
-            closing = command.find("}", index)
-            inner = command[index + 1 : closing] if closing != -1 else ""
-            if "," in inner or ".." in inner:
-                return None
+        # The remote shell expands a brace list into separate words, which are not the words checked here.
+        if comment:
+            pass
+        elif character == "{":
+            braces.append(False)
+        elif braces and (character == "," or command[index : index + 2] == ".."):
+            braces[-1] = True
+        elif character == "}" and braces and braces.pop():
+            return None
         if character == "|":
             if command[index + 1 : index + 2] == "|":
                 return None
@@ -1934,7 +1947,8 @@ def _shown(value: str) -> str:
 # in a letter that takes a value.
 def _may_take_next(argument: str, values: str, flags: frozenset[str]) -> bool:
     if argument.startswith("--"):
-        return len(argument) > 2 and "=" not in argument and argument not in flags
+        # An unambiguous start of a long flag names it, the way the program reads it.
+        return len(argument) > 2 and "=" not in argument and not any(flag.startswith(argument) for flag in flags)
     if argument.startswith("-") and len(argument) > 1:
         for position, letter in enumerate(argument[1:], 1):
             if letter in values:

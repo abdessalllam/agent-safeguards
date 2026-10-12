@@ -168,7 +168,7 @@ def _skip_operand(command: str, index: int) -> int:
 
 def _drop_descriptor(kept: list[str]) -> str:
     digits = 0
-    while digits < len(kept) and len(kept[-1 - digits]) == 1 and kept[-1 - digits].isdigit():
+    while digits < len(kept) and len(kept[-1 - digits]) == 1 and kept[-1 - digits] in "0123456789":
         digits += 1
     if digits and (digits == len(kept) or (len(kept[-1 - digits]) == 1 and kept[-1 - digits] in COMMAND_BOUNDARY)):
         dropped = "".join(kept[len(kept) - digits :])
