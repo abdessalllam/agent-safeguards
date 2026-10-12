@@ -43,7 +43,6 @@ from agent_safeguards.common import (  # noqa: E402
     heredocs,
     message,
     normalize_command,
-    option_names,
     split_options,
     strip_wrappers,
     strip_wrappers_with_directory,
@@ -99,12 +98,6 @@ QUICK_SCAN = re.compile(
 INLINE_RECURSIVE_DELETE = re.compile(r"rmtree|removedirs|rmSync|rmdirSync|remove_dir_all|rm_rf|rm\s+-[a-zA-Z]*[rR]")
 INTERPRETERS = frozenset({"python", "python3", "node", "perl", "ruby", "deno", "bun", "osascript", "swift"})
 SHELLS = frozenset({"bash", "sh", "zsh", "dash", "fish"})
-XARGS_VALUE_OPTIONS = frozenset(
-    {
-        "-a", "-d", "-E", "-I", "-J", "-L", "-n", "-P", "-R", "-S", "-s",
-        "--arg-file", "--delimiter", "--eof", "--max-args", "--max-chars", "--max-lines", "--max-procs", "--process-slot-var",
-    }
-)
 ERASE_TOOL = re.compile(r"(?:mkfs|newfs|shred|srm)(?:[._].*)?")
 TRASH_TOOLS = frozenset({"trash", "trash-put", "gvfs-trash"})
 # A Trash holds what a user can still restore, so an agent may add to it but never empty it or delete inside it. These are the
@@ -128,6 +121,28 @@ MAX_MATCHES = 20000
 LOCATION_SCHEME = re.compile(r"(?i)[a-z][a-z0-9+.-]*:/")
 XARGS_DELETERS = frozenset({"rm", "unlink", "rmdir", "shred", "srm", "gvfs-rm"})
 XARGS_SHORT_VALUES = frozenset("adEIJLnPRSs")
+# GNU xargs: a value is required (`--arg-file F` or `--arg-file=F`), optional (only `--eof=E`), or absent. An unambiguous start
+# of a name stands for it.
+XARGS_LONG_OPTIONS = {
+    "arg-file": "required",
+    "delimiter": "required",
+    "max-args": "required",
+    "max-chars": "required",
+    "max-procs": "required",
+    "process-slot-var": "required",
+    "eof": "optional",
+    "replace": "optional",
+    "max-lines": "optional",
+    "null": "none",
+    "no-run-if-empty": "none",
+    "interactive": "none",
+    "open-tty": "none",
+    "verbose": "none",
+    "exit": "none",
+    "show-limits": "none",
+    "help": "none",
+    "version": "none",
+}
 KIO_COMMANDS = KIO_REMOVE_VERBS | frozenset({"cat", "copy", "cp", "exec", "ls", "move", "mv", "openProperties", "properties"})
 GIO_DELETE_VERBS = frozenset({"remove", "rm", "trash"})
 FIND_GLOBAL_OPTIONS = frozenset({"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"})
@@ -215,10 +230,7 @@ MOSH_VALUE_LETTERS = frozenset("p")
 MOSH_LONG_FLAGS = frozenset({"--help", "--local", "--no-init", "--no-ssh-pty", "--predict-overwrite", "--verbose", "--version"})
 MOSH_LONG_VALUES = frozenset({"--bind-server", "--client", "--experimental-remote-ip", "--family", "--port", "--predict", "--server", "--ssh"})
 # Shells take a value after these options, so the next word is not the script.
-SHELL_VALUE_OPTIONS = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
-SHELL_BUNDLE_VALUE = re.compile(r"[-+][A-Za-z]*[oO]")
-SHELL_COMMAND_CLUSTER = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
-SHELL_STDIN_CLUSTER = re.compile(r"-[A-Za-z]*s[A-Za-z]*")
+SHELL_LONG_VALUES = frozenset({"--rcfile", "--init-file"})
 STDIN_OPERATORS = frozenset({"<", "<>"})
 # A tilde that is quoted or escaped is not a home folder, so what follows it is a relative path.
 QUOTED_TILDE = re.compile(r"(?:^|[\s;&|(])(?:(?:['\"]+|\\)~|~['\"\\])")
@@ -1029,11 +1041,15 @@ def _xargs(words: list[str], cwd: str | None) -> None:
         consumed = 1
         if option.startswith("--"):
             name, equals, value = option.partition("=")
-            if name == "--replace":
+            candidates = [full for full in XARGS_LONG_OPTIONS if full == name[2:]] or [full for full in XARGS_LONG_OPTIONS if full.startswith(name[2:])]
+            if len(candidates) != 1:
+                raise Denied(message("delete_guard.reason.xargs_option"))
+            resolved = candidates[0]
+            if resolved == "replace":
                 replace = value if equals else "{}"
-            elif name in XARGS_VALUE_OPTIONS and not equals:
+            elif XARGS_LONG_OPTIONS[resolved] == "required" and not equals:
                 consumed = 2
-            keeps_input = keeps_input or name in {"--arg-file", "--open-tty"}
+            keeps_input = keeps_input or resolved in {"arg-file", "open-tty"}
         else:
             letters = option[1:]
             for position, letter in enumerate(letters):
@@ -1469,33 +1485,35 @@ def _line_input_files(command: str) -> list[tuple[str, str | None]]:
 
 
 # A shell runs a command string (-c), a script file (after its own options and their values), or what it reads on stdin.
+# A shell reads its options first (every o and O letter takes a word, -c and -s set the mode wherever they stand), then what is
+# left: with -c the first word is the command string, with -s or with no word at all the input is read, otherwise the first
+# word is the script.
 def _check_shell(words: list[str], cwd: str | None) -> None:
-    script = None
-    reads_stdin = False
     index = 1
+    command_mode = stdin_mode = False
     while index < len(words):
         word = words[index]
-        if word == "--":
-            script = words[index + 1] if index + 1 < len(words) else None
+        if word == "--" or word == "-":
+            index += 1
             break
-        # An option with a value takes the next word as it; in a bundle (`-eo pipefail`) it is the last letter that does.
-        if word in SHELL_VALUE_OPTIONS or SHELL_BUNDLE_VALUE.fullmatch(word):
-            index += 2
-            continue
-        if SHELL_COMMAND_CLUSTER.fullmatch(word):
-            if index + 1 < len(words):
-                _check_command(words[index + 1], cwd)
-            return
-        if SHELL_STDIN_CLUSTER.fullmatch(word):
-            reads_stdin = True
-        elif not (word.startswith(("-", "+")) and len(word) > 1):
-            script = word
+        if word.startswith("--"):
+            index += 2 if word in SHELL_LONG_VALUES else 1
+        elif len(word) > 1 and word[0] in "-+":
+            if word[0] == "-":
+                command_mode = command_mode or "c" in word
+                stdin_mode = stdin_mode or "s" in word
+            index += 1 + word.count("o") + word.count("O")
+        else:
             break
-        index += 1
+    operands = words[index:]
+    if command_mode:
+        if operands:
+            _check_command(operands[0], cwd)
+        return
     if _REMOTE[0] is not None:
         return
-    if script is not None and not reads_stdin:
-        _check_script(script, cwd, shell=True)
+    if operands and not stdin_mode:
+        _check_script(operands[0], cwd, shell=True)
     else:
         for name, folder in _STDIN_FILES[0]:
             _check_script(name, folder, shell=True)

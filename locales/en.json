@@ -36,6 +36,7 @@
   "delete_guard.reason.unparseable": "a delete command whose quoting cannot be parsed",
   "delete_guard.reason.unresolvable": "`{verb}` target {raw} cannot be resolved because the current folder is unknown",
   "delete_guard.reason.worktree": "{path} is a Git worktree or submodule; use `git worktree remove {path}`",
+  "delete_guard.reason.xargs_option": "an `xargs` option that cannot be read, so the command it runs is not known",
   "delete_guard.reason.xargs_rm": "`xargs rm` deletes paths the guard cannot see",
   "safe_tool.ask.local_artifact": "Tracking a machine-local agent artifact requires explicit user approval.",
   "safe_tool.cli.usage": "usage: safe-tool hook <claude|codex> | self-test | status coderabbit | status rtk | has-key <NAME> [<NAME> ...] [--file <startup file>] | remote-readonly '<command>' | redact | git identity | git commit -m <message> [-m <message> ...]",
