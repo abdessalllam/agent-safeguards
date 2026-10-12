@@ -166,12 +166,15 @@ def _skip_operand(command: str, index: int) -> int:
     return min(index, length)
 
 
-def _drop_descriptor(kept: list[str]) -> None:
+def _drop_descriptor(kept: list[str]) -> str:
     digits = 0
     while digits < len(kept) and len(kept[-1 - digits]) == 1 and kept[-1 - digits].isdigit():
         digits += 1
     if digits and (digits == len(kept) or (len(kept[-1 - digits]) == 1 and kept[-1 - digits] in COMMAND_BOUNDARY)):
+        dropped = "".join(kept[len(kept) - digits :])
         del kept[len(kept) - digits :]
+        return dropped
+    return ""
 
 
 # The operands of a command are what is left once every option and the value that goes with it is set aside. A short
@@ -222,8 +225,9 @@ def split_options(words: list[str], value_letters: frozenset[str] | str, value_o
 
 # The text is rewritten with a quote-aware pass, so a quoted ">" or "#" stays an ordinary word while an unquoted
 # comment, redirection, file-descriptor prefix and escaped newline are removed before the command is split.
-# Each removed redirection leaves a marker word, because a redirection that fails stops its command from running.
-def normalize_command(command: str) -> str:
+# Each removed redirection leaves a marker word, because a redirection that fails stops its command from running. When a list
+# is given it receives, in the same order, the descriptor, the operator and the operand of each redirection.
+def normalize_command(command: str, redirects: list[tuple[str, str, str]] | None = None) -> str:
     length = len(command)
     kept: list[str] = []
     index = 0
@@ -245,13 +249,17 @@ def normalize_command(command: str) -> str:
         elif character == "&" and command[index + 1 : index + 2] == ">":
             index += 1
         elif character in "<>":
-            _drop_descriptor(kept)
+            descriptor = _drop_descriptor(kept)
             end = index
             while end < length and command[end] in "<>":
                 end += 1
             if end < length and command[end] in REDIRECTION_SUFFIX:
                 end += 1
-            index = _skip_operand(command, end)
+            operator_text = command[index:end]
+            operand_end = _skip_operand(command, end)
+            if redirects is not None:
+                redirects.append((descriptor, operator_text, command[end:operand_end].strip()))
+            index = operand_end
             kept.append(" " + REDIRECTION_MARKER + " ")
             at_word_start = True
         else:
@@ -559,7 +567,7 @@ def command_substitutions(command: str) -> list[str]:
 
 MAX_GLOB_VARIANTS = 256
 MAX_GLOB_MATCHES = 2000
-BRACE_PATTERN = re.compile(r"\{([^{}]*,[^{}]*)\}|\{(-?\d{1,6}|[A-Za-z])\.\.(-?\d{1,6}|[A-Za-z])(?:\.\.(-?\d{1,6}))?\}")
+BRACE_PATTERN = re.compile(r"\{([^{}]*,[^{}]*)\}|\{(-?\d{1,30}|[A-Za-z])\.\.(-?\d{1,30}|[A-Za-z])(?:\.\.(-?\d{1,30}))?\}")
 
 
 def brace_options(found: re.Match) -> list[str] | None:
@@ -570,17 +578,25 @@ def brace_options(found: re.Match) -> list[str] | None:
     if numeric != end.lstrip("-").isdigit():
         return ["_"]
     first, last = (int(start), int(end)) if numeric else (ord(start), ord(end))
-    increment = abs(int(found.group(4) or 1)) or 1
+    step = found.group(4) or "1"
+    increment = abs(int(step)) or 1
     if abs(last - first) // increment >= MAX_GLOB_VARIANTS:
         return None
     direction = increment if last >= first else -increment
     values = range(first, last + (1 if last >= first else -1), direction)
     if not numeric:
         return [chr(value) for value in values]
-    # A number written with a leading zero keeps its width in every term, the way the shell prints the sequence.
-    padded = any(len(digits) > 1 and digits.startswith("0") for digits in (start.lstrip("-"), end.lstrip("-")))
-    width = max(len(start), len(end)) if padded else 0
-    return ["%0*d" % (width, value) for value in values]
+    # A number written with a leading zero keeps its width in every term, the way the shell prints the sequence; some shells
+    # take the width from the step as well, so both widths are followed.
+    def padded(text: str) -> bool:
+        digits = text.lstrip("-")
+        return len(digits) > 1 and digits.startswith("0")
+
+    width = max(len(start), len(end)) if padded(start) or padded(end) else 0
+    widths = {width}
+    if padded(step):
+        widths.add(max(len(start), len(end), len(step)))
+    return sorted({"%0*d" % (each, value) for each in widths for value in values})
 
 
 # A word with braces stands for several words; None means there are more than the scan can follow.
@@ -656,6 +672,8 @@ def strip_wrappers_with_directory(words: list[str], keep: frozenset[str] = froze
             index += 1
         value_options = WRAPPER_VALUE_OPTIONS[base]
         after_dashes = False
+        chosen: str | None = None
+        root_changed = False
         while index < len(words):
             option = words[index]
             if option == "--" and not after_dashes:
@@ -666,7 +684,10 @@ def strip_wrappers_with_directory(words: list[str], keep: frozenset[str] = froze
                 changed = DIRECTORY_OPTIONS.get(base, frozenset()) & set(names)
                 if changed:
                     name = sorted(changed)[-1]
-                    moved.append("" if name in CHROOT_OPTIONS else _option_value(option, name, words, index))
+                    if name in CHROOT_OPTIONS:
+                        root_changed = True
+                    else:
+                        chosen = _option_value(option, name, words, index)
                 if base == "env" and SPLIT_STRING_OPTIONS & set(names):
                     expansions += 1
                     if expansions > MAX_SPLIT_STRING_EXPANSIONS:
@@ -689,6 +710,11 @@ def strip_wrappers_with_directory(words: list[str], keep: frozenset[str] = froze
                 index += 1
             else:
                 break
+        # A wrapper changes directory once, to the last folder it was given; a root change leaves nothing to resolve.
+        if root_changed:
+            moved.append("")
+        elif chosen is not None:
+            moved.append(chosen)
     return words[index:], moved
 
 

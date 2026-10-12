@@ -215,15 +215,42 @@ REMOTE_FORBIDDEN_LETTERS = {"date": "s", "file": "C", "free": "s", "journalctl":
 # Letters that take the rest of the bundle as their value (-ufoo.service, -T/tmp/out), which is not a list of options.
 # An exact long option wins over any longer option it begins, so these are not taken for the forbidden ones.
 REMOTE_EXACT_LONG = {"journalctl": frozenset({"--cursor"})}
-REMOTE_VALUE_LETTERS = {"date": "dfrs", "file": "fmeFP", "free": "cs", "journalctl": "DMutpcSUnogF", "sort": "tTkSo", "tail": "ncs"}
+REMOTE_VALUE_LETTERS = {
+    "date": "dfrs",
+    "file": "fmeFP",
+    "free": "cs",
+    "journalctl": "DMutpcSUnogF",
+    "sort": "tTkSo",
+    "systemctl": "HMnopst",
+    "tail": "ncs",
+}
+# Long options that take no value, so a -- after one of them is a terminator.
+REMOTE_FLAG_LONG = {
+    "date": frozenset({"--debug", "--help", "--rfc-2822", "--rfc-822", "--rfc-email", "--universal", "--utc", "--version"}),
+    "file": frozenset(
+        {"--apple", "--brief", "--dereference", "--extension", "--help", "--keep-going", "--mime", "--mime-encoding", "--mime-type", "--no-dereference", "--no-pad", "--preserve-date", "--raw", "--special-files", "--uncompress", "--version"}
+    ),
+    "free": frozenset(
+        {"--bytes", "--committed", "--giga", "--gibi", "--help", "--human", "--kibi", "--kilo", "--lohi", "--mebi", "--mega", "--pebi", "--peta", "--si", "--tebi", "--tera", "--total", "--version", "--wide"}
+    ),
+    "journalctl": frozenset(
+        {"--all", "--catalog", "--disk-usage", "--dmesg", "--full", "--header", "--help", "--list-boots", "--list-catalog", "--merge", "--no-full", "--no-hostname", "--no-pager", "--quiet", "--reverse", "--show-cursor", "--system", "--user", "--utc", "--verify", "--version"}
+    ),
+    "sort": frozenset(
+        {"--debug", "--dictionary-order", "--general-numeric-sort", "--help", "--human-numeric-sort", "--ignore-case", "--ignore-leading-blanks", "--ignore-nonprinting", "--merge", "--month-sort", "--numeric-sort", "--random-sort", "--reverse", "--stable", "--unique", "--version", "--version-sort", "--zero-terminated"}
+    ),
+    "systemctl": frozenset({"--all", "--failed", "--full", "--help", "--no-legend", "--no-pager", "--no-warn", "--plain", "--quiet", "--system", "--user", "--version"}),
+    "tail": frozenset({"--help", "--quiet", "--silent", "--verbose", "--version", "--zero-terminated"}),
+}
 DOCKER_STATS_VALUE_OPTIONS = frozenset({"--format"})
 BOOLEAN_TRUE = frozenset({"1", "t", "T", "true", "TRUE", "True"})
 BOOLEAN_FALSE = frozenset({"0", "f", "F", "false", "FALSE", "False"})
 # ps reads words without a dash as BSD options too; these take the next word (or the rest of the word) as their value.
-PS_PROFILES = (
-    (frozenset("CGgOopqstUu"), frozenset("NOopqtU")),
-    (frozenset("OoGgupUt"), frozenset("OoGgupUt")),
-)
+PS_PROFILES = {
+    "linux": (frozenset("CGgOopqstUu"), frozenset("NOopqtU")),
+    "darwin": (frozenset("OoGgupUt"), frozenset("OoGgupUt")),
+}
+_PS_TARGET = ["darwin" if sys.platform == "darwin" else "linux"]
 PS_LONG_VALUE_OPTIONS = frozenset(
     {
         "--cols", "--columns", "--date-format", "--format", "--group", "--Group", "--lines", "--pid", "--ppid", "--quick-pid", "--rows",
@@ -253,7 +280,7 @@ REMOTE_SECRET_PATHS = re.compile(
     re.IGNORECASE,
 )
 # What a remote command is checked and its output cleaned with: addresses and hosts in logs are infrastructure details too.
-REDACT_URL = re.compile(r"(?i)\b[a-z][a-z0-9+.-]{1,15}://[^\s\"'<>`]+")
+REDACT_URL = re.compile(r"(?i)(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s\"'<>`]+")
 REDACT_USER_HOST = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}")
 REDACT_IPV4 = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?(?![\w.])")
 REDACT_IPV6 = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}(?:[0-9A-Fa-f]{0,4}|\d{1,3}(?:\.\d{1,3}){3})(?![\w:.])")
@@ -926,10 +953,12 @@ def _reads_startup_file(command: str) -> bool:
 
 
 # `e` shows the environment of every process: as a BSD word (`ps ax eww`, `ps e1`, also after other options) and as a dashed
-# letter. The words that an option takes as its value are skipped, and Linux and macOS disagree about which options take one
-# (-C, -q and -s do on Linux only), so the arguments are read both ways.
+# letter. The words that an option takes as its value are skipped, except a value that begins with a dash: Linux then reads
+# the whole line as BSD options and macOS may read the option as one that takes none, so it is looked at as options. The
+# options that take a value differ between Linux (-C, -q and -s do) and macOS, so the target decides; a remote check is Linux.
 def _ps_shows_environment(arguments: list[str]) -> bool:
-    return any(_ps_walk(arguments, unix_values, bsd_values) for unix_values, bsd_values in PS_PROFILES)
+    unix_values, bsd_values = PS_PROFILES[_PS_TARGET[0]]
+    return _ps_walk(arguments, unix_values, bsd_values)
 
 
 def _ps_walk(arguments: list[str], unix_values: frozenset[str], bsd_values: frozenset[str]) -> bool:
@@ -946,14 +975,11 @@ def _ps_walk(arguments: list[str], unix_values: frozenset[str], bsd_values: froz
         dashed = word.startswith("-") and len(word) > 1
         body = word[1:] if dashed else word
         prefix = re.match(r"[A-Za-z]*", body).group(0)
+        if any(letter in "eE" for letter in prefix):
+            return True
         values = unix_values if dashed else bsd_values
-        for position, letter in enumerate(prefix):
-            if letter in "eE":
-                return True
-            if letter in values:
-                if position + 1 == len(body):
-                    index += 1
-                break
+        if prefix and len(prefix) == len(body) and prefix[-1] in values and index < len(arguments) and not arguments[index].startswith("-"):
+            index += 1
     return False
 
 
@@ -1873,6 +1899,12 @@ def _remote_stages(command: str) -> list[list[str]] | None:
             continue
         if character in ";&<>()":
             return None
+        if character == "{":
+            # The remote shell expands a brace list into separate words, which are not the words checked here.
+            closing = command.find("}", index)
+            inner = command[index + 1 : closing] if closing != -1 else ""
+            if "," in inner or ".." in inner:
+                return None
         if character == "|":
             if command[index + 1 : index + 2] == "|":
                 return None
@@ -1900,9 +1932,9 @@ def _shown(value: str) -> str:
 
 # Whether an option could take the next word as its value: a long option without an attached value, or a short one that ends
 # in a letter that takes a value.
-def _may_take_next(argument: str, values: str) -> bool:
+def _may_take_next(argument: str, values: str, flags: frozenset[str]) -> bool:
     if argument.startswith("--"):
-        return len(argument) > 2 and "=" not in argument
+        return len(argument) > 2 and "=" not in argument and argument not in flags
     if argument.startswith("-") and len(argument) > 1:
         for position, letter in enumerate(argument[1:], 1):
             if letter in values:
@@ -1924,7 +1956,7 @@ def _remote_option_problem(name: str, arguments: list[str]) -> str | None:
         # find reads its expression after the starting points, so a -- before them does not end the options that matter.
         if argument == "--" and name != "find":
             # The option before it may take it as its value, and the options after it are then still options.
-            if _may_take_next(previous, values):
+            if (exact or long_options or letters) and _may_take_next(previous, values, REMOTE_FLAG_LONG.get(name, frozenset())):
                 return refused("--")
             break
         previous = argument
@@ -2000,9 +2032,16 @@ def _remote_docker_problem(arguments: list[str]) -> str | None:
         return message("safe_tool.remote.reason.subcommand", name="docker", subcommand=_shown(subcommand))
     # The options before the subcommand can point docker at another machine or another configuration.
     for argument in arguments[:index]:
-        named = argument[:2] if argument.startswith(("-H", "-c")) else argument.split("=", 1)[0]
-        if named in {"-H", "-c", "--host", "--context", "--config"}:
-            return message("safe_tool.remote.reason.option", name="docker", option=named)
+        if argument.startswith("--"):
+            named = argument.split("=", 1)[0]
+            if named in {"--host", "--context", "--config"}:
+                return message("safe_tool.remote.reason.option", name="docker", option=named)
+        elif argument.startswith("-"):
+            for letter in argument[1:]:
+                if letter in "Hc":
+                    return message("safe_tool.remote.reason.option", name="docker", option="-" + letter)
+                if letter in DOCKER_VALUE_LETTERS:
+                    break
     rest = arguments[index + 1 :] if index is not None else []
     effective = subcommand
     if subcommand == "compose":
@@ -2036,14 +2075,20 @@ def _remote_check(command: str) -> str | None:
     decoded = " | ".join(" ".join(shlex.quote(word) for word in words) for words in stages)
     # Repeated slashes and . components name the same file, so the paths are also read in their plain form.
     plain = " | ".join(" ".join(shlex.quote(os.path.normpath(word) if "/" in word else word) for word in words) for words in stages)
-    if (
-        REMOTE_SECRET_PATHS.search(command)
-        or REMOTE_SECRET_PATHS.search(decoded)
-        or REMOTE_SECRET_PATHS.search(plain)
-        or _sensitive_command(command, False)
-        or _sensitive_command(decoded, False)
-        or _sensitive_command(plain, False)
-    ):
+    previous = _PS_TARGET[0]
+    _PS_TARGET[0] = "linux"
+    try:
+        sensitive = (
+            REMOTE_SECRET_PATHS.search(command)
+            or REMOTE_SECRET_PATHS.search(decoded)
+            or REMOTE_SECRET_PATHS.search(plain)
+            or _sensitive_command(command, False)
+            or _sensitive_command(decoded, False)
+            or _sensitive_command(plain, False)
+        )
+    finally:
+        _PS_TARGET[0] = previous
+    if sensitive:
         return message("safe_tool.remote.reason.sensitive")
     return None
 
