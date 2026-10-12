@@ -33,6 +33,7 @@ from agent_safeguards.common import (  # noqa: E402
     ASSIGNMENT,
     GIT_VALUE_OPTIONS,
     MAX_COMMAND_CHARS,
+    MAX_GLOB_MATCHES,
     REDIRECTION_MARKER,
     SHELL_KEYWORDS,
     TRUSTED_PATH,
@@ -43,6 +44,7 @@ from agent_safeguards.common import (  # noqa: E402
     emit_decision,
     env_flag,
     env_list,
+    expand_braces,
     fail_open,
     HEREDOC_FORBIDDEN,
     find_executable,
@@ -72,7 +74,7 @@ ATTRIBUTION_PATTERN = re.compile(r"(?im)^\s*(?:co-authored-by|generated-by)\s*:"
 EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]{1,64}@([A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,})\b")
 NON_EMAIL_IDENTITY_FIELD_PATTERN = re.compile(
     r"(?i)(?:user(?:name)?|display[_ -]?name|name|account(?:[_ -]?id)?|"
-    r"org(?:anization)?|tenant(?:[_ -]?id)?)\s*[\"']?\s*[:=]\s*[\"']?[^\s,}\]]+"
+    r"org(?:anization)?|tenant(?:[_ -]?id)?)\s*(?:[\"']\s*)?[:=]\s*[\"']?[^\s,}\]]+"
 )
 HOOK_EVENTS = frozenset({"PreToolUse", "PostToolUse", "SessionStart"})
 # The host kills a hook after 5 seconds and then lets the command run, so a check that is still busy after this long
@@ -157,7 +159,6 @@ STARTUP_FILE_PATTERN = re.compile(STARTUP_BOUNDARY + "(?:" + STARTUP_NAME + ")",
 STARTUP_HISTORY_PATTERN = re.compile(STARTUP_BOUNDARY + "(?:" + STARTUP_HISTORY + ")", re.IGNORECASE)
 STARTUP_SAMPLE_NAMES = tuple("." + name.lower() for name in (STARTUP_RC_NAMES + "|" + STARTUP_HISTORY_NAMES).split("|"))
 GLOB_SYNTAX_PATTERN = re.compile(r"\*|\?|\[[^\]]{1,64}\]|\{[^{}]*,[^{}]*\}|\{[^{}]{1,16}\.\.[^{}]{1,16}\}")
-BRACE_PATTERN = re.compile(r"\{([^{}]*,[^{}]*)\}|\{(-?\d{1,6}|[A-Za-z])\.\.(-?\d{1,6}|[A-Za-z])(?:\.\.-?\d{1,6})?\}")
 # Any of these lets a glob that starts without a dot match hidden files, so `~/*` can reach a startup file.
 DOTGLOB_PATTERN = re.compile(r"dotglob|globdots|GLOBIGNORE|\(D\)", re.IGNORECASE)
 FIND_NAME_PATTERN = re.compile(r"-(?:i?name|i?path|i?wholename)[ \t]+(?:'([^']*)'|\"([^\"]*)\"|([^\s;&|()<>`]+))")
@@ -184,8 +185,6 @@ JQ_PROGRAM_FILE = re.compile(r"-[A-Za-z]*f[A-Za-z]*|--from-file|--run[a-z-]*")
 # as a file name, so it counts as data only as the text of --body, --title or --notes of these commands.
 HEREDOC_ARGUMENT_COMMANDS = {"gh": frozenset({"issue", "pr", "release"})}
 GH_TEXT_OPTIONS = frozenset({"--body", "-b", "--title", "-t", "--notes", "-n"})
-# A word no command can contain, so it can only be the marker the guard put in itself.
-HEREDOC_MARKER = "\x02heredoc\x02"
 # A machine reached through a wrapper (vm.sh) is read-only: one pipeline of these commands, nothing that writes, runs another
 # program or never ends. The option and subcommand lists below close the ways one of them can still do that.
 REMOTE_MAX_CHARS = 4096
@@ -205,13 +204,25 @@ REMOTE_FORBIDDEN_LONG = {
     "free": ("--seconds",),
     "journalctl": (
         "--flush", "--follow", "--relinquish-var", "--rotate", "--setup-keys", "--smart-relinquish-var", "--sync",
-        "--update-catalog", "--vacuum-files", "--vacuum-size", "--vacuum-time",
+        "--update-catalog", "--vacuum-files", "--vacuum-size", "--vacuum-time", "--cursor-file",
     ),
     "sort": ("--compress-program", "--output"),
     "tail": ("--follow",),
 }
 # The same options as letters of a bundle (-us, -bC, -qf): set the clock, compile a database, sample forever, follow, write.
 REMOTE_FORBIDDEN_LETTERS = {"date": "s", "file": "C", "free": "s", "journalctl": "f", "sort": "o", "tail": "fF"}
+# Letters that take the rest of the bundle as their value (-ufoo.service, -T/tmp/out), which is not a list of options.
+# An exact long option wins over any longer option it begins, so these are not taken for the forbidden ones.
+REMOTE_EXACT_LONG = {"journalctl": frozenset({"--cursor"})}
+REMOTE_VALUE_LETTERS = {"date": "dfrs", "file": "fmeFP", "free": "cs", "journalctl": "DMutpcSUnogF", "sort": "tTkSo", "tail": "ncs"}
+BOOLEAN_TRUE = frozenset({"1", "t", "T", "true", "TRUE", "True"})
+BOOLEAN_FALSE = frozenset({"0", "f", "F", "false", "FALSE", "False"})
+# ps reads words without a dash as BSD options too; these take the next word (or the rest of the word) as their value.
+PS_UNIX_VALUE_LETTERS = frozenset("CGgOopqstUu")
+PS_BSD_VALUE_LETTERS = frozenset("NOopqtU")
+PS_LONG_VALUE_OPTIONS = frozenset(
+    {"--cols", "--columns", "--format", "--group", "--Group", "--lines", "--pid", "--ppid", "--quick-pid", "--rows", "--sid", "--sort", "--tty", "--user", "--User", "--width"}
+)
 # Options that take a value, so the value is not mistaken for a subcommand or an operand.
 DOCKER_VALUE_LETTERS = frozenset("Hcl")
 DOCKER_VALUE_OPTIONS = frozenset({"--config", "--context", "--host", "--log-level", "--tlscacert", "--tlscert", "--tlskey"})
@@ -235,7 +246,7 @@ REMOTE_SECRET_PATHS = re.compile(
     re.IGNORECASE,
 )
 # What a remote command is checked and its output cleaned with: addresses and hosts in logs are infrastructure details too.
-REDACT_URL = re.compile(r"\b(?:https?|ssh|tcp|wss?|ftp)://[^\s\"'<>)\]]+")
+REDACT_URL = re.compile(r"(?i)\b(?:https?|ssh|tcp|wss?|ftp)://[^\s\"'<>`]+")
 REDACT_USER_HOST = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}")
 REDACT_IPV4 = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?(?![\w.])")
 REDACT_IPV6 = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}(?:[0-9A-Fa-f]{0,4}|\d{1,3}(?:\.\d{1,3}){3})(?![\w:.])")
@@ -243,8 +254,6 @@ REDACT_IPV6 = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}(?:[0-9A-Fa-f]{0
 _STARTUP_RULES = [True]
 MAX_GLOB_WORDS = 20
 MAX_GLOB_WORD_CHARS = 512
-MAX_GLOB_VARIANTS = 256
-MAX_GLOB_MATCHES = 2000
 # A command that prints a variable named like a secret shows the secret, so it is refused for the printing commands.
 SECRET_VARIABLE_PATTERN = re.compile(r"\$\{?[#!]?[A-Za-z0-9_]*(?:key|token|secret|pass|credential|auth)[A-Za-z0-9_]*", re.IGNORECASE)
 PRINTING_COMMANDS = frozenset({"echo", "print", "printf"})
@@ -746,7 +755,7 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
         return True
     if executable in SEARCH_COMMANDS and _searches_home(executable, words[1:]):
         return True
-    if executable == "ps" and any(re.fullmatch(r"-?[a-z]*e[a-z]*", argument) for argument in [first] + [item for item in arguments if item.startswith("-")]):
+    if executable == "ps" and _ps_shows_environment(raw_arguments):
         return True
     if executable == "launchctl" and first in ENVIRONMENT_SERVICE_ACTIONS:
         return True
@@ -797,37 +806,6 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
     return False
 
 
-def _brace_options(found: re.Match) -> list[str] | None:
-    if found.group(1) is not None:
-        return found.group(1).split(",")
-    start, end = found.group(2), found.group(3)
-    numeric = start.lstrip("-").isdigit()
-    if numeric != end.lstrip("-").isdigit():
-        return ["_"]
-    first, last = (int(start), int(end)) if numeric else (ord(start), ord(end))
-    if abs(last - first) >= MAX_GLOB_VARIANTS:
-        return None
-    values = range(first, last + (1 if last >= first else -1), 1 if last >= first else -1)
-    return [str(value) if numeric else chr(value) for value in values]
-
-
-def _expand_braces(word: str) -> list[str] | None:
-    pending, done = [word], []
-    while pending:
-        if len(done) + len(pending) > MAX_GLOB_VARIANTS:
-            return None
-        current = pending.pop()
-        found = BRACE_PATTERN.search(current)
-        if found is None:
-            done.append(current)
-            continue
-        options = _brace_options(found)
-        if options is None:
-            return None
-        pending.extend(current[: found.start()] + option + current[found.end() :] for option in options)
-    return done
-
-
 def _could_name_startup_file(pattern: str, dotted: bool) -> bool:
     last = pattern.rsplit("/", 1)[-1].lower()
     return (last.startswith(".") or dotted) and any(fnmatch.fnmatchcase(sample, last) for sample in STARTUP_SAMPLE_NAMES)
@@ -861,7 +839,7 @@ def _glob_names_startup_file(text: str) -> bool:
     working = _working_folder()
     from_home = re.search(r"\b(?:cd|pushd)\b", text) is not None or working == USER_HOME
     for word in words:
-        variants = _expand_braces(word)
+        variants = expand_braces(word)
         if variants is None:
             return True
         for variant in variants:
@@ -940,6 +918,34 @@ def _reads_startup_file(command: str) -> bool:
     return _mentions_startup_file(remainder) or _glob_names_startup_file(remainder) or _find_names_startup_file(remainder)
 
 
+# `e` shows the environment of every process: as a BSD word (`ps ax eww`, also after other options) and, on macOS, as
+# a dashed letter. The words that an option takes as its value are skipped.
+def _ps_shows_environment(arguments: list[str]) -> bool:
+    index = 0
+    while index < len(arguments):
+        word = arguments[index]
+        index += 1
+        if word == "--":
+            break
+        if word.startswith("--"):
+            if "=" not in word and word in PS_LONG_VALUE_OPTIONS:
+                index += 1
+            continue
+        dashed = word.startswith("-") and len(word) > 1
+        body = word[1:] if dashed else word
+        if not re.fullmatch(r"[A-Za-z]+", body):
+            continue
+        values = PS_UNIX_VALUE_LETTERS if dashed else PS_BSD_VALUE_LETTERS
+        for position, letter in enumerate(body):
+            if letter in "eE":
+                return True
+            if letter in values:
+                if position + 1 == len(body):
+                    index += 1
+                break
+    return False
+
+
 def _prints_secret_variable(command: str) -> bool:
     if HERE_STRING_SECRET.search(command):
         return True
@@ -953,12 +959,19 @@ def _prints_secret_variable(command: str) -> bool:
     return False
 
 
+# The word that stands where a here-document marker was is a character the command does not contain, so no quoting or
+# escaping in it can spell that word.
+def _unused_marker(command: str) -> str | None:
+    used = set(command)
+    return next((chr(code) for code in range(0xE000, 0xF900) if chr(code) not in used), None)
+
+
 # The command a here-document or substitution belongs to: the words of its simple command with a placeholder where the
 # marker is, so a command that follows the marker (`<<'EOF' bash`) counts as much as one before it.
-def _owner_words(line: str) -> list[str] | None:
+def _owner_words(line: str, marker: str) -> list[str] | None:
     for chunk in _tokenize(line):
-        if HEREDOC_MARKER in chunk:
-            words = [word for word in chunk if word != HEREDOC_MARKER]
+        if marker in chunk:
+            words = [word for word in chunk if word != marker]
             while words and words[0] in SHELL_KEYWORDS:
                 words = words[1:]
             try:
@@ -979,13 +992,13 @@ def _is_data_owner(words: list[str] | None) -> bool:
     return not (name == "jq" and any(JQ_PROGRAM_FILE.fullmatch(argument) for argument in words[1:]))
 
 
-def _is_data_heredoc(command: str, document: Any) -> bool:
-    if HEREDOC_MARKER in command or document.line_end - document.line_start > MAX_HEREDOC_LINE_CHARS:
+def _is_data_heredoc(command: str, document: Any, marker: str) -> bool:
+    if document.line_end - document.line_start > MAX_HEREDOC_LINE_CHARS:
         return False
     tail = command[document.delimiter_end : document.line_end]
     if PIPELINE_OPERATOR_PATTERN.search(tail):
         return False
-    if not _is_data_owner(_owner_words(command[document.line_start : document.marker_start] + " " + HEREDOC_MARKER + " " + tail)):
+    if not _is_data_owner(_owner_words(command[document.line_start : document.marker_start] + " " + marker + " " + tail, marker)):
         return False
     # An unquoted body is expanded by the shell, so it must hold nothing but text and plain variables.
     if not document.quoted and HEREDOC_EXPANSION.search(command[document.body_start : document.body_end]):
@@ -995,7 +1008,7 @@ def _is_data_heredoc(command: str, document: Any) -> bool:
     line_start, opening, quote = document.outer
     if opening < 0:
         return False
-    outer = _owner_words(command[line_start:opening] + quote + " " + HEREDOC_MARKER + " ")
+    outer = _owner_words(command[line_start:opening] + quote + " " + marker + " ", marker)
     if not outer or not SYSTEM_COMMAND_PATH.fullmatch(outer[0]) or _normalized(outer[0]) != "gh":
         return False
     arguments = outer[1:]
@@ -1021,7 +1034,8 @@ def _plain_enough(code: str) -> bool:
 # the whole command unparseable. The text view also leaves out quoted bodies, which nothing expands; an unquoted body
 # stays in it because the shell expands variables there.
 def _heredoc_views(command: str) -> tuple[str, str]:
-    documents = [document for document in heredocs(command) if _is_data_heredoc(command, document)]
+    marker = _unused_marker(command)
+    documents = [document for document in heredocs(command) if marker is not None and _is_data_heredoc(command, document, marker)]
     if not documents:
         return command, command
     code: list[str] = []
@@ -1300,7 +1314,7 @@ def _run_hook(runtime: str, expected_event: str | None = None) -> int:
         payload = json.loads(raw_input)
         if not isinstance(payload, dict):
             raise ValueError
-    except (OSError, TypeError, ValueError):
+    except Exception:
         _fail_closed_unreadable(runtime, raw_input, expected_event)
         return 0
     event = expected_event or payload.get("hook_event_name", "PreToolUse")
@@ -1867,6 +1881,12 @@ def _remote_stages(command: str) -> list[list[str]] | None:
     return words
 
 
+# What a refusal prints is a name from the tables or a plain word, never text the caller typed after it: an attached value or an
+# operand could be a secret that the refusal would then show.
+def _shown(value: str) -> str:
+    return value if re.fullmatch(r"[A-Za-z0-9_.+:-]{0,40}", value) and not contains_secret(value) else "?"
+
+
 def _remote_option_problem(name: str, arguments: list[str]) -> str | None:
     def refused(option: str) -> str:
         return message("safe_tool.remote.reason.option", name=name, option=option)
@@ -1874,42 +1894,68 @@ def _remote_option_problem(name: str, arguments: list[str]) -> str | None:
     exact = REMOTE_FORBIDDEN_OPTIONS.get(name, frozenset())
     long_options = REMOTE_FORBIDDEN_LONG.get(name, ())
     letters = REMOTE_FORBIDDEN_LETTERS.get(name, "")
+    values = REMOTE_VALUE_LETTERS.get(name, "")
+    exact_long = REMOTE_EXACT_LONG.get(name, frozenset())
     for argument in arguments:
-        if argument == "--":
+        # find reads its expression after the starting points, so a -- before them does not end the options that matter.
+        if argument == "--" and name != "find":
             break
         if argument in exact:
             return refused(argument)
         if argument.startswith("--"):
             option = argument.split("=", 1)[0]
-            if len(option) > 2 and any(forbidden.startswith(option) for forbidden in long_options):
-                return refused(argument)
-        elif argument.startswith("-") and not argument[1:].isdigit() and any(letter in letters for letter in argument[1:]):
-            return refused(argument)
+            forbidden = None if option in exact_long else next((item for item in long_options if len(option) > 2 and item.startswith(option)), None)
+            if forbidden is not None:
+                return refused(forbidden)
+        elif argument.startswith("-") and not argument[1:].isdigit():
+            for letter in argument[1:]:
+                if letter in letters:
+                    return refused("-" + letter)
+                if letter in values:
+                    break
     if name == "date":
         operands = split_options(arguments, DATE_VALUE_LETTERS, DATE_VALUE_OPTIONS)
         # A numeric operand sets the clock; only a +FORMAT operand prints.
         if any(not operand.startswith("+") for operand in operands):
-            return refused(" ".join(operands))
+            return message("safe_tool.remote.reason.operand", name=name)
     if name == "uniq":
         operands = split_options(arguments, UNIQ_VALUE_LETTERS, UNIQ_VALUE_OPTIONS)
         # The second operand of uniq is a file it writes.
         if len(operands) > 1:
-            return refused(" ".join(operands))
+            return message("safe_tool.remote.reason.operand", name=name)
     if name == "docker":
         return _remote_docker_problem(arguments)
     if name == "systemctl":
         index = first_operand(arguments, SYSTEMCTL_VALUE_LETTERS, SYSTEMCTL_VALUE_OPTIONS)
         subcommand = arguments[index] if index is not None else ""
         if subcommand not in REMOTE_SUBCOMMANDS[name]:
-            return message("safe_tool.remote.reason.subcommand", name=name, subcommand=subcommand)
+            return message("safe_tool.remote.reason.subcommand", name=name, subcommand=_shown(subcommand))
     if name == "pm2":
         operands = split_options(arguments, "", frozenset())
         subcommand = operands[0] if operands else ""
         if subcommand not in REMOTE_SUBCOMMANDS[name]:
-            return message("safe_tool.remote.reason.subcommand", name=name, subcommand=subcommand)
+            return message("safe_tool.remote.reason.subcommand", name=name, subcommand=_shown(subcommand))
         if subcommand == "logs" and "--nostream" not in arguments:
             return message("safe_tool.remote.reason.option", name="pm2 logs", option="without --nostream")
     return None
+
+
+# A boolean flag counts as set when its last mention before any -- says so (--no-stream, --no-stream=false).
+def _flag_is_set(arguments: list[str], flag: str) -> bool:
+    state = False
+    for argument in arguments:
+        if argument == "--":
+            break
+        option, equals, value = argument.partition("=")
+        if option != flag:
+            continue
+        if not equals or value in BOOLEAN_TRUE:
+            state = True
+        elif value in BOOLEAN_FALSE:
+            state = False
+        else:
+            return False
+    return state
 
 
 # docker takes its own options, then the subcommand; compose takes its own options again before its subcommand.
@@ -1917,18 +1963,18 @@ def _remote_docker_problem(arguments: list[str]) -> str | None:
     index = first_operand(arguments, DOCKER_VALUE_LETTERS, DOCKER_VALUE_OPTIONS)
     subcommand = arguments[index] if index is not None else ""
     if subcommand not in REMOTE_SUBCOMMANDS["docker"]:
-        return message("safe_tool.remote.reason.subcommand", name="docker", subcommand=subcommand)
+        return message("safe_tool.remote.reason.subcommand", name="docker", subcommand=_shown(subcommand))
     rest = arguments[index + 1 :] if index is not None else []
     effective = subcommand
     if subcommand == "compose":
         position = first_operand(rest, COMPOSE_VALUE_LETTERS, COMPOSE_VALUE_OPTIONS)
         effective = rest[position] if position is not None else ""
         if effective not in REMOTE_COMPOSE_SUBCOMMANDS:
-            return message("safe_tool.remote.reason.subcommand", name="docker compose", subcommand=effective)
+            return message("safe_tool.remote.reason.subcommand", name="docker compose", subcommand=_shown(effective))
         rest = rest[position + 1 :]
     if effective == "logs" and any(DOCKER_FOLLOW.fullmatch(argument) for argument in rest if argument != "--"):
         return message("safe_tool.remote.reason.option", name="docker logs", option="-f")
-    if subcommand == "stats" and "--no-stream" not in rest:
+    if subcommand == "stats" and not _flag_is_set(rest, "--no-stream"):
         return message("safe_tool.remote.reason.option", name="docker stats", option="without --no-stream")
     return None
 
@@ -1943,13 +1989,21 @@ def _remote_check(command: str) -> str | None:
         if not words:
             return message("safe_tool.remote.reason.shape")
         if words[0] not in REMOTE_READ_COMMANDS:
-            return message("safe_tool.remote.reason.command", name=words[0])
+            return message("safe_tool.remote.reason.command", name=_shown(words[0]))
         problem = _remote_option_problem(words[0], words[1:])
         if problem is not None:
             return problem
     # The words as the remote shell will see them, with quotes and escapes removed, are checked as well as the text.
     decoded = " | ".join(" ".join(shlex.quote(word) for word in words) for words in stages)
-    if REMOTE_SECRET_PATHS.search(command) or REMOTE_SECRET_PATHS.search(decoded) or _sensitive_command(command, False) or _sensitive_command(decoded, False):
+    # Repeated slashes and . components name the same file, so the paths are also read in their plain form.
+    plain = " | ".join(" ".join(shlex.quote(os.path.normpath(word) if "/" in word else word) for word in words) for words in stages)
+    if (
+        REMOTE_SECRET_PATHS.search(command)
+        or REMOTE_SECRET_PATHS.search(decoded)
+        or REMOTE_SECRET_PATHS.search(plain)
+        or _sensitive_command(command, False)
+        or _sensitive_command(decoded, False)
+    ):
         return message("safe_tool.remote.reason.sensitive")
     return None
 

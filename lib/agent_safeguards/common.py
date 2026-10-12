@@ -62,6 +62,7 @@ DIRECTORY_OPTIONS = {
     "env": frozenset({"-C", "--chdir"}),
     "sudo": frozenset({"-D", "--chdir", "-R", "--chroot"}),
 }
+CHROOT_OPTIONS = frozenset({"-R", "--chroot"})
 SPLIT_STRING_OPTIONS = frozenset({"-S", "--split-string"})
 # Each wrapper lists the options that take a separate value, so the value is not mistaken for the command.
 WRAPPER_VALUE_OPTIONS = {
@@ -199,11 +200,23 @@ def split_options(words: list[str], value_letters: frozenset[str] | str, value_o
     operands: list[str] = []
     index = 0
     while index < len(words):
-        position = first_operand(words[index:], value_letters, value_options)
-        if position is None:
+        word = words[index]
+        if word == "--":
+            # Everything after the terminator is an operand, whatever it begins with.
+            operands.extend(words[index + 1 :])
             break
-        operands.append(words[index + position])
-        index += position + 1
+        if word.startswith("--"):
+            index += 2 if "=" not in word and word in value_options else 1
+        elif word.startswith("-") and len(word) > 1:
+            takes_next = False
+            for position, letter in enumerate(word[1:], 1):
+                if letter in value_letters:
+                    takes_next = position + 1 >= len(word)
+                    break
+            index += 2 if takes_next else 1
+        else:
+            operands.append(word)
+            index += 1
     return operands
 
 
@@ -338,11 +351,15 @@ def _read_delimiter(command: str, index: int) -> tuple[str, bool, int] | None:
                 return None
             interior = command[index + 1 : closing]
             # Inside double quotes a backslash only escapes $, a backtick, a quote, a backslash or a line break.
-            pieces.append(re.sub(r'\\([$`"\\\n])', r"\1", interior) if character == '"' else interior)
+            pieces.append(re.sub(r'\\\n|\\([$`"\\])', lambda found: found.group(1) or "", interior) if character == '"' else interior)
             quoted, index = True, closing + 1
         elif character == "\\":
             if index + 1 >= length:
                 return None
+            # A backslash and a line break are a continuation: the shell removes both and the word goes on.
+            if command[index + 1] == "\n":
+                index += 2
+                continue
             pieces.append(command[index + 1])
             quoted, index = True, index + 2
         else:
@@ -540,6 +557,43 @@ def command_substitutions(command: str) -> list[str]:
     return bodies
 
 
+MAX_GLOB_VARIANTS = 256
+MAX_GLOB_MATCHES = 2000
+BRACE_PATTERN = re.compile(r"\{([^{}]*,[^{}]*)\}|\{(-?\d{1,6}|[A-Za-z])\.\.(-?\d{1,6}|[A-Za-z])(?:\.\.-?\d{1,6})?\}")
+
+
+def brace_options(found: re.Match) -> list[str] | None:
+    if found.group(1) is not None:
+        return found.group(1).split(",")
+    start, end = found.group(2), found.group(3)
+    numeric = start.lstrip("-").isdigit()
+    if numeric != end.lstrip("-").isdigit():
+        return ["_"]
+    first, last = (int(start), int(end)) if numeric else (ord(start), ord(end))
+    if abs(last - first) >= MAX_GLOB_VARIANTS:
+        return None
+    values = range(first, last + (1 if last >= first else -1), 1 if last >= first else -1)
+    return [str(value) if numeric else chr(value) for value in values]
+
+
+# A word with braces stands for several words; None means there are more than the scan can follow.
+def expand_braces(word: str) -> list[str] | None:
+    pending, done = [word], []
+    while pending:
+        if len(done) + len(pending) > MAX_GLOB_VARIANTS:
+            return None
+        current = pending.pop()
+        found = BRACE_PATTERN.search(current)
+        if found is None:
+            done.append(current)
+            continue
+        options = brace_options(found)
+        if options is None:
+            return None
+        pending.extend(current[: found.start()] + option + current[found.end() :] for option in options)
+    return done
+
+
 # A short bundle such as -Eu names each option, and the last one may take the next word as its value.
 def option_names(option: str, value_options: frozenset[str]) -> tuple[list[str], bool]:
     if option.startswith("--"):
@@ -554,11 +608,24 @@ def option_names(option: str, value_options: frozenset[str]) -> tuple[list[str],
     return names, False
 
 
+# The value of the directory option named in a bundle, joined or separate; an empty string when it is missing.
+def _option_value(option: str, name: str, words: list[str], index: int) -> str:
+    if option.startswith("--"):
+        if "=" in option:
+            return option.split("=", 1)[1]
+        return words[index + 1] if index + 1 < len(words) else ""
+    position = option.index(name[1:]) + 1
+    if position < len(option):
+        return option[position:]
+    return words[index + 1] if index + 1 < len(words) else ""
+
+
 # Both tools classify the command that actually runs, so assignments, shell keywords and wrappers come off first.
-# The flag reports a wrapper option that changes the working or root directory for the command that follows.
-def strip_wrappers_with_directory(words: list[str], keep: frozenset[str] = frozenset()) -> tuple[list[str], bool]:
+# The second result is None unless a wrapper option changes the working or root directory for the command that follows;
+# then it is the value of the last such option, or an empty string for a root change, which has no folder to resolve.
+def strip_wrappers_with_directory(words: list[str], keep: frozenset[str] = frozenset()) -> tuple[list[str], str | None]:
     words = list(words)
-    moved = False
+    moved: str | None = None
     expansions = 0
     index = 0
     while index < len(words):
@@ -589,7 +656,10 @@ def strip_wrappers_with_directory(words: list[str], keep: frozenset[str] = froze
                 index += 1
             elif not after_dashes and option.startswith("-") and len(option) > 1:
                 names, takes_next = option_names(option, value_options)
-                moved = moved or bool(DIRECTORY_OPTIONS.get(base, frozenset()) & set(names))
+                changed = DIRECTORY_OPTIONS.get(base, frozenset()) & set(names)
+                if changed:
+                    name = sorted(changed)[-1]
+                    moved = "" if name in CHROOT_OPTIONS else _option_value(option, name, words, index)
                 if base == "env" and SPLIT_STRING_OPTIONS & set(names):
                     expansions += 1
                     if expansions > MAX_SPLIT_STRING_EXPANSIONS:
