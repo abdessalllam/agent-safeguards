@@ -145,17 +145,32 @@ FIND_NEWER_PREDICATE = re.compile(r"-newer[aBcmt][aBcmt]")
 # stays in the same folder.
 MATCH_MARK = "\ue000match\ue001"
 GLOB_VISITS = 200000
+POSIX_CLASSES_ASCII = {
+    "alnum": "a-zA-Z0-9",
+    "alpha": "a-zA-Z",
+    "blank": " \\t",
+    "cntrl": "\\x00-\\x1f\\x7f",
+    "digit": "0-9",
+    "graph": "!-~",
+    "lower": "a-z",
+    "print": " -~",
+    "punct": "!-/:-@\\[-`{-~",
+    "space": " \\t\\n\\r\\f\\v",
+    "upper": "A-Z",
+    "word": "a-zA-Z0-9_",
+    "xdigit": "0-9A-Fa-f",
+}
 POSIX_CLASSES = {
     "alnum": "a-zA-Z0-9\\x80-\\U0010ffff",
     "alpha": "a-zA-Z\\x80-\\U0010ffff",
-    "blank": " \\t",
-    "cntrl": "\\x00-\\x1f\\x7f",
+    "blank": " \\t\\x80-\\U0010ffff",
+    "cntrl": "\\x00-\\x1f\\x7f-\\U0010ffff",
     "digit": "0-9",
     "graph": "!-~\\x80-\\U0010ffff",
     "lower": "a-z\\x80-\\U0010ffff",
     "print": " -~\\x80-\\U0010ffff",
     "punct": "!-/:-@\\[-`{-~\\x80-\\U0010ffff",
-    "space": " \\t\\n\\r\\f\\v",
+    "space": " \\t\\n\\r\\f\\v\\x80-\\U0010ffff",
     "upper": "A-Z\\x80-\\U0010ffff",
     "word": "a-zA-Z0-9_\\x80-\\U0010ffff",
     "xdigit": "0-9A-Fa-f",
@@ -201,6 +216,7 @@ MOSH_LONG_FLAGS = frozenset({"--help", "--local", "--no-init", "--no-ssh-pty", "
 MOSH_LONG_VALUES = frozenset({"--bind-server", "--client", "--experimental-remote-ip", "--family", "--port", "--predict", "--server", "--ssh"})
 # Shells take a value after these options, so the next word is not the script.
 SHELL_VALUE_OPTIONS = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
+SHELL_BUNDLE_VALUE = re.compile(r"[-+][A-Za-z]*[oO]")
 SHELL_COMMAND_CLUSTER = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 SHELL_STDIN_CLUSTER = re.compile(r"-[A-Za-z]*s[A-Za-z]*")
 STDIN_OPERATORS = frozenset({"<", "<>"})
@@ -531,8 +547,13 @@ def _glob_walk(base: str, parts: list[str], matches: list[str], visits: list[int
                 _glob_walk(entry.path, rest, matches, visits, verb, raw, folders_only)
     else:
         path = os.path.join(base, part)
-        if os.path.lexists(path):
-            _glob_walk(path, rest, matches, visits, verb, raw, folders_only)
+        try:
+            os.lstat(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        except OSError:
+            raise Denied(message("delete_guard.reason.expansion", verb=verb, raw=raw)) from None
+        _glob_walk(path, rest, matches, visits, verb, raw, folders_only)
 
 
 # A shell pattern as tokens: `*`, `?`, literal characters and classes with `!` or `^` for negation, ranges and the named
@@ -563,7 +584,8 @@ def _glob_tokens(pattern: str) -> list[tuple[str, object]]:
                     end = pattern.find(":]", position + 2)
                     name = pattern[position + 2 : end] if end != -1 else ""
                     if name in POSIX_CLASSES:
-                        members.append(POSIX_CLASSES[name])
+                        # The wide form (any non-ASCII name may belong) is the safe one for a class, the ASCII form for a negated one.
+                        members.append((POSIX_CLASSES_ASCII if negate else POSIX_CLASSES)[name])
                         position = end + 2
                         continue
                 members.append("-" if pattern[position] == "-" else re.escape(pattern[position]))
@@ -777,10 +799,10 @@ def _check_target(raw: str, cwd: str | None, *, recursive: bool, verb: str) -> N
         raise Denied(message("delete_guard.reason.trash_purge", verb=verb, path=resolved))
     for match in _glob_matches(raw, cwd, verb):
         found = os.path.realpath(match)
-        if _names_trash(match) or _in_trash(found) or (recursive and os.path.isdir(found) and _holds_trash(found)):
+        if _names_trash(match) or _in_trash(found) or (recursive and _is_folder_path(found, verb, raw) and _holds_trash(found)):
             raise Denied(message("delete_guard.reason.trash_purge", verb=verb, path=match))
         _check_resolved(found, cwd, recursive, verb)
-    if recursive and base == raw and os.path.isdir(resolved) and _holds_trash(resolved):
+    if recursive and base == raw and _is_folder_path(resolved, verb, raw) and _holds_trash(resolved):
         raise Denied(message("delete_guard.reason.trash_holder", verb=verb, path=resolved))
     # A glob under a temp root is cleanup of scratch folders only when a literal name comes before the first wildcard.
     if base != raw and resolved in TEMP_ROOTS:
@@ -852,10 +874,10 @@ def _trash_one(target: str, cwd: str | None) -> None:
     _check_sendable(resolved)
     for match in _glob_matches(target, cwd, "trash"):
         found = os.path.realpath(match)
-        if _names_trash(match) or (os.path.isdir(found) and _holds_trash(found)):
+        if _names_trash(match) or (_is_folder_path(found, "trash", target) and _holds_trash(found)):
             raise Denied(message("delete_guard.reason.trash_inside", path=match))
         _check_sendable(found)
-    if _glob_base(target) == target and os.path.isdir(resolved) and _holds_trash(resolved):
+    if _glob_base(target) == target and _is_folder_path(resolved, "trash", target) and _holds_trash(resolved):
         raise Denied(message("delete_guard.reason.trash_inside", path=resolved))
 
 
@@ -983,7 +1005,7 @@ def _find(words: list[str], cwd: str | None) -> None:
             if _deletes_from_names(command):
                 raise Denied(message("delete_guard.reason.xargs_rm"))
             # What find runs reads the standard input find was given, opened in the folder find runs in.
-            _check_chunk(command, None if predicate in {"-execdir", "-okdir"} else cwd, " ".join(command), trusted=False, redirect_cwd=cwd)
+            _check_chunk(command, None if predicate in {"-execdir", "-okdir"} else cwd, " ".join(command), trusted=False)
     if not deleting:
         return
     if parts.input_roots:
@@ -1116,6 +1138,9 @@ def _without_text_heredocs(text: str) -> str:
 def _check_script(raw: str, cwd: str | None, *, shell: bool) -> None:
     # A name with braces or wildcards stands for several files; each is read, since which of them is the script and which an
     # argument is not worth following.
+    # The words reach this check with their quotes removed, so a name that is a pattern may be a file with that very name
+    # (`'danger[1].sh'`); it is read as written as well.
+    _check_script_file(raw, cwd, shell=shell)
     if ("{" in raw and BRACE_PATTERN.search(raw)) or re.search(r"[*?\[]", raw):
         variants = expand_braces(raw)
         if variants is None:
@@ -1123,8 +1148,6 @@ def _check_script(raw: str, cwd: str | None, *, shell: bool) -> None:
         for variant in variants:
             for name in _glob_matches(variant, cwd, "script") or ([variant] if not re.search(r"[*?\[]", variant) else []):
                 _check_script_file(name, cwd, shell=shell)
-        return
-    _check_script_file(raw, cwd, shell=shell)
 
 
 def _check_script_file(raw: str, cwd: str | None, *, shell: bool) -> None:
@@ -1141,7 +1164,7 @@ def _check_script_file(raw: str, cwd: str | None, *, shell: bool) -> None:
         status = os.stat(resolved)
     except OSError:
         return
-    key = (resolved, status.st_size, status.st_mtime_ns, cwd)
+    key = (resolved, status.st_size, status.st_mtime_ns, cwd, tuple(_STDIN_FILES[0]))
     if _SCRIPT_CACHE.get(key):
         return
     if _is_reviewed_script(resolved, data):
@@ -1297,11 +1320,19 @@ def _wrapper_directories(values: list[str], start: str | None) -> str | None:
 
 
 # The result is the shell's folder after the command and whether this command was a directory change that is known.
-# The folder the redirections of a command are opened in is the folder of the shell that runs it, before any wrapper moves.
-SAME_FOLDER = object()
+# The files a command line opens are opened in the folder of its shell, before any wrapper moves: while one of its commands
+# is checked, the files of that line that have no folder yet are given the folder of the shell, so whatever the command runs
+# (a wrapper, find, xargs, `sh -c`, eval, a script) looks for them there.
+def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: bool = True) -> tuple[str | None, bool]:
+    held = _STDIN_FILES[0]
+    _STDIN_FILES[0] = [(name, cwd if folder is None else folder) for name, folder in held]
+    try:
+        return _check_one_chunk(words, cwd, command_text, trusted)
+    finally:
+        _STDIN_FILES[0] = held
 
 
-def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: bool = True, redirect_cwd: object = SAME_FOLDER) -> tuple[str | None, bool]:
+def _check_one_chunk(words: list[str], cwd: str | None, command_text: str, trusted: bool = True) -> tuple[str | None, bool]:
     try:
         stripped, directories = strip_wrappers_with_directory(words)
     except UnresolvableCommand:
@@ -1337,7 +1368,7 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
             return None, False
         return resolved, True
     if name in SHELLS:
-        _check_shell(words, cwd, shell_cwd if redirect_cwd is SAME_FOLDER else redirect_cwd)
+        _check_shell(words, cwd)
         return shell_cwd, False
     if name in {"source", "."} and len(words) > 1 and _REMOTE[0] is None:
         _check_script(words[1], cwd, shell=True)
@@ -1419,13 +1450,13 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
 # The files the command line opens for reading, for a shell on the line that reads its standard input. Which of them is the
 # input depends on descriptors and groups, so every one is read as a possible script; a data file that holds a delete can be
 # refused. A command run by xargs without an argument file gets /dev/null, so it has none.
-_STDIN_FILES: list[list[str]] = [[]]
+_STDIN_FILES: list[list[tuple[str, str | None]]] = [[]]
 
 
-def _line_input_files(command: str) -> list[str]:
+def _line_input_files(command: str) -> list[tuple[str, str | None]]:
     redirects: list[tuple[str, str, str]] = []
     normalize_command(command, redirects)
-    names: list[str] = []
+    names: list[tuple[str, str | None]] = []
     for _, operator, operand in redirects:
         if operator in STDIN_OPERATORS:
             try:
@@ -1433,12 +1464,12 @@ def _line_input_files(command: str) -> list[str]:
             except ValueError:
                 continue
             if words:
-                names.append(words[0])
+                names.append((words[0], None))
     return names
 
 
 # A shell runs a command string (-c), a script file (after its own options and their values), or what it reads on stdin.
-def _check_shell(words: list[str], cwd: str | None, redirect_cwd: str | None) -> None:
+def _check_shell(words: list[str], cwd: str | None) -> None:
     script = None
     reads_stdin = False
     index = 1
@@ -1447,7 +1478,8 @@ def _check_shell(words: list[str], cwd: str | None, redirect_cwd: str | None) ->
         if word == "--":
             script = words[index + 1] if index + 1 < len(words) else None
             break
-        if word in SHELL_VALUE_OPTIONS:
+        # An option with a value takes the next word as it; in a bundle (`-eo pipefail`) it is the last letter that does.
+        if word in SHELL_VALUE_OPTIONS or SHELL_BUNDLE_VALUE.fullmatch(word):
             index += 2
             continue
         if SHELL_COMMAND_CLUSTER.fullmatch(word):
@@ -1465,8 +1497,8 @@ def _check_shell(words: list[str], cwd: str | None, redirect_cwd: str | None) ->
     if script is not None and not reads_stdin:
         _check_script(script, cwd, shell=True)
     else:
-        for name in _STDIN_FILES[0]:
-            _check_script(name, redirect_cwd, shell=True)
+        for name, folder in _STDIN_FILES[0]:
+            _check_script(name, folder, shell=True)
 
 
 # Ignored files hold machine-local notes and archives, so a real `git clean` run is never automatic.
@@ -1518,12 +1550,13 @@ def _check_command(command: str, cwd: str | None) -> None:
     # A substitution can run from anywhere in the command, so its body is checked on its own, from an unknown
     # folder whenever the command also changes directory.
     substitution_cwd = None if re.search(r"\b(?:cd|pushd|popd)\b", command) else cwd
-    for body in command_substitutions(command):
-        if body.strip():
-            _check_command(body, substitution_cwd)
+    # A command line inside another (a substitution, `sh -c`, `eval`, a script) reads the input of the line around it as well.
     outer_files = _STDIN_FILES[0]
-    _STDIN_FILES[0] = _line_input_files(command)
+    _STDIN_FILES[0] = outer_files + _line_input_files(command)
     try:
+        for body in command_substitutions(command):
+            if body.strip():
+                _check_command(body, substitution_cwd)
         _check_chunks(command, cwd)
     finally:
         _STDIN_FILES[0] = outer_files
