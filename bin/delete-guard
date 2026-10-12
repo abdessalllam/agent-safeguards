@@ -17,6 +17,8 @@ import os
 import re
 import shlex
 import shutil
+import signal
+import stat
 import subprocess
 from typing import NamedTuple
 
@@ -24,6 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath
 
 from agent_safeguards.common import (  # noqa: E402
     GIT_VALUE_OPTIONS,
+    HEREDOC_FORBIDDEN,
     MAX_COMMAND_CHARS,
     REDIRECTION_MARKER,
     SHELL_KEYWORDS,
@@ -33,9 +36,11 @@ from agent_safeguards.common import (  # noqa: E402
     emit_decision,
     fail_open,
     find_executable,
+    heredocs,
     message,
     normalize_command,
     option_names,
+    split_options,
     strip_wrappers,
     strip_wrappers_with_directory,
 )
@@ -82,6 +87,7 @@ HOOK_EVENTS = frozenset({"PreToolUse", "PostToolUse", "SessionStart"})
 QUICK_SCAN = re.compile(
     r"\b(rm|rmtree|removedirs|rmSync|rmdirSync|remove_dir_all|rm_rf|find|xargs|trash|gio|diskutil|dd|mkfs|newfs|shred|srm|rsync|clean)\b"
     r"|\b(?:mkfs|newfs)[._]"
+    r"|\b(?:ktrash|kioclient)\d*\b|\b(?:hadoop|hdfs|osascript|powershell|pwsh|cmd\.exe)\b|(?i:clear-recyclebin)"
 )
 INLINE_RECURSIVE_DELETE = re.compile(r"rmtree|removedirs|rmSync|rmdirSync|remove_dir_all|rm_rf|rm\s+-[a-zA-Z]*[rR]")
 INTERPRETERS = frozenset({"python", "python3", "node", "perl", "ruby", "deno", "bun", "osascript", "swift"})
@@ -93,24 +99,82 @@ XARGS_VALUE_OPTIONS = frozenset(
     }
 )
 ERASE_TOOL = re.compile(r"(?:mkfs|newfs|shred|srm)(?:[._].*)?")
-TRASH_TOOLS = frozenset({"trash", "trash-put"})
+TRASH_TOOLS = frozenset({"trash", "trash-put", "gvfs-trash"})
+# A Trash holds what a user can still restore, so an agent may add to it but never empty it or delete inside it. These are the
+# folder names of the freedesktop, macOS, Windows, NAS and Android conventions, the freedesktop home Trash and the virtual
+# trash: location. The names that could also be an ordinary folder (RECYCLER, Recycled) are matched in that exact case.
+TRASH_FOLDER = re.compile(
+    r"(?i:\.Trash(?:es|-\d+)?|\$Recycle\.Bin|#recycle|@Recycle|files_trashbin)"
+    r"|RECYCLER|RECYCLED|Recycled|\.recycle|\.FilesByGoogleTrash|\.trashed-.+"
+)
+TRASH_HOME_FOLDER = re.compile(r"(?:^|/)\.local/share/Trash(?:/|$)")
+TRASH_URI = re.compile(r"(?i)trash:")
+TRASH_EMPTY_TOOL = re.compile(r"trash-(?:empty|rm)\d*")
+KDE_TRASH_TOOL = re.compile(r"ktrash\d*")
+KIO_TOOL = re.compile(r"kioclient\d*")
+KIO_REMOVE_VERBS = frozenset({"del", "delete", "remove", "rm"})
+HADOOP_PURGE_OPTIONS = frozenset({"-expunge", "-skipTrash"})
+# The macOS Finder, the Windows shell and PowerShell empty the Trash by name, and Windows keeps it in $Recycle.Bin.
+FINDER_EMPTY_TRASH = re.compile(r"(?i)\bempty\b[^\n]{0,40}\btrash\b|\bdelete\b[^\n]{0,80}\btrash\b")
+WINDOWS_SHELLS = frozenset({"powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe"})
+WINDOWS_EMPTY_BIN = re.compile(
+    r"(?i)clear-recyclebin|shemptyrecyclebin"
+    r"|(?:remove-item|\bri\b|\bdel\b|\berase\b|\brd\b|\brmdir\b|\brm\b)[^\n]*(?:\$recycle\.bin|\brecycler\b|\brecycled\b)"
+)
+# A remote path under these cannot be judged by its depth, so none of it is moved to the Trash.
+REMOTE_TRASH_SYSTEM_TREES = frozenset(
+    {"/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/proc", "/run", "/sbin", "/snap", "/sys", "/usr", "/System", "/Library", "/Applications"}
+)
+REMOTE_HOME_PARENTS = frozenset({"/home", "/Users"})
 # A delete on another machine cannot be resolved here, so it must be a literal path written from the home folder or the
 # root and strictly inside an allowed folder; the shell on the other side then has nothing left to expand.
 DEFAULT_REMOTE_ROOTS = ("~/ci", "/tmp")
 REMOTE_UNSAFE_PATH = re.compile(r"[$`\\*?\[\]{}!;&|<>()'\"\s\x00-\x1f]")
 REMOTE_COMMAND_NAMES = frozenset({"mosh", "ssh"})
 REMOTE_COMMAND_PATTERN = re.compile(r"ssh[_-].+")
-SSH_VALUE_OPTIONS = frozenset({"-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w"})
 # A script that checks what it is asked to delete before it runs the command says so, and its command strings are then
 # judged when they run, with every variable already expanded.
-VETTED_MARKER = "delete-guard check-remote"
+# The words must be on a line that runs, not in a comment, and either of the two commands counts.
+VETTED_PATTERN = re.compile(r"^(?![ \t]*#).*\bdelete-guard[\"']?[ \t]+(?:check-remote|remote-preflight)\b", re.MULTILINE)
+# The host stops a hook after about 5 seconds and lets the command through, so a check ends in a refusal sooner.
+HOOK_BUDGET_SECONDS = 3.0
 MAX_SCRIPT_BYTES = 256 * 1024
 MAX_SCRIPT_DEPTH = 3
 SYSTEM_PROGRAM_FOLDERS = ("/bin/", "/sbin/", "/usr/", "/opt/", "/Library/", "/System/", "/Applications/")
 # A command that starts a script, a shell on a file, ssh or a remote alias can delete without any delete word in its text.
+# Any path, any .sh name and any word that can start or wrap another command is enough to look closer.
 SCRIPT_HINT = re.compile(
-    r"(?:^|[;&|(\n])[ \t]*(?:(?:sudo|env|command|nohup|time)[ \t]+)*"
-    r"(?:\./|\.\./|~/|/(?!bin/|usr/|sbin/|opt/|Library/|System/|Applications/)|[\w.-]+\.sh\b|(?:source|\.|bash|sh|zsh|dash|fish|ssh|mosh|ssh[_-][\w-]+)[ \t])"
+    r"/|\.sh\b|(?:^|[\s;&|(])(?:source|\.|bash|sh|zsh|dash|ksh|fish|ssh|mosh|exec|env|timeout|sudo|nice|nohup|time|command|xargs|ssh[_-][\w-]+)(?=[\s;&|)]|$)"
+)
+# ssh and mosh read their options before the host and again after it; these are the letters and names that take a value.
+SSH_FLAG_LETTERS = frozenset("46AaCfGgKkMNnqsTtVvXxYy")
+SSH_VALUE_LETTERS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+MOSH_FLAG_LETTERS = frozenset("46an")
+MOSH_VALUE_LETTERS = frozenset("p")
+MOSH_LONG_FLAGS = frozenset({"--help", "--local", "--no-init", "--no-ssh-pty", "--predict-overwrite", "--verbose", "--version"})
+MOSH_LONG_VALUES = frozenset({"--bind-server", "--client", "--experimental-remote-ip", "--family", "--port", "--predict", "--server", "--ssh"})
+# Shells take a value after these options, so the next word is not the script.
+SHELL_VALUE_OPTIONS = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
+SHELL_COMMAND_CLUSTER = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
+SHELL_STDIN_CLUSTER = re.compile(r"-[A-Za-z]*s[A-Za-z]*")
+STDIN_SCRIPT = re.compile(r"(?:^|[\s;&|(])(?:ba|z|da|k|fi)?sh(?:ell)?\b[^;&|\n<]*<(?!<)[ \t]*([^\s;&|()<>'\"]+)")
+# A tilde that is quoted or escaped is not a home folder, so what follows it is a relative path.
+QUOTED_TILDE = re.compile(r"(?:^|[\s;&|(])(?:['\"]+|\\)~")
+# `f() {`, `f(){`, `f ( ) {` and `function f {` only define what follows.
+FUNCTION_HEADER = re.compile(r"(?:function[ \t]+)?[A-Za-z_][\w.:-]*[ \t]*(?:\([ \t]*\)[ \t]*)?\{?")
+# Text that a quoted here-document of cat only prints is not a list of commands.
+TEXT_HEREDOC_OWNER = re.compile(r"[ \t]*cat\b[^|;&<(`$\"'\\\n]*")
+TEXT_HEREDOC_TAIL = re.compile(r"[|`]|\$\(|[<>]\(")
+RSYNC_VALUE_LETTERS = frozenset("efBTM@")
+RSYNC_VALUE_OPTIONS = frozenset(
+    {
+        "--address", "--backup-dir", "--block-size", "--bwlimit", "--cc", "--checksum-choice", "--checksum-seed", "--chmod", "--chown",
+        "--compare-dest", "--contimeout", "--copy-as", "--copy-dest", "--debug", "--early-input", "--exclude", "--exclude-from", "--files-from",
+        "--filter", "--groupmap", "--iconv", "--include", "--include-from", "--info", "--link-dest", "--log-file", "--log-file-format",
+        "--max-alloc", "--max-size", "--min-size", "--modify-window", "--only-write-batch", "--out-format", "--outbuf", "--partial-dir",
+        "--password-file", "--port", "--protocol", "--read-batch", "--remote-option", "--rsh", "--rsync-path", "--sockopts", "--stop-after",
+        "--stop-at", "--suffix", "--temp-dir", "--timeout", "--usermap", "--write-batch",
+    }
 )
 SHELL_SHEBANG = re.compile(r"#!\s*\S*(?:/env\s+)?(?:ba|z|da|k)?sh\b")
 DISKUTIL_ERASE = re.compile(r"(?i)^(erase|zero|secureerase|partitiondisk|reformat|deletevolume|deletecontainer|apfs)")
@@ -125,9 +189,34 @@ class RemoteDenied(Denied):
     pass
 
 
+class CheckTooSlow(BaseException):
+    """Raised by the budget alarm; it is not an Exception, so no handler inside a check can swallow it."""
+
+
+def _on_budget_alarm(signal_number: int, frame: object) -> None:
+    raise CheckTooSlow
+
+
+def _run_with_budget(check) -> None:
+    if not hasattr(signal, "setitimer"):
+        check()
+        return
+    previous = signal.signal(signal.SIGALRM, _on_budget_alarm)
+    signal.setitimer(signal.ITIMER_REAL, HOOK_BUDGET_SECONDS)
+    try:
+        check()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 # Set to the allowed folders while a command meant for another machine is checked, and to None otherwise.
 _REMOTE: list[tuple[str, ...] | None] = [None]
 _SCRIPT_STACK: list[str] = []
+# Permanent delete targets of a remote command that passed the lexical rule, for the machine to check physically.
+_REMOTE_TARGETS: list[str] = []
+# Scripts already read in this run and found clean, by path, size, modification time and folder.
+_SCRIPT_CACHE: dict[tuple, bool] = {}
 
 
 def _remote_roots() -> tuple[str, ...]:
@@ -161,15 +250,13 @@ class Chunk(NamedTuple):
 
 # `name() {`, `name () {` and `function name {` only define what follows; the command inside is what the guard must see.
 def _function_header_length(words: list[str]) -> int:
-    if words[:1] == ["function"] and len(words) > 1:
-        length = 3 if words[2:3] == ["()"] else 2
-    elif len(words) > 1 and words[1] == "()":
-        length = 2
-    elif words and re.fullmatch(r"[A-Za-z_][\w.:-]*\(\)", words[0]):
-        length = 1
-    else:
-        return 0
-    while words[length : length + 1] == ["{"]:
+    text = ""
+    length = 0
+    for count, word in enumerate(words[:6], 1):
+        text = text + " " + word if text else word
+        if FUNCTION_HEADER.fullmatch(text) and ("(" in text or text.startswith("function")):
+            length = count
+    while length and words[length : length + 1] == ["{"]:
         length += 1
     return length
 
@@ -264,6 +351,52 @@ def _protected(path: str) -> bool:
     return os.path.dirname(path) in MOUNT_PARENTS
 
 
+def _names_trash(path: str) -> bool:
+    path = path.replace("\\", "/")
+    return TRASH_URI.match(path) is not None or any(TRASH_FOLDER.fullmatch(part) for part in path.split("/")) or TRASH_HOME_FOLDER.search(path) is not None
+
+
+# The home Trash folders of this user, which also covers a data folder moved with XDG_DATA_HOME.
+def _trash_roots() -> tuple[str, ...]:
+    roots = [os.path.join(USER_HOME, ".Trash"), os.path.join(USER_HOME, ".local", "share", "Trash")]
+    data_home = os.environ.get("XDG_DATA_HOME", "")
+    if data_home.startswith("/"):
+        roots.append(os.path.join(os.path.normpath(data_home), "Trash"))
+    return tuple(roots)
+
+
+def _in_trash(path: str) -> bool:
+    return _names_trash(path) or _inside(path, "/boot/trash") or any(_inside(path, root) for root in _trash_roots())
+
+
+# The literal form of a path written for another machine, or None when the shell over there could read it differently.
+def _remote_literal(raw: str) -> str | None:
+    path = raw if raw == "/" else raw.rstrip("/")
+    anchored = path.startswith("~/") or path.startswith("/")
+    components = path.split("/")[1:] if anchored else []
+    if not anchored or REMOTE_UNSAFE_PATH.search(path) or not components or any(part in {"", ".", ".."} for part in components):
+        return None
+    return path
+
+
+# Sending a file to a remote Trash can be undone, so it needs no allowed folder, but the home folder, what sits directly in
+# it and the system folders stay out of reach just as they do on this machine.
+def _remote_trash_protected(path: str) -> bool:
+    parts = path.strip("/").split("/")
+    if path.startswith("~/"):
+        return len(parts) < 3
+    top = "/" + parts[0]
+    if top in REMOTE_TRASH_SYSTEM_TREES:
+        return True
+    if top in REMOTE_HOME_PARENTS:
+        return len(parts) < 4
+    if top == "/root":
+        return len(parts) < 3
+    if top in SYSTEM_ROOTS:
+        return len(parts) < 3
+    return len(parts) < 2
+
+
 # The answer is cached because one command can name hundreds of targets that all resolve against the same folder.
 @functools.lru_cache(maxsize=32)
 def _repository_root(cwd: str | None) -> str | None:
@@ -287,21 +420,23 @@ def _repository_root(cwd: str | None) -> str | None:
 
 
 def _check_remote_target(raw: str, verb: str) -> None:
-    path = raw if raw == "/" else raw.rstrip("/")
-    anchored = path.startswith("~/") or path.startswith("/")
-    components = path.split("/")[1:] if anchored else []
-    refused = (
-        not anchored
-        or REMOTE_UNSAFE_PATH.search(path) is not None
-        or not components
-        or any(part in {"", ".", ".."} for part in components)
-        or not any(path.startswith(root + "/") for root in _REMOTE[0] or ())
-    )
-    if refused:
+    path = _remote_literal(raw)
+    if path is None or not any(path.startswith(root + "/") for root in _REMOTE[0] or ()):
         raise RemoteDenied(message("delete_guard.reason.remote_target", verb=verb, raw=raw))
+    _REMOTE_TARGETS.append(path)
+
+
+def _check_remote_trash_target(raw: str) -> None:
+    path = _remote_literal(raw)
+    if path is None or _remote_trash_protected(path):
+        raise RemoteDenied(message("delete_guard.reason.remote_trash", raw=raw))
+    if _names_trash(path):
+        raise RemoteDenied(message("delete_guard.reason.trash_inside", path=raw))
 
 
 def _check_target(raw: str, cwd: str | None, *, recursive: bool, verb: str) -> None:
+    if _names_trash(raw):
+        raise Denied(message("delete_guard.reason.trash_purge", verb=verb, path=raw))
     if _REMOTE[0] is not None:
         _check_remote_target(raw, verb)
         return
@@ -320,6 +455,8 @@ def _check_target(raw: str, cwd: str | None, *, recursive: bool, verb: str) -> N
     resolved = _expand(base, cwd)
     if resolved is None:
         raise Denied(message("delete_guard.reason.unresolvable", verb=verb, raw=raw))
+    if _in_trash(resolved):
+        raise Denied(message("delete_guard.reason.trash_purge", verb=verb, path=resolved))
     # A glob under a temp root is cleanup of scratch folders only when a literal name comes before the first wildcard.
     if base != raw and resolved in TEMP_ROOTS:
         first_component = raw[len(base) :].lstrip("/").split("/")[0]
@@ -354,27 +491,63 @@ def _rm(words: list[str], cwd: str | None) -> None:
         else:
             targets.append(word)
     for target in targets:
-        _check_target(target, cwd, recursive=recursive, verb="rm -r" if recursive else "rm")
+        _check_target(target, cwd, recursive=recursive, verb=_base(words[0]) + (" -r" if recursive else ""))
 
 
+# Moving a file to the Trash can be undone, so it is allowed wherever the folder is not protected. Emptying the Trash cannot,
+# so -e and -s (macOS), --empty and --secure are refused; the options that take a folder or only change the output are not.
 def _trash(words: list[str], cwd: str | None) -> None:
-    for target in (word for word in words[1:] if not word.startswith("-")):
-        if _REMOTE[0] is not None:
-            _check_remote_target(target, "trash")
+    targets: list[str] = []
+    options_done = False
+    for word in words[1:]:
+        if not options_done and word == "--":
+            options_done = True
+        elif not options_done and word.startswith("--") and word.split("=", 1)[0] in {"--empty", "--secure"}:
+            raise Denied(message("delete_guard.reason.trash_empty", name=_base(words[0])))
+        elif not options_done and word.startswith("-") and len(word) > 1:
+            if not word.startswith("--") and set(word[1:]) & {"e", "s"}:
+                raise Denied(message("delete_guard.reason.trash_empty", name=_base(words[0])))
+        else:
+            targets.append(word)
+    for target in targets:
+        if TRASH_URI.match(target):
             continue
+        if _REMOTE[0] is not None:
+            _check_remote_trash_target(target)
+            continue
+        if _names_trash(target):
+            raise Denied(message("delete_guard.reason.trash_inside", path=target))
         if _is_computed(target):
             continue
         resolved = _expand(_glob_base(target), cwd)
-        if resolved is not None and _protected(resolved):
+        if resolved is None:
+            continue
+        if _in_trash(resolved) or any(_inside(root, resolved) for root in _trash_roots()):
+            raise Denied(message("delete_guard.reason.trash_inside", path=resolved))
+        if _protected(resolved):
             raise Denied(message("delete_guard.reason.trash_protected", path=resolved))
+
+
+# `gio trash` can be undone; `gio remove` deletes for good, so each of its operands is held to the delete rules.
+def _gio(words: list[str], cwd: str | None) -> None:
+    verb = words[1] if len(words) > 1 else ""
+    if verb == "trash":
+        _trash(words[1:], cwd)
+    elif verb in {"remove", "rm"}:
+        for operand in split_options(words[2:], "", frozenset()):
+            _check_target(operand, cwd, recursive=False, verb="gio remove")
 
 
 def _find(words: list[str], cwd: str | None) -> None:
     deleting = "-delete" in words
+    executions: list[list[str]] = []
     for index, word in enumerate(words):
         if word in {"-exec", "-execdir", "-ok", "-okdir"} and index + 1 < len(words):
-            if _base(words[index + 1]) in {"rm", "trash", "trash-put", "unlink", "rmdir", "shred", "srm"}:
+            end = next((position for position in range(index + 1, len(words)) if words[position] in {";", "\\;", "+"}), len(words))
+            command = words[index + 1 : end]
+            if command and (_base(command[0]) in TRASH_TOOLS or _base(command[0]) in {"rm", "unlink", "rmdir", "shred", "srm"}):
                 deleting = True
+                executions.append(command)
     if not deleting:
         return
     starts: list[str] = []
@@ -386,6 +559,13 @@ def _find(words: list[str], cwd: str | None) -> None:
         starts.append(word)
     for start in starts or ["."]:
         _check_target(start, cwd, recursive=True, verb="find -delete")
+    # The command that find runs deletes what it is given besides the matches, so those operands are targets too.
+    for command in executions:
+        operands = [command[0]] + [word for word in command[1:] if word != "{}"]
+        if _base(command[0]) in TRASH_TOOLS:
+            _trash(operands, cwd)
+        elif _base(command[0]) in {"rm", "unlink", "rmdir"}:
+            _rm(operands, cwd)
 
 
 def _xargs(words: list[str]) -> None:
@@ -399,91 +579,188 @@ def _xargs(words: list[str]) -> None:
         raise Denied(message("delete_guard.reason.xargs_rm"))
 
 
-def _is_reviewed_script(path: str) -> bool:
+# A script is reviewed when its bytes are exactly those of the file in the last commit. The index is not asked, because
+# its change flags (assume-unchanged, skip-worktree) can say "unchanged" for a file that was edited.
+def _is_reviewed_script(path: str, data: bytes) -> bool:
     root = _repository_root(os.path.dirname(path))
     if root is None or GIT_PATH is None or not _inside(path, root):
         return False
-    relative = os.path.relpath(path, root)
-    environment = {"PATH": "/usr/bin:/bin", "HOME": USER_HOME, "LC_ALL": "C"}
     try:
-        tracked = subprocess.run(
-            [GIT_PATH, "-C", root, "ls-files", "--error-unmatch", "--", relative],
-            stdin=subprocess.DEVNULL, capture_output=True, timeout=3, check=False, env=environment,
-        ).returncode == 0
-        return tracked and subprocess.run(
-            [GIT_PATH, "-C", root, "diff", "--quiet", "HEAD", "--", relative],
-            stdin=subprocess.DEVNULL, capture_output=True, timeout=3, check=False, env=environment,
-        ).returncode == 0
+        committed = subprocess.run(
+            [GIT_PATH, "-C", root, "cat-file", "blob", "HEAD:" + os.path.relpath(path, root)],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=3, check=False, env={"PATH": "/usr/bin:/bin", "HOME": USER_HOME, "LC_ALL": "C"},
+        )
     except (OSError, subprocess.TimeoutExpired):
         return False
+    return committed.returncode == 0 and committed.stdout == data
+
+
+# Startup files hold keys and aliases and are never read or shown, so a denial message cannot quote one.
+def _script_excluded(path: str) -> bool:
+    return (os.path.dirname(path) == USER_HOME and os.path.basename(path).startswith(".")) or _inside(path, "/etc")
+
+
+# Opening without waiting means a pipe or a device can never stall the check, and the descriptor is what is examined.
+def _read_regular_file(path: str, limit: int) -> bytes | None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining > 0:
+            data = os.read(descriptor, min(remaining, 65536))
+            if not data:
+                break
+            chunks.append(data)
+            remaining -= len(data)
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+# The body of a quoted here-document that cat only prints is text, not commands.
+def _without_text_heredocs(text: str) -> str:
+    pieces: list[str] = []
+    position = 0
+    for document in heredocs(text):
+        if document.outer is not None or not document.quoted or document.body_start < position:
+            continue
+        head = re.split(r"&&|\|\||;|\||&", text[document.line_start : document.marker_start])[-1]
+        if TEXT_HEREDOC_OWNER.fullmatch(head) and not TEXT_HEREDOC_TAIL.search(text[document.delimiter_end : document.line_end]):
+            pieces.append(text[position : document.body_start])
+            position = document.end
+    pieces.append(text[position:])
+    stripped = "".join(pieces)
+    return text if HEREDOC_FORBIDDEN.search(stripped) else stripped
 
 
 # A script nobody has reviewed (not tracked, or changed since the last commit) is read before it runs and its deletes are
 # held to the same rules as a typed command, because its variables and loops hide what a quick look at the command cannot.
 def _check_script(raw: str, cwd: str | None, *, shell: bool) -> None:
     resolved = _expand(raw, cwd)
-    if resolved is None or resolved in _SCRIPT_STACK or len(_SCRIPT_STACK) >= MAX_SCRIPT_DEPTH:
+    if resolved is None or resolved in _SCRIPT_STACK or len(_SCRIPT_STACK) >= MAX_SCRIPT_DEPTH or _script_excluded(resolved):
         return
-    # Startup files hold keys and aliases and are never shown, so a denial message must not be able to quote one.
-    if (os.path.dirname(resolved) == USER_HOME and os.path.basename(resolved).startswith(".")) or _inside(resolved, "/etc"):
+    data = _read_regular_file(resolved, MAX_SCRIPT_BYTES)
+    if data is None or len(data) > MAX_SCRIPT_BYTES or b"\x00" in data[:1024]:
+        return
+    text = data.decode("utf-8", errors="replace")
+    if not (shell or SHELL_SHEBANG.match(text)):
         return
     try:
-        if not os.path.isfile(resolved) or os.path.getsize(resolved) > MAX_SCRIPT_BYTES:
-            return
-        with open(resolved, encoding="utf-8", errors="replace") as handle:
-            text = handle.read()
+        status = os.stat(resolved)
     except OSError:
         return
-    if "\x00" in text[:1024] or not (shell or SHELL_SHEBANG.match(text)) or _is_reviewed_script(resolved):
+    key = (resolved, status.st_size, status.st_mtime_ns, cwd)
+    if _SCRIPT_CACHE.get(key):
+        return
+    if _is_reviewed_script(resolved, data):
+        _SCRIPT_CACHE[key] = True
         return
     _SCRIPT_STACK.append(resolved)
     try:
-        _check_command(text, cwd)
+        _check_command(_without_text_heredocs(text), cwd)
     except Denied as denial:
         raise type(denial)(message("delete_guard.reason.in_script", script=resolved, reason=str(denial))) from None
     finally:
         _SCRIPT_STACK.pop()
+    _SCRIPT_CACHE[key] = True
 
 
 def _search_path(name: str) -> str | None:
-    return shutil.which(name, path=os.pathsep.join((os.environ.get("PATH", ""), os.path.join(USER_HOME, ".local", "bin"))))
+    found = shutil.which(name, path=os.pathsep.join((os.environ.get("PATH", ""), os.path.join(USER_HOME, ".local", "bin"))))
+    return os.path.realpath(found) if found else None
 
 
 @functools.lru_cache(maxsize=32)
 def _vets_deletes(path: str | None) -> bool:
-    if path is None:
+    if path is None or _script_excluded(path):
         return False
-    try:
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            return VETTED_MARKER in handle.read(65536)
-    except OSError:
-        return False
+    data = _read_regular_file(path, 65536)
+    return data is not None and VETTED_PATTERN.search(data[:65536].decode("utf-8", errors="replace")) is not None
 
 
-def _remote_command_text(name: str, words: list[str]) -> str:
+# ssh and mosh take options before the host and again after it; an option this reader does not know ends in a refusal,
+# because guessing where the host is could hide the command that follows it.
+def _remote_command_words(name: str, words: list[str]) -> list[str]:
     rest = words[1:]
-    if name in REMOTE_COMMAND_NAMES:
-        while rest and rest[0].startswith("-"):
-            rest = rest[2:] if rest[0] in SSH_VALUE_OPTIONS else rest[1:]
-        rest = rest[1:]
-    return " ".join(rest)
+    if name not in REMOTE_COMMAND_NAMES:
+        return rest
+    mosh = name == "mosh"
+    flags = MOSH_FLAG_LETTERS if mosh else SSH_FLAG_LETTERS
+    values = MOSH_VALUE_LETTERS if mosh else SSH_VALUE_LETTERS
+    host = False
+    index = 0
+    while index < len(rest):
+        word = rest[index]
+        if word == "--":
+            index += 1
+            if not host and index < len(rest):
+                index += 1
+            return rest[index:]
+        if mosh and word.startswith("--"):
+            option = word.split("=", 1)[0]
+            if option in MOSH_LONG_VALUES:
+                index += 1 if "=" in word else 2
+            elif option in MOSH_LONG_FLAGS:
+                index += 1
+            else:
+                raise Denied(message("delete_guard.reason.unparseable"))
+        elif word.startswith("-") and len(word) > 1:
+            takes_next = False
+            for position in range(1, len(word)):
+                if word[position] in values:
+                    takes_next = position + 1 >= len(word)
+                    break
+                if word[position] not in flags:
+                    raise Denied(message("delete_guard.reason.unparseable"))
+            index += 2 if takes_next else 1
+        elif not host:
+            host = True
+            index += 1
+        else:
+            return rest[index:]
+    return []
 
 
 def _check_remote_command(text: str) -> None:
     previous = _REMOTE[0]
     _REMOTE[0] = _remote_roots()
     try:
+        # The words a shell hands on have lost their quotes by now, but a quoted or escaped tilde is not expanded on the
+        # other side, so it stands for a folder named ~ and not for the home folder.
+        if QUICK_SCAN.search(text) and QUOTED_TILDE.search(text):
+            raise RemoteDenied(message("delete_guard.reason.remote_target", verb="delete", raw="a quoted or escaped ~"))
         _check_command(text, None)
     finally:
         _REMOTE[0] = previous
 
 
+def _check_rsync_operand(operand: str, cwd: str | None, verb: str) -> None:
+    if re.match(r"[^/\s]+:", operand):
+        raise Denied(message("delete_guard.reason.rsync_remote"))
+    _check_target(operand, cwd, recursive=True, verb=verb)
+
+
+# --delete removes from the destination and --remove-source-files from the sources, so each is held to the target rules.
 def _rsync(words: list[str], cwd: str | None) -> None:
-    if not any(word.startswith("--delete") or word == "--remove-source-files" for word in words):
+    deleting = any(word.startswith("--delete") for word in words)
+    removing = "--remove-source-files" in words
+    if not (deleting or removing):
         return
-    operands = [word for word in words[1:] if not word.startswith("-")]
-    if operands:
-        _check_target(operands[-1], cwd, recursive=True, verb="rsync --delete")
+    operands = split_options(words[1:], RSYNC_VALUE_LETTERS, RSYNC_VALUE_OPTIONS)
+    if not operands:
+        return
+    if deleting:
+        _check_rsync_operand(operands[-1], cwd, "rsync --delete")
+    if removing:
+        for source in operands[:-1]:
+            _check_rsync_operand(source, cwd, "rsync --remove-source-files")
 
 
 # The result is the shell's folder after the command and whether this command was a directory change that is known.
@@ -491,7 +768,10 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
     try:
         stripped, moved = strip_wrappers_with_directory(words)
     except UnresolvableCommand:
-        raise Denied(message("delete_guard.reason.unparseable"))
+        # A command with no delete word in it was never looked at before, so an odd wrapper there is not a reason to refuse.
+        if QUICK_SCAN.search(command_text):
+            raise Denied(message("delete_guard.reason.unparseable"))
+        return cwd, False
     if not stripped:
         return cwd, False
     wrapped = len(stripped) != len(words)
@@ -520,22 +800,18 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
             return None, False
         return resolved, True
     if name in SHELLS:
-        for index, word in enumerate(words[:-1]):
-            if word in {"-c", "-lc", "-ic"}:
-                _check_command(words[index + 1], cwd)
-                break
-        else:
-            operands = [word for word in words[1:] if not word.startswith("-")]
-            if operands and _REMOTE[0] is None:
-                _check_script(operands[0], shell_cwd, shell=True)
+        _check_shell(words, shell_cwd, cwd, command_text)
         return shell_cwd, False
     if name in {"source", "."} and len(words) > 1 and _REMOTE[0] is None:
         _check_script(words[1], shell_cwd, shell=True)
         return shell_cwd, False
-    wrapper = (words[0] if "/" in words[0] else _search_path(words[0])) if name.endswith(".sh") else None
+    # A wrapper is the file the shell would run, so a relative name is resolved against the folder the command runs in.
+    wrapper = None
+    if name.endswith(".sh"):
+        wrapper = _expand(words[0], shell_cwd) if "/" in words[0] else _search_path(words[0])
     vetted = _vets_deletes(wrapper)
     if name in REMOTE_COMMAND_NAMES or REMOTE_COMMAND_PATTERN.fullmatch(name) or name in _configured_remote_names() or vetted:
-        text = _remote_command_text(name, words)
+        text = " ".join(_remote_command_words(name, words))
         # A vetted wrapper judges the expanded text itself when it runs, so a variable here is left to it.
         if text and not (vetted and re.search(r"[$`]", text)):
             _check_remote_command(text)
@@ -543,14 +819,33 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
     if name == "eval":
         _check_command(" ".join(words[1:]), cwd)
         return shell_cwd, False
+    heredoc = command_text.split("<<", 1)[1] if "<<" in command_text else ""
     if name.rstrip("0123456789.") in INTERPRETERS:
-        heredoc = command_text.split("<<", 1)[1] if "<<" in command_text else ""
         if INLINE_RECURSIVE_DELETE.search(" ".join(words[1:])) or INLINE_RECURSIVE_DELETE.search(heredoc):
             raise Denied(message("delete_guard.reason.inline_delete"))
-    if name == "rm":
+        if name == "osascript" and FINDER_EMPTY_TRASH.search(" ".join(words[1:]) + "\n" + heredoc):
+            raise Denied(message("delete_guard.reason.trash_empty", name=name))
+    if name in {"rm", "unlink", "rmdir"}:
         _rm(words, cwd)
     elif name in TRASH_TOOLS:
         _trash(words, cwd)
+    elif TRASH_EMPTY_TOOL.fullmatch(name):
+        raise Denied(message("delete_guard.reason.trash_empty", name=name))
+    elif KDE_TRASH_TOOL.fullmatch(name):
+        if any(word.split("=", 1)[0] == "--empty" for word in words[1:]):
+            raise Denied(message("delete_guard.reason.trash_empty", name=name))
+    elif name == "gvfs-rm":
+        for operand in split_options(words[1:], "", frozenset()):
+            _check_target(operand, cwd, recursive=False, verb="gvfs-rm")
+    elif KIO_TOOL.fullmatch(name):
+        if words[1:2] and words[1] in KIO_REMOVE_VERBS:
+            for operand in split_options(words[2:], "", frozenset()):
+                _check_target(operand, cwd, recursive=True, verb="kioclient " + words[1])
+    elif name in {"hadoop", "hdfs"}:
+        if HADOOP_PURGE_OPTIONS & set(words[1:]):
+            raise Denied(message("delete_guard.reason.trash_empty", name=name))
+    elif name.lower() == "clear-recyclebin" or (name.lower() in WINDOWS_SHELLS and WINDOWS_EMPTY_BIN.search(" ".join(words[1:]) + "\n" + heredoc)):
+        raise Denied(message("delete_guard.reason.trash_empty", name=name))
     elif name == "find":
         _find(words, cwd)
     elif name == "xargs":
@@ -569,13 +864,47 @@ def _check_chunk(words: list[str], cwd: str | None, command_text: str, trusted: 
                 resolved = _expand(word[3:], cwd)
                 if resolved is None or _inside(resolved, "/dev"):
                     raise Denied(message("delete_guard.reason.dd_device"))
-    elif name == "gio" and words[1:2] in (["trash"], ["remove"]):
-        _trash(words[1:], cwd)
+    elif name == "gio":
+        _gio(words, cwd)
     elif name == "git":
         _git_clean(words)
-    elif _REMOTE[0] is None and (words[0].startswith(("./", "../", "~/")) or (os.path.isabs(words[0]) and not words[0].startswith(SYSTEM_PROGRAM_FOLDERS)) or (wrapper and "/" not in words[0])):
-        _check_script(words[0] if "/" in words[0] else wrapper, shell_cwd, shell=False)
+    elif _REMOTE[0] is None and "/" in words[0] and not (os.path.isabs(words[0]) and words[0].startswith(SYSTEM_PROGRAM_FOLDERS)):
+        _check_script(words[0], shell_cwd, shell=False)
+    elif _REMOTE[0] is None and wrapper:
+        _check_script(wrapper, shell_cwd, shell=False)
     return shell_cwd, False
+
+
+# A shell runs a command string (-c), a script file (after its own options and their values), or what it reads on stdin.
+def _check_shell(words: list[str], shell_cwd: str | None, cwd: str | None, command_text: str) -> None:
+    script = None
+    reads_stdin = False
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word == "--":
+            script = words[index + 1] if index + 1 < len(words) else None
+            break
+        if word in SHELL_VALUE_OPTIONS:
+            index += 2
+            continue
+        if SHELL_COMMAND_CLUSTER.fullmatch(word):
+            if index + 1 < len(words):
+                _check_command(words[index + 1], cwd)
+            return
+        if SHELL_STDIN_CLUSTER.fullmatch(word):
+            reads_stdin = True
+        elif not (word.startswith(("-", "+")) and len(word) > 1):
+            script = word
+            break
+        index += 1
+    if _REMOTE[0] is not None:
+        return
+    if script is not None and not reads_stdin:
+        _check_script(script, shell_cwd, shell=True)
+    else:
+        for match in STDIN_SCRIPT.finditer(command_text):
+            _check_script(match.group(1), shell_cwd, shell=True)
 
 
 # Ignored files hold machine-local notes and archives, so a real `git clean` run is never automatic.
@@ -616,11 +945,14 @@ def _configured_remote_names() -> frozenset[str]:
 
 
 def _check_command(command: str, cwd: str | None) -> None:
+    delete_words = QUICK_SCAN.search(command) is not None
     configured = any(re.search(r"(?:^|[\s;&|(])" + re.escape(name) + r"(?:\s|$)", command) for name in _configured_remote_names())
-    if not (QUICK_SCAN.search(command) or SCRIPT_HINT.search(command) or configured):
+    if not (delete_words or SCRIPT_HINT.search(command) or configured):
         return
     if len(command) > MAX_COMMAND_CHARS:
-        raise Denied(message("delete_guard.reason.too_large"))
+        if delete_words:
+            raise Denied(message("delete_guard.reason.too_large"))
+        return
     # A substitution can run from anywhere in the command, so its body is checked on its own, from an unknown
     # folder whenever the command also changes directory.
     substitution_cwd = None if re.search(r"\b(?:cd|pushd|popd)\b", command) else cwd
@@ -681,9 +1013,12 @@ def _run_hook() -> int:
     if isinstance(workdir, str) and workdir:
         cwd = workdir if os.path.isabs(workdir) or cwd is None else os.path.join(cwd, workdir)
     try:
-        _check_command(command, cwd)
+        _run_with_budget(lambda: _check_command(command, cwd))
     except Denied as denial:
         _emit_deny(denial)
+    except CheckTooSlow:
+        if not fail_open():
+            emit_decision("deny", message("delete_guard.deny_too_slow"))
     except Exception:
         if not fail_open():
             emit_decision("deny", message("delete_guard.deny_internal"))
@@ -692,14 +1027,42 @@ def _run_hook() -> int:
 
 def _check_remote_cli(command: str) -> int:
     try:
-        _check_remote_command(command)
+        _run_with_budget(lambda: _check_remote_command(command))
     except Denied as denial:
         sys.stderr.write(message("delete_guard.deny_remote", reason=str(denial), roots=", ".join(_remote_roots())) + "\n")
+        return 1
+    except CheckTooSlow:
+        sys.stderr.write(message("delete_guard.deny_too_slow") + "\n")
         return 1
     except Exception:
         sys.stderr.write(message("delete_guard.deny_internal") + "\n")
         return 1
     return 0
+
+
+# A lexical rule cannot see a link inside an allowed folder that leads out of it, so the machine itself resolves each
+# permanent delete target (its folder, so that deleting a link itself stays possible) and must find it inside a root.
+def _remote_preflight_script() -> str:
+    targets = list(dict.fromkeys(_REMOTE_TARGETS))
+    roots = _remote_roots()
+    if not targets or not roots:
+        return ""
+    return (
+        "fail=0; for t in " + " ".join(targets) + "; do d=$(dirname -- \"$t\"); b=$(basename -- \"$t\"); [ -d \"$d\" ] || continue; "
+        "r=$(cd -P -- \"$d\" && pwd)/$b; ok=0; for root in " + " ".join(roots) + "; do "
+        "rr=$(cd -P -- \"$root\" 2>/dev/null && pwd) || continue; case \"$r\" in \"$rr\"/*) ok=1;; esac; done; "
+        "[ \"$ok\" = 1 ] || { echo \"PREFLIGHT_REFUSED $t\"; fail=1; }; done; [ \"$fail\" = 0 ] && echo PREFLIGHT_OK"
+    )
+
+
+def _remote_preflight_cli(command: str) -> int:
+    _REMOTE_TARGETS.clear()
+    code = _check_remote_cli(command)
+    if code == 0:
+        script = _remote_preflight_script()
+        if script:
+            sys.stdout.write(script + "\n")
+    return code
 
 
 def _self_test() -> int:
@@ -729,6 +1092,11 @@ def _self_test() -> int:
         "rsync -a --delete src/ ~/Documents/",
         "git clean -fdx",
         "git -C /tmp/r clean -fd",
+        "trash-empty",
+        "gio trash --empty",
+        "rm -rf ~/.Trash/old",
+        "rm ~/.local/share/Trash/files/old",
+        "trash ~/.local/share/Trash/files/old",
     ]
     allowed = [
         "rm -rf /private/tmp/agent-probe",
@@ -737,6 +1105,8 @@ def _self_test() -> int:
         "rm -f /tmp/x.log",
         "rmdir empty-dir",
         "trash /private/tmp/old",
+        "trash-put /private/tmp/old",
+        "gio trash /private/tmp/old",
         "git rm -r --cached x",
         "git worktree remove .worktrees/old",
         "find /tmp/x -name '*.log' -delete",
@@ -773,6 +1143,8 @@ def main() -> int:
     arguments = sys.argv[1:]
     if arguments[:1] == ["check-remote"] and len(arguments) == 2:
         return _check_remote_cli(arguments[1])
+    if arguments[:1] == ["remote-preflight"] and len(arguments) == 2:
+        return _remote_preflight_cli(arguments[1])
     if arguments[:1] == ["hook"] and 2 <= len(arguments) <= 3 and arguments[1] in {"claude", "codex"}:
         if len(arguments) == 2 or arguments[2] in HOOK_EVENTS:
             return _run_hook()

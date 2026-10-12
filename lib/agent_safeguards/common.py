@@ -47,6 +47,9 @@ REDIRECTION_SUFFIX = "&|-"
 REDIRECTION_MARKER = "\x1f"
 OPENING_QUOTE_MARKER = "\x01"
 MAX_HEREDOCS = 16
+# Constructs where a scan and a shell can disagree about what is a here-document, or that open a group, so a command
+# that has one outside its here-documents keeps the ordinary line-by-line checks.
+HEREDOC_FORBIDDEN = re.compile(r"\$['\"\[]|\$\(\(|\$\{(?![A-Za-z_][A-Za-z0-9_]*\})|`|<\(|>\(|\(\(|\[\[|\(\)")
 MAX_HEREDOC_NESTING = 8
 HEREDOC_DELIMITER_END = " \t\n;&|()<>"
 MAX_SPLIT_STRING_EXPANSIONS = 64
@@ -168,6 +171,40 @@ def _drop_descriptor(kept: list[str]) -> None:
         digits += 1
     if digits and (digits == len(kept) or (len(kept[-1 - digits]) == 1 and kept[-1 - digits] in COMMAND_BOUNDARY)):
         del kept[len(kept) - digits :]
+
+
+# The operands of a command are what is left once every option and the value that goes with it is set aside. A short
+# option in a bundle takes the rest of the bundle, or the next word, as its value when its letter is in value_letters.
+def first_operand(words: list[str], value_letters: frozenset[str] | str, value_options: frozenset[str]) -> int | None:
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word == "--":
+            return index + 1 if index + 1 < len(words) else None
+        if word.startswith("--"):
+            index += 2 if "=" not in word and word in value_options else 1
+        elif word.startswith("-") and len(word) > 1:
+            takes_next = False
+            for position, letter in enumerate(word[1:], 1):
+                if letter in value_letters:
+                    takes_next = position + 1 >= len(word)
+                    break
+            index += 2 if takes_next else 1
+        else:
+            return index
+    return None
+
+
+def split_options(words: list[str], value_letters: frozenset[str] | str, value_options: frozenset[str]) -> list[str]:
+    operands: list[str] = []
+    index = 0
+    while index < len(words):
+        position = first_operand(words[index:], value_letters, value_options)
+        if position is None:
+            break
+        operands.append(words[index + position])
+        index += position + 1
+    return operands
 
 
 # The text is rewritten with a quote-aware pass, so a quoted ">" or "#" stays an ordinary word while an unquoted
@@ -299,7 +336,9 @@ def _read_delimiter(command: str, index: int) -> tuple[str, bool, int] | None:
             closing = _closing_quote(command, index)
             if closing is None:
                 return None
-            pieces.append(command[index + 1 : closing])
+            interior = command[index + 1 : closing]
+            # Inside double quotes a backslash only escapes $, a backtick, a quote, a backslash or a line break.
+            pieces.append(re.sub(r'\\([$`"\\\n])', r"\1", interior) if character == '"' else interior)
             quoted, index = True, closing + 1
         elif character == "\\":
             if index + 1 >= length:
@@ -407,7 +446,7 @@ def _scan_code(command: str, index: int, nested: bool, found: list, depth: int, 
             while cursor < length and command[cursor] in " \t":
                 cursor += 1
             parsed = _read_delimiter(command, cursor)
-            if parsed is None or not parsed[0]:
+            if parsed is None or (not parsed[0] and not parsed[1]):
                 index += 2
             else:
                 delimiter, quoted, delimiter_end = parsed

@@ -44,11 +44,14 @@ from agent_safeguards.common import (  # noqa: E402
     env_flag,
     env_list,
     fail_open,
+    HEREDOC_FORBIDDEN,
     find_executable,
+    first_operand,
     heredocs,
     mark_opening_quotes,
     message,
     normalize_command,
+    split_options,
     strip_wrappers,
     unquoted_lines,
 )
@@ -175,12 +178,14 @@ GIT_BLOB_SPEC = re.compile(r"[A-Za-z0-9_./~^@+-]{0,200}:(?!/)\S{1,500}")
 HEREDOC_DATA_COMMANDS = frozenset({"cat", "diff", "gh", "grep", "jq", "tee"})
 MAX_HEREDOC_LINE_CHARS = 4096
 SYSTEM_COMMAND_PATH = re.compile(r"(?:/usr/bin/|/bin/|/usr/local/bin/|/opt/[a-z]+/bin/)?[a-z]+")
-JQ_PROGRAM_FILE = re.compile(r"-[A-Za-z]*f[A-Za-z]*|--from-file")
+# jq reads its program from a file with -f and runs the tests it finds in a file with --run-tests.
+JQ_PROGRAM_FILE = re.compile(r"-[A-Za-z]*f[A-Za-z]*|--from-file|--run[a-z-]*")
 # A substitution that holds a here-document becomes an argument of its command, which must not run it or read the text
 # as a file name, so it counts as data only as the text of --body, --title or --notes of these commands.
 HEREDOC_ARGUMENT_COMMANDS = {"gh": frozenset({"issue", "pr", "release"})}
 GH_TEXT_OPTIONS = frozenset({"--body", "-b", "--title", "-t", "--notes", "-n"})
-HEREDOC_MARKER = "__heredoc_marker__"
+# A word no command can contain, so it can only be the marker the guard put in itself.
+HEREDOC_MARKER = "\x02heredoc\x02"
 # A machine reached through a wrapper (vm.sh) is read-only: one pipeline of these commands, nothing that writes, runs another
 # program or never ends. The option and subcommand lists below close the ways one of them can still do that.
 REMOTE_MAX_CHARS = 4096
@@ -191,32 +196,49 @@ REMOTE_READ_COMMANDS = frozenset(
     }
 )
 REMOTE_FORBIDDEN_OPTIONS = {
-    "date": frozenset({"-s", "--set"}),
-    "file": frozenset({"-C", "--compile"}),
     "find": frozenset({"-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprint0", "-fprintf", "-ok", "-okdir"}),
-    "journalctl": frozenset(
-        {"-f", "--follow", "--flush", "--relinquish-var", "--rotate", "--smart-relinquish-var", "--sync", "--vacuum-files", "--vacuum-size", "--vacuum-time"}
-    ),
-    "sort": frozenset({"--compress-program", "--output"}),
-    "tail": frozenset({"--follow"}),
 }
+# GNU programs accept any unambiguous start of a long option, so one of these is refused when it is only begun (--out=).
+REMOTE_FORBIDDEN_LONG = {
+    "date": ("--set",),
+    "file": ("--compile",),
+    "free": ("--seconds",),
+    "journalctl": (
+        "--flush", "--follow", "--relinquish-var", "--rotate", "--setup-keys", "--smart-relinquish-var", "--sync",
+        "--update-catalog", "--vacuum-files", "--vacuum-size", "--vacuum-time",
+    ),
+    "sort": ("--compress-program", "--output"),
+    "tail": ("--follow",),
+}
+# The same options as letters of a bundle (-us, -bC, -qf): set the clock, compile a database, sample forever, follow, write.
+REMOTE_FORBIDDEN_LETTERS = {"date": "s", "file": "C", "free": "s", "journalctl": "f", "sort": "o", "tail": "fF"}
+# Options that take a value, so the value is not mistaken for a subcommand or an operand.
+DOCKER_VALUE_LETTERS = frozenset("Hcl")
+DOCKER_VALUE_OPTIONS = frozenset({"--config", "--context", "--host", "--log-level", "--tlscacert", "--tlscert", "--tlskey"})
+COMPOSE_VALUE_LETTERS = frozenset("fp")
+COMPOSE_VALUE_OPTIONS = frozenset({"--ansi", "--env-file", "--file", "--parallel", "--profile", "--progress", "--project-directory", "--project-name"})
+SYSTEMCTL_VALUE_LETTERS = frozenset("HMnopst")
+SYSTEMCTL_VALUE_OPTIONS = frozenset({"--host", "--lines", "--machine", "--output", "--property", "--signal", "--state", "--type"})
+DATE_VALUE_LETTERS = frozenset("dfr")
+DATE_VALUE_OPTIONS = frozenset({"--date", "--file", "--reference"})
+UNIQ_VALUE_LETTERS = frozenset("fsw")
+UNIQ_VALUE_OPTIONS = frozenset({"--check-chars", "--skip-chars", "--skip-fields"})
 REMOTE_SUBCOMMANDS = {
-    "docker": frozenset({"compose", "images", "logs", "ps", "stats", "top", "version"}),
+    "docker": frozenset({"compose", "images", "logs", "ps", "stats", "version"}),
     "pm2": frozenset({"list", "logs", "ls", "status"}),
     "systemctl": frozenset({"is-active", "is-enabled", "is-failed", "list-timers", "list-unit-files", "list-units", "status"}),
 }
 REMOTE_COMPOSE_SUBCOMMANDS = frozenset({"logs", "ps"})
-REMOTE_FOLLOW_CLUSTER = re.compile(r"-[0-9A-Za-z]*[fF][0-9A-Za-z]*")
-REMOTE_SORT_OUTPUT = re.compile(r"-[A-Za-z]*o")
+DOCKER_FOLLOW = re.compile(r"-[0-9A-Za-z]*f[0-9A-Za-z]*|--follow(?:=.*)?")
 REMOTE_SECRET_PATHS = re.compile(
     r"/etc/(?:shadow|gshadow|sudoers|ssh/ssh_host|ssl/private)|/root(?:/|\b)|/proc/|\.ssh(?:/|\b)|\.git-credentials|\.docker/config|\.kube/|\.aws/|\.gnupg|/\.config/",
     re.IGNORECASE,
 )
 # What a remote command is checked and its output cleaned with: addresses and hosts in logs are infrastructure details too.
-REDACT_URL = re.compile(r"\b(?:https?|ssh|tcp|wss?|ftp)://[^\s\"'<>)\]]{1,512}")
+REDACT_URL = re.compile(r"\b(?:https?|ssh|tcp|wss?|ftp)://[^\s\"'<>)\]]+")
 REDACT_USER_HOST = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}")
 REDACT_IPV4 = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?(?![\w.])")
-REDACT_IPV6 = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:.])")
+REDACT_IPV6 = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}(?:[0-9A-Fa-f]{0,4}|\d{1,3}(?:\.\d{1,3}){3})(?![\w:.])")
 # One-element list so the message code can switch the startup rules off to ask whether they alone caused a refusal.
 _STARTUP_RULES = [True]
 MAX_GLOB_WORDS = 20
@@ -261,9 +283,6 @@ SHADOWING_PATTERN = re.compile(r"\(\)[ \t]*\{|\bfunction\b|\balias\b|\bunalias\b
 JQ_PROGRAM = re.compile(r"(?P<head>\b(?:jq|gojq|yq)\b(?:[ \t]+-[A-Za-z]+)*[ \t]+)(?:'[^']*'|\"[^\"$`\\]*\")")
 JQ_ENVIRONMENT = re.compile(r"(?<![.\w\"])(?:\$ENV|env|strenv)\b(?!\s*:)")
 HERE_STRING_SECRET = re.compile(r"<<<[ \t]*[\"']?\$\{?[#!]?[A-Za-z0-9_]*(?:key|token|secret|pass|credential|auth)", re.IGNORECASE)
-# Constructs where this scan and a shell can disagree about what is a here-document, or that open a group, so a command
-# that has one outside its here-documents keeps the ordinary line-by-line checks.
-HEREDOC_FORBIDDEN = re.compile(r"\$['\"\[]|\$\(\(|\$\{(?![A-Za-z_][A-Za-z0-9_]*\})|`|<\(|>\(|\(\(|\[\[|\(\)")
 HEREDOC_EXPANSION = re.compile(r"`|\$[({\['\"\\]|\\\n")
 COMPOUND_WORDS = SHELL_KEYWORDS | frozenset({"case", "done", "esac", "fi", "for", "function", "select", "coproc"})
 HEREDOC_START = re.compile(r"(?<!<)<<-?[ \t]*(?![\"'\\<])\w")
@@ -296,6 +315,7 @@ LOGIN_BANNER_PATTERN = re.compile(
     r"|Warning: Permanently added "
     r"|The authenticity of host "
     r"|\bConnection to \S{1,255} closed"
+    r"|\bConnection (?:reset|closed) by \S{1,255} port \d{1,5}"
     r"|\bConnecting to \S{1,255} \["
     r"|ssh: (?:connect to host|Could not resolve hostname) \S"
 )
@@ -960,7 +980,7 @@ def _is_data_owner(words: list[str] | None) -> bool:
 
 
 def _is_data_heredoc(command: str, document: Any) -> bool:
-    if document.line_end - document.line_start > MAX_HEREDOC_LINE_CHARS:
+    if HEREDOC_MARKER in command or document.line_end - document.line_start > MAX_HEREDOC_LINE_CHARS:
         return False
     tail = command[document.delimiter_end : document.line_end]
     if PIPELINE_OPERATOR_PATTERN.search(tail):
@@ -1848,27 +1868,68 @@ def _remote_stages(command: str) -> list[list[str]] | None:
 
 
 def _remote_option_problem(name: str, arguments: list[str]) -> str | None:
-    forbidden = REMOTE_FORBIDDEN_OPTIONS.get(name, frozenset())
+    def refused(option: str) -> str:
+        return message("safe_tool.remote.reason.option", name=name, option=option)
+
+    exact = REMOTE_FORBIDDEN_OPTIONS.get(name, frozenset())
+    long_options = REMOTE_FORBIDDEN_LONG.get(name, ())
+    letters = REMOTE_FORBIDDEN_LETTERS.get(name, "")
     for argument in arguments:
-        if argument in forbidden or argument.split("=", 1)[0] in forbidden:
-            return message("safe_tool.remote.reason.option", name=name, option=argument)
-    short_options = [argument for argument in arguments if argument.startswith("-") and not argument.startswith("--")]
-    operands = [argument for argument in arguments if not argument.startswith("-")]
-    follows_log = name == "docker" and (operands[:1] == ["logs"] or operands[:2] == ["compose", "logs"])
-    follows = (name == "tail" or follows_log) and (any(REMOTE_FOLLOW_CLUSTER.fullmatch(argument) for argument in short_options) or "--follow" in arguments)
-    writes = name == "sort" and any(REMOTE_SORT_OUTPUT.match(argument) for argument in short_options)
-    if follows or writes or (name == "uniq" and operands):
-        return message("safe_tool.remote.reason.option", name=name, option=" ".join(arguments[:3]))
-    if name in REMOTE_SUBCOMMANDS:
+        if argument == "--":
+            break
+        if argument in exact:
+            return refused(argument)
+        if argument.startswith("--"):
+            option = argument.split("=", 1)[0]
+            if len(option) > 2 and any(forbidden.startswith(option) for forbidden in long_options):
+                return refused(argument)
+        elif argument.startswith("-") and not argument[1:].isdigit() and any(letter in letters for letter in argument[1:]):
+            return refused(argument)
+    if name == "date":
+        operands = split_options(arguments, DATE_VALUE_LETTERS, DATE_VALUE_OPTIONS)
+        # A numeric operand sets the clock; only a +FORMAT operand prints.
+        if any(not operand.startswith("+") for operand in operands):
+            return refused(" ".join(operands))
+    if name == "uniq":
+        operands = split_options(arguments, UNIQ_VALUE_LETTERS, UNIQ_VALUE_OPTIONS)
+        # The second operand of uniq is a file it writes.
+        if len(operands) > 1:
+            return refused(" ".join(operands))
+    if name == "docker":
+        return _remote_docker_problem(arguments)
+    if name == "systemctl":
+        index = first_operand(arguments, SYSTEMCTL_VALUE_LETTERS, SYSTEMCTL_VALUE_OPTIONS)
+        subcommand = arguments[index] if index is not None else ""
+        if subcommand not in REMOTE_SUBCOMMANDS[name]:
+            return message("safe_tool.remote.reason.subcommand", name=name, subcommand=subcommand)
+    if name == "pm2":
+        operands = split_options(arguments, "", frozenset())
         subcommand = operands[0] if operands else ""
         if subcommand not in REMOTE_SUBCOMMANDS[name]:
             return message("safe_tool.remote.reason.subcommand", name=name, subcommand=subcommand)
-        if name == "docker" and subcommand == "compose" and (len(operands) < 2 or operands[1] not in REMOTE_COMPOSE_SUBCOMMANDS):
-            return message("safe_tool.remote.reason.subcommand", name="docker compose", subcommand=operands[1] if len(operands) > 1 else "")
-        if (name == "docker" and subcommand == "stats" and "--no-stream" not in arguments) or (
-            name == "pm2" and subcommand == "logs" and "--nostream" not in arguments
-        ):
-            return message("safe_tool.remote.reason.option", name=name + " " + subcommand, option="without --no-stream")
+        if subcommand == "logs" and "--nostream" not in arguments:
+            return message("safe_tool.remote.reason.option", name="pm2 logs", option="without --nostream")
+    return None
+
+
+# docker takes its own options, then the subcommand; compose takes its own options again before its subcommand.
+def _remote_docker_problem(arguments: list[str]) -> str | None:
+    index = first_operand(arguments, DOCKER_VALUE_LETTERS, DOCKER_VALUE_OPTIONS)
+    subcommand = arguments[index] if index is not None else ""
+    if subcommand not in REMOTE_SUBCOMMANDS["docker"]:
+        return message("safe_tool.remote.reason.subcommand", name="docker", subcommand=subcommand)
+    rest = arguments[index + 1 :] if index is not None else []
+    effective = subcommand
+    if subcommand == "compose":
+        position = first_operand(rest, COMPOSE_VALUE_LETTERS, COMPOSE_VALUE_OPTIONS)
+        effective = rest[position] if position is not None else ""
+        if effective not in REMOTE_COMPOSE_SUBCOMMANDS:
+            return message("safe_tool.remote.reason.subcommand", name="docker compose", subcommand=effective)
+        rest = rest[position + 1 :]
+    if effective == "logs" and any(DOCKER_FOLLOW.fullmatch(argument) for argument in rest if argument != "--"):
+        return message("safe_tool.remote.reason.option", name="docker logs", option="-f")
+    if subcommand == "stats" and "--no-stream" not in rest:
+        return message("safe_tool.remote.reason.option", name="docker stats", option="without --no-stream")
     return None
 
 
@@ -1886,7 +1947,9 @@ def _remote_check(command: str) -> str | None:
         problem = _remote_option_problem(words[0], words[1:])
         if problem is not None:
             return problem
-    if REMOTE_SECRET_PATHS.search(command) or _sensitive_command(command, False):
+    # The words as the remote shell will see them, with quotes and escapes removed, are checked as well as the text.
+    decoded = " | ".join(" ".join(shlex.quote(word) for word in words) for words in stages)
+    if REMOTE_SECRET_PATHS.search(command) or REMOTE_SECRET_PATHS.search(decoded) or _sensitive_command(command, False) or _sensitive_command(decoded, False):
         return message("safe_tool.remote.reason.sensitive")
     return None
 
@@ -1915,17 +1978,20 @@ def _is_ipv6(candidate: str) -> bool:
 # hosts and URLs become placeholders, and times such as 20:33:32 stay because they are not addresses.
 def _redact() -> int:
     raw = sys.stdin.buffer.read(MAX_OUTPUT_BYTES + 1)
-    text = raw[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+    # Output that cannot be scanned whole is not shown cut: a secret that straddles the cut would show its first half.
+    if len(raw) > MAX_OUTPUT_BYTES:
+        sys.stdout.write(message("safe_tool.redact.too_large", kilobytes=MAX_OUTPUT_BYTES // 1024) + "\n")
+        return 0
+    text = raw.decode("utf-8", errors="replace")
     if contains_secret(text) or LOGIN_BANNER_PATTERN.search(text):
         sys.stdout.write(message("safe_tool.withheld.placeholder") + "\n")
         return 0
     text = REDACT_URL.sub("<url>", text)
     text = REDACT_USER_HOST.sub("<user@host>", text)
-    text = REDACT_IPV4.sub(lambda found: "<ip>" if _all_octets(found.group(1)) else found.group(0), text)
+    # An address with a dotted tail is taken whole before the plain dotted addresses are.
     text = REDACT_IPV6.sub(lambda found: "<ip6>" if _is_ipv6(found.group(0)) else found.group(0), text)
+    text = REDACT_IPV4.sub(lambda found: "<ip>" if _all_octets(found.group(1)) else found.group(0), text)
     sys.stdout.write(text)
-    if len(raw) > MAX_OUTPUT_BYTES:
-        sys.stdout.write("\n" + message("safe_tool.redact.cut", kilobytes=MAX_OUTPUT_BYTES // 1024) + "\n")
     return 0
 
 
