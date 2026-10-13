@@ -809,7 +809,7 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
         return True
     if executable == "ansible-vault" and first in {"decrypt", "view"}:
         return True
-    if executable == "docker" and _docker_inspect_shows_environment(raw_arguments):
+    if executable == "docker" and _docker_inspect_shows_environment(words[1:]):
         return True
     if executable == "kubectl" and first in {"describe", "get"} and any(
         part.split("/")[0].split(".")[0].lower() in {"secret", "secrets"} for argument in raw_arguments[1:] for part in argument.split(",")
@@ -964,25 +964,44 @@ def _reads_startup_file(command: str) -> bool:
 # letter. The words that an option takes as its value are skipped, except a value that begins with a dash: Linux then reads
 # the whole line as BSD options and macOS may read the option as one that takes none, so it is looked at as options. The
 # options that take a value differ between Linux (-C, -q and -s do) and macOS, so the target decides; a remote check is Linux.
-# `docker inspect` prints the whole configuration of a container, with its environment, unless a format picks other fields.
-DOCKER_ENVIRONMENT_FORMAT = re.compile(r"(?i)\bEnv\b|\.(?:Config|Spec|ContainerSpec|TaskTemplate)\s*(?:\}\}|\||\))|\{\{\s*(?:json\s+|toJson\s+)?\.\s*(?:\}\}|\|)")
+# `docker inspect` prints the whole configuration of a container or image, with its environment, unless a format picks other
+# fields: no format, an empty one and `json` print everything, and so do the templates that serialize the root or its Config.
+DOCKER_ENVIRONMENT_FORMAT = re.compile(
+    r"(?i)\benv\b|\{\{-?\s*(?:\w+\s+|\()*[.$](?:\.?(?:Config|Spec|ContainerSpec|TaskTemplate))?[\s)]*-?(?:\}\}|\|)"
+)
+DOCKER_INSPECT_GROUPS = frozenset({"container", "image", "service", "task"})
 
 
 def _docker_inspect_shows_environment(arguments: list[str]) -> bool:
-    if arguments[:1] in (["container"], ["service"], ["task"]):
-        arguments = arguments[1:]
-    if arguments[:1] != ["inspect"]:
+    index = first_operand(arguments, DOCKER_VALUE_LETTERS, DOCKER_VALUE_OPTIONS)
+    if index is None:
         return False
-    formats: list[str] = []
-    rest = arguments[1:]
-    for position, argument in enumerate(rest):
-        if argument in {"-f", "--format"} and position + 1 < len(rest):
-            formats.append(rest[position + 1])
+    rest = arguments[index + 1 :]
+    if arguments[index] in DOCKER_INSPECT_GROUPS:
+        if rest[:1] != ["inspect"]:
+            return False
+        rest = rest[1:]
+    elif arguments[index] != "inspect":
+        return False
+    # The last format wins, and a word after -- is a name, not an option.
+    chosen: str | None = None
+    position = 0
+    while position < len(rest):
+        argument = rest[position]
+        position += 1
+        if argument == "--":
+            break
+        if argument in {"-f", "--format"}:
+            if position < len(rest):
+                chosen = rest[position]
+                position += 1
         elif argument.startswith("--format="):
-            formats.append(argument.split("=", 1)[1])
-        elif argument.startswith("-f") and len(argument) > 2 and not argument.startswith("--"):
-            formats.append(argument[2:])
-    return not formats or any(DOCKER_ENVIRONMENT_FORMAT.search(text) for text in formats)
+            chosen = argument.split("=", 1)[1]
+        elif argument.startswith("-f") and not argument.startswith("--") and len(argument) > 2:
+            chosen = argument[2:]
+        elif argument == "--type":
+            position += 1
+    return chosen is None or chosen.strip() in {"", "json"} or DOCKER_ENVIRONMENT_FORMAT.search(chosen) is not None
 
 
 def _ps_shows_environment(arguments: list[str]) -> bool:
@@ -1234,18 +1253,19 @@ def _ask_local_artifact_hook() -> None:
     emit_decision("ask", message("safe_tool.ask.local_artifact"))
 
 
-# A tool response is a few levels deep; one nested further than this is refused (the exception ends in a withheld output) instead
-# of being walked until the interpreter runs out of stack.
+# A tool response is a few levels deep; one nested further than this, or with more labelled text than the label view holds, is
+# refused (the exception ends in a withheld output) instead of being walked until the interpreter runs out of stack or being
+# scanned only in part.
 MAX_RESPONSE_DEPTH = 64
 
 
-class _ResponseTooDeep(Exception):
+class _ResponseTooComplex(Exception):
     pass
 
 
 def _response_text(value: Any, depth: int = 0) -> str:
     if depth > MAX_RESPONSE_DEPTH:
-        raise _ResponseTooDeep
+        raise _ResponseTooComplex
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
@@ -1258,24 +1278,26 @@ def _response_text(value: Any, depth: int = 0) -> str:
 
 
 MAX_LABEL_VALUE = 2048
-MAX_LABEL_VIEW = 65536
+MAX_LABEL_VIEW = 262144
 
 
-# The short scalar fields of a response, each as `label=value`, for the secret shapes that need their label next to them. A long
-# value is output text, where a label is part of the text already, so it is left to the scan of the values.
+# The scalar fields of a response, each as `label=value` with the start of a long value, for the secret shapes that need their
+# label next to them (the rest of a long value is output text, where a label is part of the text and the scan of the values finds
+# it). More labelled text than the view holds is withheld, not skipped.
 def _response_labels(value: Any, depth: int = 0, found: list[str] | None = None, size: list[int] | None = None) -> str:
     top = found is None
     found = [] if found is None else found
     size = [0] if size is None else size
     if depth > MAX_RESPONSE_DEPTH:
-        raise _ResponseTooDeep
+        raise _ResponseTooComplex
     if isinstance(value, dict):
         for key, child in value.items():
             if isinstance(child, (str, int, float)) and not isinstance(child, bool):
-                text = str(child)
-                if len(text) <= MAX_LABEL_VALUE and len(key) <= 256 and size[0] < MAX_LABEL_VIEW:
-                    found.append(f"{key}={text}")
-                    size[0] += len(key) + len(text) + 1
+                text = str(child)[:MAX_LABEL_VALUE]
+                found.append(f"{str(key)[:256]}={text}")
+                size[0] += len(text) + min(len(str(key)), 256) + 1
+                if size[0] > MAX_LABEL_VIEW:
+                    raise _ResponseTooComplex
             else:
                 _response_labels(child, depth + 1, found, size)
     elif isinstance(value, list):
@@ -1288,7 +1310,7 @@ def _response_labels(value: Any, depth: int = 0, found: list[str] | None = None,
 # A key is text of the output too, so it is scanned on a line of its own.
 def _response_values(value: Any, depth: int = 0) -> str:
     if depth > MAX_RESPONSE_DEPTH:
-        raise _ResponseTooDeep
+        raise _ResponseTooComplex
     if isinstance(value, str):
         return value
     if isinstance(value, dict):

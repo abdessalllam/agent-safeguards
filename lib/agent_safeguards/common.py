@@ -167,19 +167,48 @@ def _skip_operand(command: str, index: int) -> int:
     return min(index, length)
 
 
-TEST_CLOSE = re.compile(r"\s\]\](?=\s|$|[;&|)])")
+COMMAND_KEYWORD_TAIL = re.compile(r"(?:^|[\s;&|(){}])(?:if|then|elif|else|while|until|do|time|!)$")
+
+
+# Whether a command can start where the text read so far ends: at the start, after a separator, or after a keyword. `[[` and `((`
+# are the test and arithmetic commands only there; in `echo [[ 2 > file ]]` they are words and the `>` is a redirection.
+def _at_command_start(kept: list[str]) -> bool:
+    tail = "".join(kept[-24:]).rstrip(" \t")
+    if not tail.strip() and len(kept) > 24:
+        tail = "".join(kept).rstrip(" \t")
+    return not tail.strip() or tail[-1] in ";&|({\n" or COMMAND_KEYWORD_TAIL.search(tail) is not None
+
+
+# Where the test `[[ ]]` that starts at index ends: at its closing `]]`, found with the quotes and escapes of its words skipped.
+def _test_end(command: str, index: int) -> int | None:
+    length = len(command)
+    position = index + 2
+    while position < length:
+        character = command[position]
+        if character in "'\"":
+            position = _skip_quoted(command, position)
+        elif character == "\\":
+            position += 2
+        elif character == "]" and command.startswith("]]", position) and command[position - 1] in " \t\n" and (
+            position + 2 >= length or command[position + 2] in " \t\n;&|)<>"
+        ):
+            return position + 2
+        else:
+            position += 1
+    return None
 
 
 # Where the arithmetic expansion `$(( ))`, the command `(( ))` or the test `[[ ]]` that starts at index ends, or None when the
 # text there is not one (`((cmd) > file)` is two subshells, and `[[` without its `]]` is an ordinary word).
-def _expression_end(command: str, index: int, at_word_start: bool) -> int | None:
+def _expression_end(command: str, index: int, at_word_start: bool, kept: list[str]) -> int | None:
     if command.startswith("$((", index):
         return _double_parenthesis_end(command, index + 3)
-    if at_word_start and command.startswith("((", index):
+    if not at_word_start or not _at_command_start(kept):
+        return None
+    if command.startswith("((", index):
         return _double_parenthesis_end(command, index + 2)
-    if at_word_start and command.startswith("[[", index) and command[index + 2 : index + 3] in {" ", "\t"}:
-        closing = TEST_CLOSE.search(command, index + 2)
-        return closing.end() if closing else None
+    if command.startswith("[[", index) and command[index + 2 : index + 3] in {" ", "\t", "\n"}:
+        return _test_end(command, index)
     return None
 
 
@@ -288,7 +317,7 @@ def normalize_command(command: str, redirects: list[tuple[str, str, str]] | None
         elif character == "&" and command[index + 1 : index + 2] == ">":
             index += 1
         # The `>` of an arithmetic expansion, `(( ))` and `[[ ]]` compares or shifts; it opens no file.
-        elif character in "$([" and (span_end := _expression_end(command, index, at_word_start)) is not None:
+        elif character in "$([" and (span_end := _expression_end(command, index, at_word_start, kept)) is not None:
             kept.append(command[index:span_end])
             index, at_word_start = span_end, False
         elif character in "<>":
