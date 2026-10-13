@@ -250,9 +250,6 @@ DOCKER_STATS_VALUE_OPTIONS = frozenset({"--format"})
 BOOLEAN_TRUE = frozenset({"1", "t", "T", "true", "TRUE", "True"})
 BOOLEAN_FALSE = frozenset({"0", "f", "F", "false", "FALSE", "False"})
 # ps reads words without a dash as BSD options too; these take the next word (or the rest of the word) as their value.
-PS_ENVIRON_FIELD = re.compile(
-    r"(?i)(?<![A-Za-z0-9_=.-])environ(?![A-Za-z0-9_-])|(?<=[oO])environ(?![A-Za-z0-9_-])|(?<=--format=)environ(?![A-Za-z0-9_-])"
-)
 PS_PROFILES = {
     "linux": (frozenset("CGgOopqstUu"), frozenset("NOopqtU")),
     "darwin": (frozenset("OoGgupUt"), frozenset("OoGgupUt")),
@@ -282,7 +279,7 @@ REMOTE_SUBCOMMANDS = {
 }
 REMOTE_COMPOSE_SUBCOMMANDS = frozenset({"logs", "ps"})
 REMOTE_SECRET_PATHS = re.compile(
-    r"/etc/(?:shadow|gshadow|sudoers|ssh/ssh_host|ssl/private)|/root(?:/|\b)|/proc/|\.ssh(?:/|\b)|\.git-credentials|\.docker/config|\.kube/|\.aws/|\.gnupg|/\.config/",
+    r"/etc/(?:shadow|gshadow|sudoers|ssh/ssh_host|ssl/private)|/root(?:/|\b)|~root(?![\w.-])|/proc/|\.ssh(?:/|\b)|\.git-credentials|\.docker/config|\.kube/|\.aws/|\.gnupg|/\.config/",
     re.IGNORECASE,
 )
 # What a remote command is checked and its output cleaned with: addresses and hosts in logs are infrastructure details too.
@@ -966,11 +963,14 @@ def _reads_startup_file(command: str) -> bool:
 # the whole line as BSD options and macOS may read the option as one that takes none, so it is looked at as options. The
 # options that take a value differ between Linux (-C, -q and -s do) and macOS, so the target decides; a remote check is Linux.
 def _ps_shows_environment(arguments: list[str]) -> bool:
-    # procps has a format field (`-o environ`) that prints the environment, in any spelling of the option that carries it.
-    if any(PS_ENVIRON_FIELD.search(argument) for argument in arguments):
-        return True
     unix_values, bsd_values = PS_PROFILES[_PS_TARGET[0]]
     return _ps_walk(arguments, unix_values, bsd_values)
+
+
+# procps has a format field (`-o environ`) that prints the environment. A format is a list of field names, each with an optional
+# header (`pid=ID`) or width (`args:20`) after it; only the name decides.
+def _ps_format_shows_environment(value: str) -> bool:
+    return any(re.split(r"[=:]", item, 1)[0].lower() == "environ" for item in re.split(r"[,\s]+", value) if item)
 
 
 def _ps_walk(arguments: list[str], unix_values: frozenset[str], bsd_values: frozenset[str]) -> bool:
@@ -981,7 +981,10 @@ def _ps_walk(arguments: list[str], unix_values: frozenset[str], bsd_values: froz
         if word == "--":
             break
         if word.startswith("--"):
-            if "=" not in word and word in PS_LONG_VALUE_OPTIONS:
+            name, equals, attached = word.partition("=")
+            if name == "--format" and _ps_format_shows_environment(attached if equals else (arguments[index] if index < len(arguments) else "")):
+                return True
+            if not equals and word in PS_LONG_VALUE_OPTIONS:
                 index += 1
             continue
         dashed = word.startswith("-") and len(word) > 1
@@ -991,6 +994,10 @@ def _ps_walk(arguments: list[str], unix_values: frozenset[str], bsd_values: froz
         position = next((place for place, letter in enumerate(prefix) if letter in values), None)
         # What follows a format option (o, O) is its value in every mode. After any other option it is a value only until a
         # word that does not parse is read again as BSD options, so those letters are looked at too.
+        if position is not None and prefix[position] in "oO":
+            following = arguments[index] if index < len(arguments) and not arguments[index].startswith("-") else ""
+            if _ps_format_shows_environment(body[position + 1 :] or following):
+                return True
         keeps_value = "oO" if _PS_TARGET[0] == "darwin" else "oOC"
         letters = prefix[: position + 1] if position is not None and prefix[position] in keeps_value else prefix
         if any(letter in "eE" for letter in letters):
@@ -1202,24 +1209,38 @@ def _ask_local_artifact_hook() -> None:
     emit_decision("ask", message("safe_tool.ask.local_artifact"))
 
 
-def _response_text(value: Any) -> str:
+# A tool response is a few levels deep; one nested further than this is refused (the exception ends in a withheld output) instead
+# of being walked until the interpreter runs out of stack.
+MAX_RESPONSE_DEPTH = 64
+
+
+class _ResponseTooDeep(Exception):
+    pass
+
+
+def _response_text(value: Any, depth: int = 0) -> str:
+    if depth > MAX_RESPONSE_DEPTH:
+        raise _ResponseTooDeep
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
-        return "\n".join(f"{key}={_response_text(child)}" for key, child in value.items())
+        return "\n".join(f"{key}={_response_text(child, depth + 1)}" for key, child in value.items())
     if isinstance(value, list):
-        return "\n".join(_response_text(child) for child in value)
+        return "\n".join(_response_text(child, depth + 1) for child in value)
     return ""
 
 
 # The key prefix that _response_text adds would hide a token at the very start of the output, so secrets are scanned without it.
-def _response_values(value: Any) -> str:
+# A key is text of the output too, so it is scanned on a line of its own.
+def _response_values(value: Any, depth: int = 0) -> str:
+    if depth > MAX_RESPONSE_DEPTH:
+        raise _ResponseTooDeep
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
-        return "\n".join(_response_values(child) for child in value.values())
+        return "\n".join(f"{key}\n{_response_values(child, depth + 1)}" for key, child in value.items())
     if isinstance(value, list):
-        return "\n".join(_response_values(child) for child in value)
+        return "\n".join(_response_values(child, depth + 1) for child in value)
     return ""
 
 
@@ -1274,10 +1295,20 @@ def _sensitive_output(command: str, response: Any) -> bool:
     )
 
 
-def _withheld_shape(value: Any, *, root: bool = True) -> Any:
+MAX_SHAPE_DEPTH = 6
+
+
+# A key of the replacement is kept only when it is a plain field name that holds no secret.
+def _shape_key(key: str, position: int) -> str:
+    return key if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", key) and not contains_secret(key) else f"field{position}"
+
+
+def _withheld_shape(value: Any, *, root: bool = True, depth: int = 0) -> Any:
     placeholder = message("safe_tool.withheld.placeholder")
+    if depth > MAX_SHAPE_DEPTH:
+        return None
     if isinstance(value, dict):
-        replacement = {key: _withheld_shape(child, root=False) for key, child in value.items()}
+        replacement = {_shape_key(key, position): _withheld_shape(child, root=False, depth=depth + 1) for position, (key, child) in enumerate(value.items())}
         for key in ("stdout", "output", "content"):
             if key in replacement and isinstance(replacement[key], str):
                 replacement[key] = placeholder
@@ -1299,11 +1330,15 @@ def _withhold_post_hook(runtime: str, response: Any) -> None:
     if runtime == "claude":
         if not isinstance(response, dict):
             response = {"stdout": "", "stderr": "", "interrupted": False, "isImage": False}
+        try:
+            shape = _withheld_shape(response)
+        except Exception:
+            shape = {"stdout": message("safe_tool.withheld.placeholder"), "stderr": "", "interrupted": False, "isImage": False}
         emit(
             {
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
-                    "updatedToolOutput": _withheld_shape(response),
+                    "updatedToolOutput": shape,
                 }
             }
         )
@@ -1897,19 +1932,19 @@ def _remote_stages(command: str) -> list[list[str]] | None:
     length = len(command)
     # One entry per open brace: whether a comma or .. has been seen at its own level, which makes it a list the shell expands.
     braces: list[bool] = []
-    comment = False
     word_start = True
     word_begin = 0
     while index < length:
         character = command[index]
+        # The rest is a comment (a line break was refused above), so the flags in it are not flags of the command.
         if character == "#" and word_start:
-            comment = True
+            break
         was_start = word_start
         if was_start and character not in " \t|":
             word_begin = index
         # A wildcard in the first part of a word expands to names that can begin with a dash (`sort -? out`), which are options
         # the remote shell would then pass on; with a folder in front (`/var/log/*.log`) every name begins with that folder.
-        if character in "*?[" and not comment and "/" not in command[word_begin:index]:
+        if character in "*?[" and "/" not in command[word_begin:index]:
             return None
         word_start = character in " \t|"
         if character == "\\":
@@ -1938,9 +1973,7 @@ def _remote_stages(command: str) -> list[list[str]] | None:
         if character == "$" and command[index + 1 : index + 2] in {"'", '"'}:
             return None
         # The remote shell expands a brace list into separate words, which are not the words checked here.
-        if comment:
-            pass
-        elif character == "{":
+        if character == "{":
             braces.append(False)
         elif braces and (character == "," or command[index : index + 2] == ".."):
             braces[-1] = True
@@ -1952,7 +1985,7 @@ def _remote_stages(command: str) -> list[list[str]] | None:
             stages.append(command[start:index])
             start = index + 1
         index += 1
-    stages.append(command[start:])
+    stages.append(command[start:index])
     words: list[list[str]] = []
     for stage in stages:
         try:
@@ -2065,25 +2098,39 @@ def _remote_option_problem(name: str, arguments: list[str]) -> str | None:
         subcommand = operands[0] if operands else ""
         if subcommand not in REMOTE_SUBCOMMANDS[name]:
             return message("safe_tool.remote.reason.subcommand", name=name, subcommand=_shown(subcommand))
-        if subcommand == "logs" and not _pm2_no_stream(arguments):
-            return message("safe_tool.remote.reason.option", name="pm2 logs", option="without --nostream")
+        if subcommand == "logs":
+            return _pm2_logs_problem(arguments)
     return None
 
 
-# pm2 logs ends instead of following only with --nostream as an option: not as the value of an option that takes one (--lines,
-# --name, --namespace), and not after --.
-def _pm2_no_stream(arguments: list[str]) -> bool:
+PM2_LOGS_FLAGS = frozenset({"--err", "--format", "--json", "--no-color", "--nostream", "--out", "--raw"})
+PM2_LOGS_VALUE_OPTIONS = frozenset({"--lines", "--name", "--namespace", "-n"})
+
+
+# pm2 logs ends instead of following only with --nostream as an option: not as the value of an option that takes one, and not
+# after --. pm2 has many options that take a value (--output, --error, --pid, --interpreter), so an option that is not on
+# these two lists cannot be told from one of them and is refused.
+def _pm2_logs_problem(arguments: list[str]) -> str | None:
+    ends = False
     index = 0
     while index < len(arguments):
         argument = arguments[index]
         index += 1
         if argument == "--":
-            return False
-        if argument in {"--lines", "--name", "--namespace", "-n"}:
-            index += 1
-        elif argument == "--nostream":
-            return True
-    return False
+            break
+        if not argument.startswith("-") or argument == "-":
+            continue
+        name, equals, _ = argument.partition("=")
+        if name in PM2_LOGS_VALUE_OPTIONS:
+            if not equals:
+                index += 1
+        elif name in PM2_LOGS_FLAGS and not equals:
+            ends = ends or name == "--nostream"
+        else:
+            return message("safe_tool.remote.reason.option", name="pm2 logs", option=_shown(name))
+    if not ends:
+        return message("safe_tool.remote.reason.option", name="pm2 logs", option="without --nostream")
+    return None
 
 
 # A boolean flag counts as set when its last mention before any -- says so (--no-stream, --no-stream=false).

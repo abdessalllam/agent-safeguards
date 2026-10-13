@@ -154,8 +154,9 @@ def _skip_quoted(command: str, index: int) -> int:
 
 def _skip_operand(command: str, index: int) -> int:
     length = len(command)
-    while index < length and command[index] in " \t":
-        index += 1
+    # A backslash before a line break only continues the line, so it may stand between the operator and its operand.
+    while index < length and (command[index] in " \t" or command.startswith("\\\n", index)):
+        index += 2 if command[index] == "\\" else 1
     if index < length and command[index] == "(":
         return index
     while index < length and command[index] not in OPERAND_END:
@@ -258,7 +259,7 @@ def normalize_command(command: str, redirects: list[tuple[str, str, str]] | None
             operator_text = command[index:end]
             operand_end = _skip_operand(command, end)
             if redirects is not None:
-                redirects.append((descriptor, operator_text, command[end:operand_end].strip()))
+                redirects.append((descriptor, operator_text, command[end:operand_end].replace("\\\n", "").strip()))
             index = operand_end
             kept.append(" " + REDIRECTION_MARKER + " ")
             at_word_start = True

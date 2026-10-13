@@ -324,6 +324,7 @@ class Chunk(NamedTuple):
     after: str | None
     opened: bool
     redirected: bool
+    redirections: tuple[tuple[str, str, str], ...] = ()
 
 
 # `name() {`, `name () {` and `function name {` only define what follows; the command inside is what the guard must see.
@@ -339,7 +340,9 @@ def _function_header_length(words: list[str]) -> int:
     return length
 
 
-def _chunk(raw_words: list[str], before: str | None, after: str | None, redirected: bool) -> Chunk:
+def _chunk(
+    raw_words: list[str], before: str | None, after: str | None, redirected: bool, redirections: tuple[tuple[str, str, str], ...] = ()
+) -> Chunk:
     words = [word for word in raw_words if word]
     header = _function_header_length(words)
     opened = header > 0 or (bool(words) and (words[0].startswith("(") or words[0] == "{"))
@@ -353,7 +356,7 @@ def _chunk(raw_words: list[str], before: str | None, after: str | None, redirect
         if not words[-1]:
             words.pop()
     # Only now are the quoted and escaped parentheses given back, so that they were not taken for the end of a group.
-    return Chunk([word.translate(UNPROTECT_SEPARATORS) for word in words], before, after, opened, redirected)
+    return Chunk([word.translate(UNPROTECT_SEPARATORS) for word in words], before, after, opened, redirected, redirections)
 
 
 # An escaped or quoted separator (the \\; that ends a find command, the '|' given to env) is a word, not the end of the command,
@@ -399,8 +402,9 @@ def _protect_escaped_separators(text: str) -> str:
 
 
 def _tokenize(command: str) -> list[Chunk] | None:
+    recorded: list[tuple[str, str, str]] = []
     try:
-        lexer = shlex.shlex(_protect_escaped_separators(normalize_command(command)), posix=True, punctuation_chars=";&|\n")
+        lexer = shlex.shlex(_protect_escaped_separators(normalize_command(command, recorded)), posix=True, punctuation_chars=";&|\n")
         lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         lexer.commenters = ""
@@ -411,22 +415,28 @@ def _tokenize(command: str) -> list[Chunk] | None:
     words: list[str] = []
     before: str | None = None
     redirected = False
+    # The n-th marker stands for the n-th redirection that normalize_command recorded, so each command keeps its own.
+    redirections: list[tuple[str, str, str]] = []
+    records = iter(recorded)
     for token in tokens:
         if token == REDIRECTION_MARKER:
             redirected = True
+            record = next(records, None)
+            if record is not None:
+                redirections.append(record)
         elif token and all(character in ";&|\n" for character in token):
             # A line break beside an operator only continues it, so "&&" plus a newline is still "&&".
             stripped = token.replace("\n", "")
             separator = stripped if stripped and set(stripped) != {";"} else ";"
-            if words:
-                chunks.append(_chunk(words, before, separator, redirected))
-                words, redirected = [], False
+            if words or redirections:
+                chunks.append(_chunk(words, before, separator, redirected, tuple(redirections)))
+                words, redirected, redirections = [], False, []
             before = separator
         else:
             words.append(token)
-    if words:
-        chunks.append(_chunk(words, before, None, redirected))
-    return [chunk for chunk in chunks if chunk.words or chunk.opened]
+    if words or redirections:
+        chunks.append(_chunk(words, before, None, redirected, tuple(redirections)))
+    return [chunk for chunk in chunks if chunk.words or chunk.opened or chunk.redirections]
 
 
 def _base(word: str) -> str:
@@ -1031,14 +1041,16 @@ def _shell_gets_a_name(command: list[str], marker: str, appended: bool) -> bool:
         return False
     if not stripped or _base(stripped[0]) not in SHELLS:
         return False
-    options, operands = _shell_words(stripped[1:])
-    if any(_is_command_option(option) for option in options):
+    fish = _base(stripped[0]) == "fish"
+    options, operands = _shell_words(stripped[1:], fish)
+    if any(_is_command_option(option, fish) for option in options):
         return False
-    if any(marker in operand for operand in operands):
+    # The shells disagree about which words are the values of options, so the marker counts wherever it stands.
+    if any(marker in word for word in stripped[1:]):
         return True
     # A `-s` that no `+s` clears makes the shell read its input; otherwise an appended name becomes its script.
-    reads_input = any(_is_short(option) and "s" in option and option[0] == "-" for option in options) and not any(
-        _is_short(option) and "s" in option and option[0] == "+" for option in options
+    reads_input = any(option[0] == "-" and "s" in _bundle_letters(option, fish) for option in options) and not any(
+        option[0] == "+" and "s" in _bundle_letters(option, fish) for option in options
     )
     return appended and not operands and not reads_input
 
@@ -1047,14 +1059,31 @@ def _is_short(option: str) -> bool:
     return not option.startswith("--") and option not in BASH_SINGLE_DASH_LONG
 
 
-# `c` is the command string's option, as a letter of a short bundle or as fish's `--command`; the single-dash long names of bash
-# (`-norc`) only contain one.
-def _is_command_option(option: str) -> bool:
-    return option == "--command" or option.startswith("--command=") or (_is_short(option) and ("c" in option or "C" in option))
+# The letters that take the next word as their value (an attached value follows the letter inside the same word).
+def _value_letters(fish: bool) -> str:
+    return "CdDfoOP" if fish else "oO"
 
 
-# The words after a shell's name split into options (with the values some of them take set aside) and operands.
-def _shell_words(words: list[str]) -> tuple[list[str], list[str]]:
+# The option letters of a short bundle up to the one that takes a value: the rest of the word is that value, not more options.
+def _bundle_letters(option: str, fish: bool) -> str:
+    if not _is_short(option):
+        return ""
+    letters = option[1:]
+    for position, letter in enumerate(letters):
+        if letter in _value_letters(fish):
+            return letters[:position]
+    return letters
+
+
+# `c` selects a command string, as a letter of a short bundle or as fish's `--command`; `C` is bash's noclobber (and fish's
+# initial command, after which the script is still read), and the single-dash long names of bash (`-norc`) only contain letters.
+def _is_command_option(option: str, fish: bool) -> bool:
+    return option == "--command" or option.startswith("--command=") or (option[0] == "-" and "c" in _bundle_letters(option, fish))
+
+
+# The words after a shell's name split into options (each option that takes a value is followed by one word that is set aside)
+# and operands.
+def _shell_words(words: list[str], fish: bool) -> tuple[list[str], list[str]]:
     options: list[str] = []
     operands: list[str] = []
     index = 0
@@ -1066,10 +1095,8 @@ def _shell_words(words: list[str]) -> tuple[list[str], list[str]]:
             break
         if len(word) > 1 and word[0] in "-+":
             options.append(word)
-            if word in SHELL_LONG_WITH_VALUE:
+            if word in SHELL_LONG_WITH_VALUE or (_is_short(word) and any(letter in _value_letters(fish) for letter in word[1:])):
                 index += 1
-            elif _is_short(word):
-                index += word.count("o") + word.count("O")
         else:
             operands.append(word)
     return options, operands
@@ -1551,15 +1578,42 @@ def _check_one_chunk(words: list[str], cwd: str | None, command_text: str, trust
 _STDIN_FILES: list[list[tuple[str, str | None]]] = [[]]
 
 
-# The places the command line writes to with a redirection (`> /dev/disk3`), for those that are devices.
-DEVICE_WRITE_OK = re.compile(r"/dev/(?:null|zero|full|stdout|stderr|stdin|tty|random|urandom|ptmx|fd/\d+|pts/\d+|shm(?:/.*)?)")
+# The places the command line writes to with a redirection (`> /dev/disk3`), for those that are devices. The pseudo files of bash
+# (`/dev/tcp/host/port`) and the terminals and sinks that every command writes to are not devices to protect.
+DEVICE_WRITE_OK = re.compile(r"/dev/(?:null|zero|full|stdout|stderr|stdin|tty\w*|console|random|urandom|ptmx|(?:fd|pts|shm|tcp|udp)/.*)")
+# In a command too large to read, only a redirection that names a device is looked for.
+DEVICE_REDIRECT_HINT = re.compile(
+    r">\s*[\"']?[^\s;&|<>]*/dev/(?!null|zero|full|stdout|stderr|stdin|tty|console|random|urandom|ptmx|fd/|pts/|shm/|tcp/|udp/)"
+)
+FILE_DESCRIPTOR_OPERAND = re.compile(r"\d+-?|-")
 
 
-def _check_device_writes(command: str, cwd: str | None) -> None:
-    redirects: list[tuple[str, str, str]] = []
-    normalize_command(command, redirects)
-    for _, operator, operand in redirects:
-        if not operator.startswith(">") or operator.startswith((">&", ">(")) and operand.rstrip("-").isdigit():
+# `>&2` and `>&-` duplicate or close a descriptor; `>&file` and `<>` write a file as `>` does.
+def _writes_a_file(operator: str, operand: str) -> bool:
+    if operand.startswith("("):
+        return False
+    if operator == ">&":
+        return FILE_DESCRIPTOR_OPERAND.fullmatch(operand) is None
+    return operator.startswith((">", "<>"))
+
+
+# The names a redirection word stands for: the word, each brace variant, and what a pattern matches.
+def _redirection_names(word: str, cwd: str | None) -> list[str]:
+    variants = expand_braces(word)
+    if variants is None:
+        raise Denied(message("delete_guard.reason.expansion", verb="a redirection", raw=word))
+    names: list[str] = []
+    for variant in variants:
+        names.append(variant)
+        names.extend(_glob_matches(variant, cwd, "a redirection"))
+    return names
+
+
+# A redirection is opened by the shell that reads the command line, in the folder it is in at that point, before any wrapper of
+# the command (`env -C dir`) moves.
+def _check_device_writes(redirections: tuple[tuple[str, str, str], ...], cwd: str | None) -> None:
+    for _, operator, operand in redirections:
+        if not _writes_a_file(operator, operand):
             continue
         try:
             words = shlex.split(operand)
@@ -1568,12 +1622,18 @@ def _check_device_writes(command: str, cwd: str | None) -> None:
         if not words or not words[0]:
             continue
         if _is_computed(words[0]):
-            if operator.startswith(">") and words[0].startswith(("/dev/", "$")) and "/dev" in words[0]:
+            if "/dev" in words[0] and words[0].startswith(("/dev/", "$")):
                 raise Denied(message("delete_guard.reason.computed_path", verb="a redirection", raw=words[0]))
             continue
-        resolved = _expand(words[0], cwd)
-        if resolved is not None and _inside(resolved, "/dev") and not DEVICE_WRITE_OK.fullmatch(resolved):
-            raise Denied(message("delete_guard.reason.device_redirect", path=resolved))
+        for name in _redirection_names(words[0], cwd):
+            resolved = _expand(name, cwd)
+            if resolved is None:
+                continue
+            written = os.path.normpath(name if os.path.isabs(name) else os.path.join(cwd or "/", name))
+            if DEVICE_WRITE_OK.fullmatch(written):
+                continue
+            if _inside(resolved, "/dev") and not DEVICE_WRITE_OK.fullmatch(resolved):
+                raise Denied(message("delete_guard.reason.device_redirect", path=resolved))
 
 
 def _line_input_files(command: str) -> list[tuple[str, str | None]]:
@@ -1663,13 +1723,24 @@ def _configured_remote_names() -> frozenset[str]:
     return frozenset(name for name in re.split(r"[:,\s]+", os.environ.get("AGENT_SAFEGUARDS_REMOTE_COMMANDS", "")) if name)
 
 
+QUOTE_CHARACTERS = re.compile(r"[\\'\"]")
+
+
 def _check_command(command: str, cwd: str | None) -> None:
-    delete_words = QUICK_SCAN.search(command) is not None
-    configured = any(re.search(r"(?:^|[\s;&|(])" + re.escape(name) + r"(?:\s|$)", command) for name in _configured_remote_names())
-    if not (delete_words or SCRIPT_HINT.search(command) or configured):
+    # What a quoted here-document prints is text; a redirection in it is not opened.
+    if "<<" in command:
+        command = _without_text_heredocs(command)
+    # A name split by empty quotes (`r""m`, `""bash`) is one word to the shell, so the gates look at the text without quotes too.
+    bare = QUOTE_CHARACTERS.sub("", command)
+    delete_words = QUICK_SCAN.search(command) is not None or QUICK_SCAN.search(bare) is not None
+    configured = any(
+        re.search(r"(?:^|[\s;&|(])" + re.escape(name) + r"(?:\s|$)", text) for name in _configured_remote_names() for text in (command, bare)
+    )
+    writes = ">" in command
+    if not (delete_words or writes or SCRIPT_HINT.search(command) or SCRIPT_HINT.search(bare) or configured):
         return
     if len(command) > MAX_COMMAND_CHARS:
-        if delete_words:
+        if delete_words or DEVICE_REDIRECT_HINT.search(command):
             raise Denied(message("delete_guard.reason.too_large"))
         return
     # A substitution can run from anywhere in the command, so its body is checked on its own, from an unknown
@@ -1679,7 +1750,6 @@ def _check_command(command: str, cwd: str | None) -> None:
     outer_files = _STDIN_FILES[0]
     _STDIN_FILES[0] = outer_files + _line_input_files(command)
     try:
-        _check_device_writes(command, cwd)
         for body in command_substitutions(command):
             if body.strip():
                 _check_command(body, substitution_cwd)
@@ -1700,6 +1770,8 @@ def _check_chunks(command: str, cwd: str | None) -> None:
     conditional = False
     for chunk in chunks:
         grouped = grouped or chunk.opened
+        if chunk.redirections:
+            _check_device_writes(chunk.redirections, None if conditional and chunk.before != "&&" else current)
         if not chunk.words:
             continue
         # A folder learned after && holds only while the commands keep chaining with &&; anything else may still run.
