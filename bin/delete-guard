@@ -211,6 +211,10 @@ REMOTE_HOME_PARENTS = frozenset({"/home", "/Users"})
 # root and strictly inside an allowed folder; the shell on the other side then has nothing left to expand.
 DEFAULT_REMOTE_ROOTS = ("~/ci", "/tmp")
 REMOTE_UNSAFE_PATH = re.compile(r"[$`\\*?\[\]{}!;&|<>()'\"\s\x00-\x1f]")
+# What a path may hold when every wildcard, brace, parenthesis and exclamation mark in it is quoted or escaped in the command: the
+# names of route folders (`app/[lang]/page.tsx`, `(dashboard)`) are such paths. The rest stays unsafe.
+REMOTE_UNSAFE_AFTER_QUOTES = re.compile(r"[$`\\;&|<>'\"\s\x00-\x1f]")
+RELAXED_CHARACTERS = frozenset("*?[]{}()!")
 REMOTE_COMMAND_NAMES = frozenset({"mosh", "ssh"})
 REMOTE_COMMAND_PATTERN = re.compile(r"ssh[_-].+")
 # A script that checks what it is asked to delete before it runs the command says so, and its command strings are then
@@ -802,12 +806,68 @@ def _in_trash(path: str) -> bool:
     return _names_trash(path) or _inside(path, "/boot/trash") or any(_inside(path, root) for root in _trash_roots())
 
 
+# The words of a command whose characters that the shell would expand (wildcards, braces, `$`, a backquote) are all quoted or
+# escaped, as the shell reads them: only for such a word may `[lang]` be a name and not a pattern. The text is read the way the
+# shell reads it, so a word that quotes are part of in a nested command is not found here.
+def _quoted_literal_words(text: str) -> frozenset[str]:
+    words: set[str] = set()
+    patterns: set[str] = set()
+    current: list[str] = []
+    risky = False
+    started = False
+    index = 0
+    length = len(text)
+    while index <= length:
+        character = text[index] if index < length else " "
+        if character in " \t\n;|&<>":
+            if started:
+                (patterns if risky else words).add("".join(current))
+            current, risky, started = [], False, False
+            index += 1
+        elif character == "'":
+            closing = text.find("'", index + 1)
+            if closing == -1:
+                break
+            current.append(text[index + 1 : closing])
+            started = True
+            index = closing + 1
+        elif character == '"':
+            index += 1
+            started = True
+            while index < length and text[index] != '"':
+                if text[index] == "\\" and text[index + 1 : index + 2] in {'"', "\\", "$", "`"}:
+                    current.append(text[index + 1])
+                    index += 2
+                    continue
+                if text[index] in "$`":
+                    risky = True
+                current.append(text[index])
+                index += 1
+            index += 1
+        elif character == "\\" and index + 1 < length:
+            if text[index + 1] != "\n":
+                current.append(text[index + 1])
+                started = True
+            index += 2
+        else:
+            if character in RELAXED_CHARACTERS or character in "$`":
+                risky = True
+            current.append(character)
+            started = True
+            index += 1
+    return frozenset(words - patterns)
+
+
+_QUOTED_WORDS: list[frozenset[str]] = [frozenset()]
+
+
 # The literal form of a path written for another machine, or None when the shell over there could read it differently.
 def _remote_literal(raw: str) -> str | None:
     path = raw if raw == "/" else raw.rstrip("/")
     anchored = path.startswith("~/") or path.startswith("/")
     components = path.split("/")[1:] if anchored else []
-    if not anchored or REMOTE_UNSAFE_PATH.search(path) or not components or any(part in {"", ".", ".."} for part in components):
+    unsafe = REMOTE_UNSAFE_AFTER_QUOTES if raw in _QUOTED_WORDS[0] else REMOTE_UNSAFE_PATH
+    if not anchored or unsafe.search(path) or not components or any(part in {"", ".", ".."} for part in components):
         return None
     return path
 
@@ -880,7 +940,9 @@ def _check_target(raw: str, cwd: str | None, *, recursive: bool, verb: str) -> N
         _check_remote_target(raw, verb)
         return
     _check_match_mark(raw, verb)
-    if "{" in raw and BRACE_PATTERN.search(raw):
+    # A wildcard or brace that is quoted or escaped in the command is part of the name (`app/[lang]/page.tsx`).
+    literal = raw in _QUOTED_WORDS[0]
+    if not literal and "{" in raw and BRACE_PATTERN.search(raw):
         variants = expand_braces(raw)
         if variants is None:
             raise Denied(message("delete_guard.reason.expansion", verb=verb, raw=raw))
@@ -891,10 +953,10 @@ def _check_target(raw: str, cwd: str | None, *, recursive: bool, verb: str) -> N
         if recursive:
             raise Denied(message("delete_guard.reason.computed_path", verb=verb, raw=raw))
         return
-    base = _glob_base(raw)
+    base = raw if literal else _glob_base(raw)
     if base != raw and recursive and not base.strip("./"):
         raise Denied(message("delete_guard.reason.bare_glob", verb=verb, raw=raw))
-    wildcard = re.search(r"[*?\[]", raw)
+    wildcard = None if literal else re.search(r"[*?\[]", raw)
     if wildcard and recursive:
         component_end = raw.find("/", wildcard.start())
         if component_end != -1 and raw[component_end:].strip("/"):
@@ -904,7 +966,7 @@ def _check_target(raw: str, cwd: str | None, *, recursive: bool, verb: str) -> N
         raise Denied(message("delete_guard.reason.unresolvable", verb=verb, raw=raw))
     if _in_trash(resolved):
         raise Denied(message("delete_guard.reason.trash_purge", verb=verb, path=resolved))
-    for match in _glob_matches(raw, cwd, verb):
+    for match in [] if literal else _glob_matches(raw, cwd, verb):
         found = os.path.realpath(match)
         if _names_trash(match) or _in_trash(found) or (recursive and _is_folder_path(found, verb, raw) and _holds_trash(found)):
             raise Denied(message("delete_guard.reason.trash_purge", verb=verb, path=match))
@@ -1874,6 +1936,8 @@ def _check_command(command: str, cwd: str | None) -> None:
     _STDIN_FILES[0] = outer_files + _line_input_files(command)
     outer_variables = _VARIABLES_CHANGED[0]
     _VARIABLES_CHANGED[0] = outer_variables | _variables_changed(command)
+    outer_words = _QUOTED_WORDS[0]
+    _QUOTED_WORDS[0] = _quoted_literal_words(command)
     try:
         for body in command_substitutions(command):
             if body.strip():
@@ -1882,6 +1946,7 @@ def _check_command(command: str, cwd: str | None) -> None:
     finally:
         _STDIN_FILES[0] = outer_files
         _VARIABLES_CHANGED[0] = outer_variables
+        _QUOTED_WORDS[0] = outer_words
 
 
 def _check_chunks(command: str, cwd: str | None) -> None:
@@ -1988,13 +2053,19 @@ def _preflight_trash_patterns() -> str:
     return "|".join(patterns)
 
 
+# A path in the script the machine runs: quoted, so that the name `[lang]` is not a pattern there, but with its leading `~/` left
+# for the machine to expand.
+def _script_path(path: str) -> str:
+    return "~/" + shlex.quote(path[2:]) if path.startswith("~/") else shlex.quote(path)
+
+
 def _remote_preflight_script() -> str:
     targets = list(dict.fromkeys(_REMOTE_TARGETS))
     roots = _remote_roots()
     if not targets or not roots:
         return ""
-    removed = " ".join(path for path, entered in targets if not entered)
-    entered = " ".join(path for path, entered in targets if entered)
+    removed = " ".join(_script_path(path) for path, entered in targets if not entered)
+    entered = " ".join(_script_path(path) for path, entered in targets if entered)
     return (
         "fail=0; check() { case \"$1\" in " + _preflight_trash_patterns() + ") echo \"PREFLIGHT_REFUSED $2\"; fail=1; return;; esac; "
         "ok=0; for root in " + " ".join(roots) + "; do rr=$(cd -P -- \"$root\" 2>/dev/null && pwd) || continue; "
