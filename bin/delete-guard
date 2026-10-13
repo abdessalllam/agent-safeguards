@@ -46,6 +46,7 @@ from agent_safeguards.common import (  # noqa: E402
     split_options,
     strip_wrappers,
     strip_wrappers_with_directory,
+    unquoted_text,
 )
 
 # These immutable policy values stay at module scope so the hook and the self-test share one policy.
@@ -95,7 +96,7 @@ QUICK_SCAN = re.compile(
     r"|\b(?:mkfs|newfs)[._]"
     r"|\b(?:ktrash|kioclient)\d*\b|\b(?:hadoop|hdfs|osascript|powershell|pwsh|cmd\.exe)\b|(?i:clear-recyclebin)"
 )
-INLINE_RECURSIVE_DELETE = re.compile(r"rmtree|removedirs|rmSync|rmdirSync|remove_dir_all|rm_rf|rm\s+-[a-zA-Z]*[rR]")
+INLINE_RECURSIVE_DELETE = re.compile(r"rmtree|removedirs|rmSync|rmdirSync|remove_dir_all|rm_rf|rm\s+-[a-zA-Z]*[rR]|\.rm\s*\([^;]{0,400}recursive")
 INTERPRETERS = frozenset({"python", "python3", "node", "perl", "ruby", "deno", "bun", "osascript", "swift"})
 BASH_SINGLE_DASH_LONG = frozenset(
     {"-debugger", "-dump-po-strings", "-dump-strings", "-help", "-init-file", "-login", "-noediting", "-noprofile", "-norc", "-nolineediting", "-posix", "-pretty-print", "-rcfile", "-restricted", "-verbose", "-version"}
@@ -340,17 +341,34 @@ def _function_header_length(words: list[str]) -> int:
     return length
 
 
+# `coproc cmd` and `coproc NAME { cmd; }` run the command that follows; `case WORD in PATTERN) cmd` and a later `PATTERN) cmd` run
+# the command after the pattern. The prefix is not a command, so it is dropped and the command is looked at.
+def _without_syntax_prefix(words: list[str]) -> list[str]:
+    if words[:1] == ["coproc"]:
+        words = words[1:]
+        if len(words) > 1 and (words[1] == "{" or words[1].startswith("(")) and re.fullmatch(r"[A-Za-z_]\w*", words[0]):
+            words = words[1:]
+    if words[:1] == ["case"] and "in" in words[2:]:
+        words = words[words.index("in", 2) + 1 :]
+    return words
+
+
 def _chunk(
     raw_words: list[str], before: str | None, after: str | None, redirected: bool, redirections: tuple[tuple[str, str, str], ...] = ()
 ) -> Chunk:
     words = [word for word in raw_words if word]
     header = _function_header_length(words)
     opened = header > 0 or (bool(words) and (words[0].startswith("(") or words[0] == "{"))
-    words = words[header:]
+    words = _without_syntax_prefix(words[header:])
+    opened = opened or (bool(words) and (words[0].startswith("(") or words[0] == "{"))
     while words and words[0].startswith("("):
         words[0] = words[0][1:]
         if not words[0]:
             words.pop(0)
+    # A word that ends in a parenthesis and is followed by more words is the pattern of a case arm (`x) cmd`); the last word
+    # of a subshell (`(cmd)`) has nothing after it.
+    if len(words) > 1 and words[0].endswith(")") and not words[0].startswith("$("):
+        words = words[1:]
     if words and words[-1].endswith(")"):
         words[-1] = words[-1].rstrip(")")
         if not words[-1]:
@@ -452,7 +470,15 @@ def _home_expanded(path: str) -> str:
     return USER_HOME + path[1:] if path == "~" or path.startswith("~/") else path
 
 
+# A command that sets HOME (or reads it from input) makes `$HOME` and `~` a place the guard cannot know, not the home of the user.
+HOME_ASSIGNMENT = re.compile(r"(?<![\w$])HOME\s*\+?=|\b(?:read|mapfile|readarray|unset)\b[^;&|\n]*\bHOME\b")
+HOME_FORM = re.compile(r"(?:\$HOME|\$\{HOME\}|~)(?:/|$)")
+_HOME_CHANGED = [False]
+
+
 def _expand(path: str, cwd: str | None) -> str | None:
+    if _HOME_CHANGED[0] and HOME_FORM.match(path):
+        return None
     path = _home_expanded(path)
     if path.startswith("~"):
         return None
@@ -1081,8 +1107,8 @@ def _is_command_option(option: str, fish: bool) -> bool:
     return option == "--command" or option.startswith("--command=") or (option[0] == "-" and "c" in _bundle_letters(option, fish))
 
 
-# The words after a shell's name split into options (each option that takes a value is followed by one word that is set aside)
-# and operands.
+# The words after a shell's name split into options (each option that takes a separate value is followed by one word that is set
+# aside) and operands: the script and its arguments, where the options end.
 def _shell_words(words: list[str], fish: bool) -> tuple[list[str], list[str]]:
     options: list[str] = []
     operands: list[str] = []
@@ -1095,11 +1121,21 @@ def _shell_words(words: list[str], fish: bool) -> tuple[list[str], list[str]]:
             break
         if len(word) > 1 and word[0] in "-+":
             options.append(word)
-            if word in SHELL_LONG_WITH_VALUE or (_is_short(word) and any(letter in _value_letters(fish) for letter in word[1:])):
+            if word in SHELL_LONG_WITH_VALUE or (_is_short(word) and _value_is_next(word, fish)):
                 index += 1
         else:
-            operands.append(word)
+            operands.extend(words[index - 1 :])
+            break
     return options, operands
+
+
+# A letter that takes a value is the last one of its word when the value is the next word; otherwise it is attached.
+def _value_is_next(option: str, fish: bool) -> bool:
+    letters = option[1:]
+    for position, letter in enumerate(letters):
+        if letter in _value_letters(fish):
+            return position == len(letters) - 1
+    return False
 
 
 def _moves_and_deletes(command: list[str]) -> bool:
@@ -1398,7 +1434,7 @@ def _check_remote_command(text: str) -> None:
     try:
         # The words a shell hands on have lost their quotes by now, but a quoted or escaped tilde is not expanded on the
         # other side, so it stands for a folder named ~ and not for the home folder.
-        if QUICK_SCAN.search(text) and QUOTED_TILDE.search(text):
+        if (QUICK_SCAN.search(text) or QUICK_SCAN.search(QUOTE_CHARACTERS.sub("", text))) and QUOTED_TILDE.search(text):
             raise RemoteDenied(message("delete_guard.reason.remote_target", verb="delete", raw="a quoted or escaped ~"))
         _check_command(text, None)
     finally:
@@ -1486,6 +1522,9 @@ def _check_one_chunk(words: list[str], cwd: str | None, command_text: str, trust
             return None, False
         target = targets[0]
         if target == "-" or _is_computed(target):
+            return None, False
+        # CDPATH makes a relative name a name inside one of its folders.
+        if not target.startswith(("/", "./", "../", "~", "$")) and target not in {".", ".."} and ("CDPATH" in command_text or os.environ.get("CDPATH")):
             return None, False
         resolved = _expand(target, cwd)
         # A cd that may be skipped, grouped, backgrounded or failed leaves the real folder unknown.
@@ -1583,7 +1622,7 @@ _STDIN_FILES: list[list[tuple[str, str | None]]] = [[]]
 DEVICE_WRITE_OK = re.compile(r"/dev/(?:null|zero|full|stdout|stderr|stdin|tty\w*|console|random|urandom|ptmx|(?:fd|pts|shm|tcp|udp)/.*)")
 # In a command too large to read, only a redirection that names a device is looked for.
 DEVICE_REDIRECT_HINT = re.compile(
-    r">\s*[\"']?[^\s;&|<>]*/dev/(?!null|zero|full|stdout|stderr|stdin|tty|console|random|urandom|ptmx|fd/|pts/|shm/|tcp/|udp/)"
+    r"(?:>|<>)&?!?\s*/dev/(?!(?:null|zero|full|stdout|stderr|stdin|tty\w*|console|random|urandom|ptmx)(?![\w./-])|(?:fd|pts|shm|tcp|udp)/)"
 )
 FILE_DESCRIPTOR_OPERAND = re.compile(r"\d+-?|-")
 
@@ -1597,15 +1636,20 @@ def _writes_a_file(operator: str, operand: str) -> bool:
     return operator.startswith((">", "<>"))
 
 
-# The names a redirection word stands for: the word, each brace variant, and what a pattern matches.
-def _redirection_names(word: str, cwd: str | None) -> list[str]:
-    variants = expand_braces(word)
-    if variants is None:
-        raise Denied(message("delete_guard.reason.expansion", verb="a redirection", raw=word))
+# The names a redirection word stands for: the word, each brace variant, and what a pattern matches. A quoted or escaped
+# wildcard or brace is part of the name, so `operand` (the text as written) tells which characters are active.
+def _redirection_names(word: str, operand: str, cwd: str | None) -> list[str]:
+    active = unquoted_text(operand)
+    variants = [word]
+    if "{" in active and BRACE_PATTERN.search(active):
+        variants = expand_braces(word)
+        if variants is None:
+            raise Denied(message("delete_guard.reason.expansion", verb="a redirection", raw=word))
     names: list[str] = []
     for variant in variants:
         names.append(variant)
-        names.extend(_glob_matches(variant, cwd, "a redirection"))
+        if re.search(r"[*?\[]", active):
+            names.extend(_glob_matches(variant, cwd, "a redirection"))
     return names
 
 
@@ -1625,12 +1669,10 @@ def _check_device_writes(redirections: tuple[tuple[str, str, str], ...], cwd: st
             if "/dev" in words[0] and words[0].startswith(("/dev/", "$")):
                 raise Denied(message("delete_guard.reason.computed_path", verb="a redirection", raw=words[0]))
             continue
-        for name in _redirection_names(words[0], cwd):
+        for name in _redirection_names(words[0], operand, cwd):
+            # The place the name leads to decides: a link in /dev/shm can lead to a device.
             resolved = _expand(name, cwd)
             if resolved is None:
-                continue
-            written = os.path.normpath(name if os.path.isabs(name) else os.path.join(cwd or "/", name))
-            if DEVICE_WRITE_OK.fullmatch(written):
                 continue
             if _inside(resolved, "/dev") and not DEVICE_WRITE_OK.fullmatch(resolved):
                 raise Denied(message("delete_guard.reason.device_redirect", path=resolved))
@@ -1740,7 +1782,7 @@ def _check_command(command: str, cwd: str | None) -> None:
     if not (delete_words or writes or SCRIPT_HINT.search(command) or SCRIPT_HINT.search(bare) or configured):
         return
     if len(command) > MAX_COMMAND_CHARS:
-        if delete_words or DEVICE_REDIRECT_HINT.search(command):
+        if delete_words or DEVICE_REDIRECT_HINT.search(bare):
             raise Denied(message("delete_guard.reason.too_large"))
         return
     # A substitution can run from anywhere in the command, so its body is checked on its own, from an unknown
@@ -1749,6 +1791,8 @@ def _check_command(command: str, cwd: str | None) -> None:
     # A command line inside another (a substitution, `sh -c`, `eval`, a script) reads the input of the line around it as well.
     outer_files = _STDIN_FILES[0]
     _STDIN_FILES[0] = outer_files + _line_input_files(command)
+    outer_home = _HOME_CHANGED[0]
+    _HOME_CHANGED[0] = outer_home or HOME_ASSIGNMENT.search(command) is not None
     try:
         for body in command_substitutions(command):
             if body.strip():
@@ -1756,11 +1800,16 @@ def _check_command(command: str, cwd: str | None) -> None:
         _check_chunks(command, cwd)
     finally:
         _STDIN_FILES[0] = outer_files
+        _HOME_CHANGED[0] = outer_home
 
 
 def _check_chunks(command: str, cwd: str | None) -> None:
     chunks = _tokenize(command)
     if chunks is None:
+        # The command cannot be split, but the redirections in it can still be read where they stand.
+        recorded: list[tuple[str, str, str]] = []
+        normalize_command(command, recorded)
+        _check_device_writes(tuple(recorded), os.path.realpath(cwd) if cwd else None)
         if INLINE_RECURSIVE_DELETE.search(command) or re.search(r"-delete\b", command):
             raise Denied(message("delete_guard.reason.unparseable"))
         return

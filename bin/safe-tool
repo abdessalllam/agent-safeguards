@@ -200,7 +200,7 @@ REMOTE_FORBIDDEN_OPTIONS = {
 # GNU programs accept any unambiguous start of a long option, so one of these is refused when it is only begun (--out=).
 REMOTE_FORBIDDEN_LONG = {
     "date": ("--set",),
-    "file": ("--compile",),
+    "file": ("--compile", "--uncompress", "--uncompress-noreport"),
     "free": ("--seconds",),
     "journalctl": (
         "--flush", "--follow", "--relinquish-var", "--rotate", "--setup-keys", "--smart-relinquish-var", "--sync",
@@ -211,7 +211,7 @@ REMOTE_FORBIDDEN_LONG = {
     "tail": ("--follow",),
 }
 # The same options as letters of a bundle (-us, -bC, -qf): set the clock, compile a database, sample forever, follow, write.
-REMOTE_FORBIDDEN_LETTERS = {"date": "s", "file": "C", "free": "s", "journalctl": "fM", "sort": "o", "systemctl": "HM", "tail": "fF"}
+REMOTE_FORBIDDEN_LETTERS = {"date": "s", "file": "CzZ", "free": "s", "journalctl": "fM", "sort": "o", "systemctl": "HM", "tail": "fF"}
 # Letters that take the rest of the bundle as their value (-ufoo.service, -T/tmp/out), which is not a list of options.
 # An exact long option wins over any longer option it begins, so these are not taken for the forbidden ones.
 REMOTE_EXACT_LONG = {"journalctl": frozenset({"--cursor"})}
@@ -809,6 +809,8 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
         return True
     if executable == "ansible-vault" and first in {"decrypt", "view"}:
         return True
+    if executable == "docker" and _docker_inspect_shows_environment(raw_arguments):
+        return True
     if executable == "kubectl" and first in {"describe", "get"} and any(
         part.split("/")[0].split(".")[0].lower() in {"secret", "secrets"} for argument in raw_arguments[1:] for part in argument.split(",")
     ):
@@ -962,6 +964,27 @@ def _reads_startup_file(command: str) -> bool:
 # letter. The words that an option takes as its value are skipped, except a value that begins with a dash: Linux then reads
 # the whole line as BSD options and macOS may read the option as one that takes none, so it is looked at as options. The
 # options that take a value differ between Linux (-C, -q and -s do) and macOS, so the target decides; a remote check is Linux.
+# `docker inspect` prints the whole configuration of a container, with its environment, unless a format picks other fields.
+DOCKER_ENVIRONMENT_FORMAT = re.compile(r"(?i)\bEnv\b|\.(?:Config|Spec|ContainerSpec|TaskTemplate)\s*(?:\}\}|\||\))|\{\{\s*(?:json\s+|toJson\s+)?\.\s*(?:\}\}|\|)")
+
+
+def _docker_inspect_shows_environment(arguments: list[str]) -> bool:
+    if arguments[:1] in (["container"], ["service"], ["task"]):
+        arguments = arguments[1:]
+    if arguments[:1] != ["inspect"]:
+        return False
+    formats: list[str] = []
+    rest = arguments[1:]
+    for position, argument in enumerate(rest):
+        if argument in {"-f", "--format"} and position + 1 < len(rest):
+            formats.append(rest[position + 1])
+        elif argument.startswith("--format="):
+            formats.append(argument.split("=", 1)[1])
+        elif argument.startswith("-f") and len(argument) > 2 and not argument.startswith("--"):
+            formats.append(argument[2:])
+    return not formats or any(DOCKER_ENVIRONMENT_FORMAT.search(text) for text in formats)
+
+
 def _ps_shows_environment(arguments: list[str]) -> bool:
     unix_values, bsd_values = PS_PROFILES[_PS_TARGET[0]]
     return _ps_walk(arguments, unix_values, bsd_values)
@@ -981,10 +1004,12 @@ def _ps_walk(arguments: list[str], unix_values: frozenset[str], bsd_values: froz
         if word == "--":
             break
         if word.startswith("--"):
-            name, equals, attached = word.partition("=")
+            # procps separates a long option from its value with = or :.
+            long_option = re.fullmatch(r"(--[A-Za-z][A-Za-z-]*)([=:]?)(.*)", word, re.S)
+            name, equals, attached = long_option.groups() if long_option else (word, "", "")
             if name == "--format" and _ps_format_shows_environment(attached if equals else (arguments[index] if index < len(arguments) else "")):
                 return True
-            if not equals and word in PS_LONG_VALUE_OPTIONS:
+            if not equals and name in PS_LONG_VALUE_OPTIONS:
                 index += 1
             continue
         dashed = word.startswith("-") and len(word) > 1
@@ -1227,7 +1252,36 @@ def _response_text(value: Any, depth: int = 0) -> str:
         return "\n".join(f"{key}={_response_text(child, depth + 1)}" for key, child in value.items())
     if isinstance(value, list):
         return "\n".join(_response_text(child, depth + 1) for child in value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
     return ""
+
+
+MAX_LABEL_VALUE = 2048
+MAX_LABEL_VIEW = 65536
+
+
+# The short scalar fields of a response, each as `label=value`, for the secret shapes that need their label next to them. A long
+# value is output text, where a label is part of the text already, so it is left to the scan of the values.
+def _response_labels(value: Any, depth: int = 0, found: list[str] | None = None, size: list[int] | None = None) -> str:
+    top = found is None
+    found = [] if found is None else found
+    size = [0] if size is None else size
+    if depth > MAX_RESPONSE_DEPTH:
+        raise _ResponseTooDeep
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if isinstance(child, (str, int, float)) and not isinstance(child, bool):
+                text = str(child)
+                if len(text) <= MAX_LABEL_VALUE and len(key) <= 256 and size[0] < MAX_LABEL_VIEW:
+                    found.append(f"{key}={text}")
+                    size[0] += len(key) + len(text) + 1
+            else:
+                _response_labels(child, depth + 1, found, size)
+    elif isinstance(value, list):
+        for child in value:
+            _response_labels(child, depth + 1, found, size)
+    return "\n".join(found) if top else ""
 
 
 # The key prefix that _response_text adds would hide a token at the very start of the output, so secrets are scanned without it.
@@ -1274,7 +1328,8 @@ def _shows_host_details(command: str, text: str) -> bool:
 
 def _sensitive_output(command: str, response: Any) -> bool:
     text = _response_text(response)
-    if contains_secret(_response_values(response)):
+    # A secret shape is looked for in the values alone (a token at the very start) and next to its label (`password=...`).
+    if contains_secret(_response_values(response)) or contains_secret(_response_labels(response)):
         return True
     private_email = any(match.group(1).lower() not in RESERVED_EMAIL_DOMAINS for match in EMAIL_PATTERN.finditer(text))
     identity_context = any(
@@ -2094,12 +2149,13 @@ def _remote_option_problem(name: str, arguments: list[str]) -> str | None:
         if subcommand not in REMOTE_SUBCOMMANDS[name]:
             return message("safe_tool.remote.reason.subcommand", name=name, subcommand=_shown(subcommand))
     if name == "pm2":
-        operands = split_options(arguments, "", frozenset())
-        subcommand = operands[0] if operands else ""
+        subcommand, no_stream, problem = _pm2_read(arguments)
+        if problem is not None:
+            return problem
         if subcommand not in REMOTE_SUBCOMMANDS[name]:
             return message("safe_tool.remote.reason.subcommand", name=name, subcommand=_shown(subcommand))
-        if subcommand == "logs":
-            return _pm2_logs_problem(arguments)
+        if subcommand == "logs" and not no_stream:
+            return message("safe_tool.remote.reason.option", name="pm2 logs", option="without --nostream")
     return None
 
 
@@ -2107,18 +2163,23 @@ PM2_LOGS_FLAGS = frozenset({"--err", "--format", "--json", "--no-color", "--nost
 PM2_LOGS_VALUE_OPTIONS = frozenset({"--lines", "--name", "--namespace", "-n"})
 
 
-# pm2 logs ends instead of following only with --nostream as an option: not as the value of an option that takes one, and not
-# after --. pm2 has many options that take a value (--output, --error, --pid, --interpreter), so an option that is not on
-# these two lists cannot be told from one of them and is refused.
-def _pm2_logs_problem(arguments: list[str]) -> str | None:
+# What pm2 will run is the first word that is not an option or the value of one, and pm2 logs ends instead of following only with
+# --nostream as an option: not as the value of an option that takes one, and not after --. pm2 has many options that take a value
+# (--output, --error, --pid, --interpreter), so an option that is not on these two lists cannot be told from one of them and is
+# refused. Returns the subcommand, whether --nostream is an option, and the reason for a refusal.
+def _pm2_read(arguments: list[str]) -> tuple[str, bool, str | None]:
+    subcommand = ""
     ends = False
     index = 0
     while index < len(arguments):
         argument = arguments[index]
         index += 1
         if argument == "--":
+            if not subcommand and index < len(arguments):
+                subcommand = arguments[index]
             break
         if not argument.startswith("-") or argument == "-":
+            subcommand = subcommand or argument
             continue
         name, equals, _ = argument.partition("=")
         if name in PM2_LOGS_VALUE_OPTIONS:
@@ -2127,10 +2188,8 @@ def _pm2_logs_problem(arguments: list[str]) -> str | None:
         elif name in PM2_LOGS_FLAGS and not equals:
             ends = ends or name == "--nostream"
         else:
-            return message("safe_tool.remote.reason.option", name="pm2 logs", option=_shown(name))
-    if not ends:
-        return message("safe_tool.remote.reason.option", name="pm2 logs", option="without --nostream")
-    return None
+            return subcommand, False, message("safe_tool.remote.reason.option", name="pm2", option=_shown(name))
+    return subcommand, ends, None
 
 
 # A boolean flag counts as set when its last mention before any -- says so (--no-stream, --no-stream=false).
@@ -2205,7 +2264,7 @@ def _remote_docker_problem(arguments: list[str]) -> str | None:
     for argument in arguments[:index]:
         if argument.startswith("--"):
             named = argument.split("=", 1)[0]
-            if named in {"--host", "--context", "--config"}:
+            if named in {"--host", "--context", "--config", "--tlskey"}:
                 return message("safe_tool.remote.reason.option", name="docker", option=named)
         elif argument.startswith("-"):
             for letter in argument[1:]:

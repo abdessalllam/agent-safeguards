@@ -43,7 +43,7 @@ ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
 DURATION = re.compile(r"[0-9.]+[smhd]?")
 COMMAND_BOUNDARY = " \t\n;&|("
 OPERAND_END = " \t\n;&|<>()"
-REDIRECTION_SUFFIX = "&|-"
+REDIRECTION_SUFFIX = "&|-!"
 REDIRECTION_MARKER = "\x1f"
 OPENING_QUOTE_MARKER = "\x01"
 MAX_HEREDOCS = 16
@@ -167,6 +167,44 @@ def _skip_operand(command: str, index: int) -> int:
     return min(index, length)
 
 
+TEST_CLOSE = re.compile(r"\s\]\](?=\s|$|[;&|)])")
+
+
+# Where the arithmetic expansion `$(( ))`, the command `(( ))` or the test `[[ ]]` that starts at index ends, or None when the
+# text there is not one (`((cmd) > file)` is two subshells, and `[[` without its `]]` is an ordinary word).
+def _expression_end(command: str, index: int, at_word_start: bool) -> int | None:
+    if command.startswith("$((", index):
+        return _double_parenthesis_end(command, index + 3)
+    if at_word_start and command.startswith("((", index):
+        return _double_parenthesis_end(command, index + 2)
+    if at_word_start and command.startswith("[[", index) and command[index + 2 : index + 3] in {" ", "\t"}:
+        closing = TEST_CLOSE.search(command, index + 2)
+        return closing.end() if closing else None
+    return None
+
+
+def _double_parenthesis_end(command: str, index: int) -> int | None:
+    depth = 0
+    length = len(command)
+    while index < length:
+        character = command[index]
+        if character in "'\"":
+            index = _skip_quoted(command, index)
+            continue
+        if character == "\\":
+            index += 2
+            continue
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            if depth:
+                depth -= 1
+            else:
+                return index + 2 if command[index + 1 : index + 2] == ")" else None
+        index += 1
+    return None
+
+
 def _drop_descriptor(kept: list[str]) -> str:
     digits = 0
     while digits < len(kept) and len(kept[-1 - digits]) == 1 and kept[-1 - digits] in "0123456789":
@@ -249,12 +287,19 @@ def normalize_command(command: str, redirects: list[tuple[str, str, str]] | None
                 index += 1
         elif character == "&" and command[index + 1 : index + 2] == ">":
             index += 1
+        # The `>` of an arithmetic expansion, `(( ))` and `[[ ]]` compares or shifts; it opens no file.
+        elif character in "$([" and (span_end := _expression_end(command, index, at_word_start)) is not None:
+            kept.append(command[index:span_end])
+            index, at_word_start = span_end, False
         elif character in "<>":
             descriptor = _drop_descriptor(kept)
             end = index
             while end < length and command[end] in "<>":
                 end += 1
             if end < length and command[end] in REDIRECTION_SUFFIX:
+                end += 1
+            # zsh's `>&!` forces the overwrite of a file as `>!` does.
+            if command[end - 1 : end] == "&" and command[end : end + 1] == "!":
                 end += 1
             operator_text = command[index:end]
             operand_end = _skip_operand(command, end)
@@ -557,6 +602,10 @@ def command_substitutions(command: str) -> list[str]:
             end = _closing_backtick(command, index + 1)
             bodies.append(command[index + 1 : end])
             index = end + 1
+        elif command.startswith("$((", index) and (arithmetic_end := _double_parenthesis_end(command, index + 3)) is not None:
+            # An arithmetic expansion is not a command; a substitution inside it still is.
+            bodies.extend(command_substitutions(command[index + 3 : arithmetic_end - 2]))
+            index = arithmetic_end
         elif command.startswith("$(", index) or (not quote and command[index : index + 2] in {"<(", ">("}):
             end = _closing_parenthesis(command, index + 2)
             bodies.append(command[index + 2 : end])
