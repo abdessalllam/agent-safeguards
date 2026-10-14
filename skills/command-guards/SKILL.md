@@ -1,6 +1,6 @@
 ---
 name: command-guards
-description: Use when a shell command is blocked by safe-tool or delete-guard, or its output was withheld. Messages look like "Sensitive-output command blocked", "Delete guard:", or "[withheld: sensitive output]". Explains the safe rewrite for each block so the work can continue.
+description: 'Use when a shell command is blocked by safe-tool or delete-guard, or its output was withheld. Messages look like "Sensitive-output command blocked", "Delete guard:", or "[withheld: sensitive output]". Explains the safe rewrite for each block so the work can continue.'
 ---
 
 # Command guards

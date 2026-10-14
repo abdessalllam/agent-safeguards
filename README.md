@@ -201,6 +201,13 @@ Codex can also refuse listed commands before they run, even with the sandbox off
 cp extras/codex-rules/delete-guard.rules extras/codex-rules/identity.rules ~/.codex/rules/
 ```
 
+### Grok and Muse
+
+Other agent CLIs can run the same hooks; each needs its own check that the hooks are really running.
+
+- **Grok** reads the hooks in `~/.claude/settings.json` by default (`[compat.claude] hooks` in `~/.grok/config.toml` turns that off) and sends the same field names (`tool_input`, `tool_name`, `cwd`), so the Claude Code registration above guards Grok too, including the question about a whole repository, which Grok shows as a permission prompt. Check it with a command the guard refuses, such as `trash-empty`.
+- **Muse** loads Claude-format plugins (`muse plugins validate <path>` should say `valid`), but a plugin hook must be approved with `muse plugins approve plugin:<id>:hook:<hook-id>`, and its shell tool is named `bash`. Muse withholds a tool output only for the Codex reply format, and it does not know `ask`, so register `safe-tool hook codex PreToolUse`, `delete-guard hook codex PreToolUse` and `safe-tool hook codex PostToolUse` (matcher `bash`) in a small local plugin that points at the installed commands.
+
 ### From a local clone
 
 ```sh
