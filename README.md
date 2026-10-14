@@ -135,6 +135,8 @@ The command after a `case` pattern (`case x in x) cmd;; esac`) and after `coproc
 
 On this machine too, a wildcard or brace that is quoted or escaped in the command is part of the name (`rm -rf "src/app/[lang]/account"`), unless the same word is also written unquoted somewhere in the command.
 
+Sending a whole Git repository to the Trash is asked about, not refused: a folder with a `.git` (also a worktree's `.git` file), a `.worktrees` folder, a folder that holds repositories within three levels, or a `.git` folder itself, given to `trash`, `trash-put`, `gio trash` or `mv` into a Trash. Claude Code puts the question to you (`ask`), so one yes lets that command run; Codex cannot ask and refuses, telling the agent to bring it to you. The question is held until the rest of the command has been checked, so a refusal anywhere in the command wins over it. A file or folder inside a repository, and anything in a temp folder, is not asked about, and neither is a `trash` target that is a plain variable. A `trash` target that a command computes (`trash "$(...)"`, a backquote) is asked about, because the result may be the whole project. A permanent delete of a repository root or a worktree stays refused.
+
 Temp folders are exempt from all of this, even when a repository lives inside one, so scratch clones can be cleaned up. The temp root itself is not: `rm -rf /tmp` and `rm -rf /tmp/*` are refused, while `rm -rf /tmp/agent-probe-*` is fine. `cd` is followed only when the target exists and the command has no grouping; otherwise relative delete targets are refused because the folder is unknown.
 
 Every refusal says what to do instead: `git worktree remove <path>` for a worktree, the Trash for everything else.

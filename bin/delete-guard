@@ -92,7 +92,7 @@ SYSTEM_ROOT_PATHS = frozenset(SYSTEM_ROOTS) | frozenset(os.path.realpath(path) f
 MOUNT_PARENTS = ("/Volumes", "/mnt", "/media")
 HOOK_EVENTS = frozenset({"PreToolUse", "PostToolUse", "SessionStart"})
 QUICK_SCAN = re.compile(
-    r"\b(rm|rmtree|removedirs|rmSync|rmdirSync|remove_dir_all|rm_rf|find|xargs|trash|gio|diskutil|dd|mkfs|newfs|shred|srm|rsync|clean|unlink|rmdir)\b"
+    r"\b(rm|rmtree|removedirs|rmSync|rmdirSync|remove_dir_all|rm_rf|find|xargs|trash|gio|diskutil|dd|mkfs|newfs|shred|srm|rsync|clean|unlink|rmdir|mv)\b"
     r"|\b(?:mkfs|newfs)[._]"
     r"|\b(?:ktrash|kioclient)\d*\b|\b(?:hadoop|hdfs|osascript|powershell|pwsh|cmd\.exe)\b|(?i:clear-recyclebin)"
 )
@@ -272,6 +272,16 @@ class RemoteDenied(Denied):
     pass
 
 
+# Some commands are not refused but need the user's yes (sending a whole repository to the Trash). The question is kept here while
+# the rest of the command is still checked, because a refusal anywhere in it must win over a yes that was given to part of it.
+_PENDING_ASK: list[str | None] = [None]
+
+
+def _ask(key: str, **values: str) -> None:
+    if _PENDING_ASK[0] is None:
+        _PENDING_ASK[0] = message(key, **values)
+
+
 class CheckTooSlow(BaseException):
     """Raised by the budget alarm; it is not an Exception, so no handler inside a check can swallow it."""
 
@@ -313,6 +323,14 @@ def _remote_roots() -> tuple[str, ...]:
         if anchored and len(parts) >= 2 and not REMOTE_UNSAFE_PATH.search(entry) and all(part not in {"", ".", ".."} for part in parts[1:]) and entry not in SYSTEM_ROOTS:
             roots.append(entry)
     return tuple(roots)
+
+
+# Claude Code can put the question to the user; a host that cannot refuses and tells the agent to bring it to the user.
+def _emit_ask(reason: str, runtime: str) -> None:
+    if runtime == "claude":
+        emit_decision("ask", message("delete_guard.ask", reason=reason))
+    else:
+        emit_decision("deny", message("delete_guard.deny_permission", reason=reason))
 
 
 def _emit_deny(denial: Denied) -> None:
@@ -575,6 +593,43 @@ def _trash_roots() -> tuple[str, ...]:
     if data_home.startswith("/"):
         roots.append(os.path.join(os.path.normpath(data_home), "Trash"))
     return tuple(dict.fromkeys(roots + [os.path.realpath(root) for root in roots]))
+
+
+REPOSITORY_SCAN_SKIP = frozenset({"node_modules", ".git", ".venv", "venv", "__pycache__", "target", "build", "dist", ".gradle", "Pods"})
+MAX_REPOSITORY_SCAN = 20000
+MAX_REPOSITORY_DEPTH = 3
+
+
+# Whether a folder is a Git repository or worktree (it has a `.git`), holds one within a few levels (a `.worktrees` folder, a
+# folder of projects), or is the `.git` folder itself. A folder that cannot be looked through completely is not shown to hold none.
+def _holds_repository(path: str) -> bool:
+    if os.path.basename(path) == ".git":
+        return True
+    level = [path]
+    visited = 0
+    for depth in range(MAX_REPOSITORY_DEPTH + 1):
+        following: list[str] = []
+        for folder in level:
+            try:
+                with os.scandir(folder) as entries:
+                    for entry in entries:
+                        visited += 1
+                        if visited > MAX_REPOSITORY_SCAN or entry.name == ".git":
+                            return True
+                        if depth < MAX_REPOSITORY_DEPTH and entry.name not in REPOSITORY_SCAN_SKIP and entry.is_dir(follow_symlinks=False):
+                            following.append(entry.path)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                return True
+        level = following
+    return False
+
+
+# A scratch clone in a temp folder may be cleaned up; a project, a worktree or a folder of them is the user's to decide.
+def _ask_about_repository(resolved: str, verb: str) -> None:
+    if not any(_inside(resolved, root) for root in TEMP_ROOTS) and _holds_repository(resolved):
+        _ask("delete_guard.reason.trash_repository", verb=verb, path=resolved)
 
 
 # A folder with a Trash directly inside it (the top of a volume) would take the Trash along when it is deleted or moved. A
@@ -1034,11 +1089,47 @@ def _trash(words: list[str], cwd: str | None) -> None:
             _trash_one(_location_path(variant, "trash", strict=False), cwd)
 
 
+# Moving into a Trash is sending to it: a whole repository that goes there is asked about like `trash repo`.
+def _mv(words: list[str], cwd: str | None) -> None:
+    if _REMOTE[0] is not None:
+        return
+    destination: str | None = None
+    for index, word in enumerate(words[1:], 1):
+        if word == "--":
+            break
+        if word in {"-t", "--target-directory"} and index + 1 < len(words):
+            destination = words[index + 1]
+        elif word.startswith("--target-directory="):
+            destination = word.split("=", 1)[1]
+    operands = split_options(words[1:], "tS", frozenset({"--target-directory", "--suffix"}))
+    if destination is None:
+        if len(operands) < 2:
+            return
+        destination, operands = operands[-1], operands[:-1]
+    if _is_computed(destination):
+        return
+    place = _expand(destination, cwd)
+    if place is None or not (_in_trash(place) or _names_trash(destination)):
+        return
+    for operand in operands:
+        if _is_computed(operand):
+            continue
+        for variant in expand_braces(operand) or [operand]:
+            resolved = _expand(_glob_base(variant), cwd)
+            if resolved is not None:
+                _ask_about_repository(resolved, "mv")
+            for match in _glob_matches(variant, cwd, "mv"):
+                _ask_about_repository(os.path.realpath(match), "mv")
+
+
 def _trash_one(target: str, cwd: str | None) -> None:
     if _names_trash(target):
         raise Denied(message("delete_guard.reason.trash_inside", path=target))
     _check_match_mark(target, "trash")
     if _is_computed(target):
+        # A path that a command computes may be the whole project (an empty result, the parent of the folder it ran in).
+        if re.search(r"\$\(|`", target):
+            _ask("delete_guard.reason.trash_computed", raw=target)
         return
     resolved = _expand(_glob_base(target), cwd)
     if resolved is None:
@@ -1049,6 +1140,9 @@ def _trash_one(target: str, cwd: str | None) -> None:
         if _names_trash(match) or (_is_folder_path(found, "trash", target) and _holds_trash(found)):
             raise Denied(message("delete_guard.reason.trash_inside", path=match))
         _check_sendable(found)
+        _ask_about_repository(found, "trash")
+    if _glob_base(target) == target:
+        _ask_about_repository(resolved, "trash")
     if _glob_base(target) == target and _is_folder_path(resolved, "trash", target) and _holds_trash(resolved):
         raise Denied(message("delete_guard.reason.trash_inside", path=resolved))
 
@@ -1673,6 +1767,8 @@ def _check_one_chunk(words: list[str], cwd: str | None, command_text: str, trust
         _rm(words, cwd)
     elif name in TRASH_TOOLS:
         _trash(words, cwd)
+    elif name == "mv":
+        _mv(words, cwd)
     elif TRASH_EMPTY_TOOL.fullmatch(name):
         raise Denied(message("delete_guard.reason.trash_empty", name=name))
     elif KDE_TRASH_TOOL.fullmatch(name):
@@ -1990,7 +2086,7 @@ def _check_chunks(command: str, cwd: str | None) -> None:
             conditional = True
 
 
-def _run_hook() -> int:
+def _run_hook(runtime: str = "claude") -> int:
     try:
         raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
         if len(raw) > MAX_INPUT_BYTES:
@@ -2009,6 +2105,7 @@ def _run_hook() -> int:
     workdir = tool_input.get("workdir")
     if isinstance(workdir, str) and workdir:
         cwd = workdir if os.path.isabs(workdir) or cwd is None else os.path.join(cwd, workdir)
+    _PENDING_ASK[0] = None
     try:
         _run_with_budget(lambda: _check_command(command, cwd))
     except Denied as denial:
@@ -2019,6 +2116,9 @@ def _run_hook() -> int:
     except Exception:
         if not fail_open():
             emit_decision("deny", message("delete_guard.deny_internal"))
+    else:
+        if _PENDING_ASK[0] is not None:
+            _emit_ask(_PENDING_ASK[0], runtime)
     return 0
 
 
@@ -2170,7 +2270,7 @@ def main() -> int:
         return _remote_preflight_cli(arguments[1])
     if arguments[:1] == ["hook"] and 2 <= len(arguments) <= 3 and arguments[1] in {"claude", "codex"}:
         if len(arguments) == 2 or arguments[2] in HOOK_EVENTS:
-            return _run_hook()
+            return _run_hook(arguments[1])
     sys.stderr.write(message("delete_guard.cli.usage") + "\n")
     return 2
 
