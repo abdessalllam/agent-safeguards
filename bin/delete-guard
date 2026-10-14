@@ -988,21 +988,23 @@ def _check_remote_trash_target(raw: str) -> None:
         raise RemoteDenied(message("delete_guard.reason.trash_inside", path=raw))
 
 
-def _check_target(raw: str, cwd: str | None, *, recursive: bool, verb: str) -> None:
+def _check_target(raw: str, cwd: str | None, *, recursive: bool, verb: str, literal: bool | None = None) -> None:
     if _names_trash(raw):
         raise Denied(message("delete_guard.reason.trash_purge", verb=verb, path=raw))
     if _REMOTE[0] is not None:
         _check_remote_target(raw, verb)
         return
     _check_match_mark(raw, verb)
-    # A wildcard or brace that is quoted or escaped in the command is part of the name (`app/[lang]/page.tsx`).
-    literal = raw in _QUOTED_WORDS[0]
+    # A wildcard or brace that is quoted or escaped in the command is part of the name (`app/[lang]/page.tsx`). What a brace list
+    # expands to was written active, so a variant is not looked up among the quoted words.
+    if literal is None:
+        literal = raw in _QUOTED_WORDS[0]
     if not literal and "{" in raw and BRACE_PATTERN.search(raw):
         variants = expand_braces(raw)
         if variants is None:
             raise Denied(message("delete_guard.reason.expansion", verb=verb, raw=raw))
         for variant in variants:
-            _check_target(variant, cwd, recursive=recursive, verb=verb)
+            _check_target(variant, cwd, recursive=recursive, verb=verb, literal=False)
         return
     if _is_computed(raw):
         if recursive:
@@ -1082,11 +1084,12 @@ def _trash(words: list[str], cwd: str | None) -> None:
         if _REMOTE[0] is not None:
             _check_remote_trash_target(target)
             continue
-        variants = expand_braces(target) if "{" in target else [target]
+        literal = target in _QUOTED_WORDS[0]
+        variants = [target] if literal or "{" not in target else expand_braces(target)
         if variants is None:
             raise Denied(message("delete_guard.reason.expansion", verb="trash", raw=target))
         for variant in variants:
-            _trash_one(_location_path(variant, "trash", strict=False), cwd)
+            _trash_one(_location_path(variant, "trash", strict=False), cwd, literal)
 
 
 # Moving into a Trash is sending to it: a whole repository that goes there is asked about like `trash repo`.
@@ -1097,10 +1100,15 @@ def _mv(words: list[str], cwd: str | None) -> None:
     for index, word in enumerate(words[1:], 1):
         if word == "--":
             break
-        if word in {"-t", "--target-directory"} and index + 1 < len(words):
-            destination = words[index + 1]
+        following = words[index + 1] if index + 1 < len(words) else None
+        if word == "--target-directory":
+            destination = following
         elif word.startswith("--target-directory="):
             destination = word.split("=", 1)[1]
+        elif word.startswith("-") and not word.startswith("--") and "t" in word:
+            # The value of -t is the rest of its word (`-t/dir`, `-ft/dir`) or, when it ends the word, the next word.
+            position = word.index("t")
+            destination = word[position + 1 :] or following
     operands = split_options(words[1:], "tS", frozenset({"--target-directory", "--suffix"}))
     if destination is None:
         if len(operands) < 2:
@@ -1114,15 +1122,22 @@ def _mv(words: list[str], cwd: str | None) -> None:
     for operand in operands:
         if _is_computed(operand):
             continue
-        for variant in expand_braces(operand) or [operand]:
-            resolved = _expand(_glob_base(variant), cwd)
-            if resolved is not None:
-                _ask_about_repository(resolved, "mv")
-            for match in _glob_matches(variant, cwd, "mv"):
-                _ask_about_repository(os.path.realpath(match), "mv")
+        literal = operand in _QUOTED_WORDS[0]
+        variants = [operand] if literal else expand_braces(operand)
+        if variants is None:
+            raise Denied(message("delete_guard.reason.expansion", verb="mv", raw=operand))
+        for variant in variants:
+            if literal or _glob_base(variant) == variant:
+                resolved = _expand(variant, cwd)
+                if resolved is not None:
+                    _ask_about_repository(resolved, "mv")
+            else:
+                # Only what the pattern matches is moved, not the folder it is read in.
+                for match in _glob_matches(variant, cwd, "mv"):
+                    _ask_about_repository(os.path.realpath(match), "mv")
 
 
-def _trash_one(target: str, cwd: str | None) -> None:
+def _trash_one(target: str, cwd: str | None, literal: bool = False) -> None:
     if _names_trash(target):
         raise Denied(message("delete_guard.reason.trash_inside", path=target))
     _check_match_mark(target, "trash")
@@ -1131,19 +1146,20 @@ def _trash_one(target: str, cwd: str | None) -> None:
         if re.search(r"\$\(|`", target):
             _ask("delete_guard.reason.trash_computed", raw=target)
         return
-    resolved = _expand(_glob_base(target), cwd)
+    resolved = _expand(target if literal else _glob_base(target), cwd)
     if resolved is None:
         return
     _check_sendable(resolved)
-    for match in _glob_matches(target, cwd, "trash"):
+    for match in [] if literal else _glob_matches(target, cwd, "trash"):
         found = os.path.realpath(match)
         if _names_trash(match) or (_is_folder_path(found, "trash", target) and _holds_trash(found)):
             raise Denied(message("delete_guard.reason.trash_inside", path=match))
         _check_sendable(found)
         _ask_about_repository(found, "trash")
-    if _glob_base(target) == target:
+    named = literal or _glob_base(target) == target
+    if named:
         _ask_about_repository(resolved, "trash")
-    if _glob_base(target) == target and _is_folder_path(resolved, "trash", target) and _holds_trash(resolved):
+    if named and _is_folder_path(resolved, "trash", target) and _holds_trash(resolved):
         raise Denied(message("delete_guard.reason.trash_inside", path=resolved))
 
 
@@ -1365,6 +1381,18 @@ def _find(words: list[str], cwd: str | None) -> None:
                 raise Denied(message("delete_guard.reason.xargs_rm"))
             # What find runs reads the standard input find was given, opened in the folder find runs in.
             _check_chunk(command, None if predicate in {"-execdir", "-okdir"} else cwd, " ".join(command), trusted=False)
+    # With -maxdepth 0 the folders find starts in are the only names it gives, so a command that sends them to the Trash is
+    # checked with them in place of {}.
+    if any(first == "-maxdepth" and second == "0" for first, second in zip(words, words[1:])):
+        for predicate, body in parts.executions:
+            try:
+                stripped = strip_wrappers(body)
+            except UnresolvableCommand:
+                continue
+            if "{}" in body and stripped and (_base(stripped[0]) in TRASH_TOOLS or _base(stripped[0]) in {"gio", "mv"}):
+                for start in parts.starts or ["."]:
+                    sent = [start if argument == "{}" else argument for argument in body]
+                    _check_chunk(sent, cwd, " ".join(sent), trusted=False)
     if not deleting:
         return
     if parts.input_roots:
