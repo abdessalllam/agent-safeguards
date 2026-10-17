@@ -73,6 +73,11 @@ PASSWORD_LABEL = re.compile(r"(?i)pass|pwd")
 # environment variable name (`OPENAI_API_KEY`) is code that refers to a secret, not one; a password may be a passphrase, so for a
 # password label only the forms code uses (not hyphenated words) are skipped.
 IDENTIFIER_WORDS = re.compile(r"_*[A-Za-z]{2,}(?:[_:-][A-Za-z]+)+(?:[-_][0-9]{1,4})?|_+[A-Za-z][A-Za-z_]{2,}|[a-z]{2,}[-_][0-9]{1,6}")
+QUERY_CONTINUATION = re.compile(r"([^&]+)&[A-Za-z_][\w.-]*=")
+ENV_REFERENCE = re.compile(r"[A-Za-z_.]+/[A-Z][A-Z0-9_]+")
+PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+RUST_PATH = re.compile(r"&?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)+")
+WORD_LIST = re.compile(r"[a-z]{2,}[0-9]{0,3}(?:[-_][a-z]{2,}[0-9]{0,3})*")
 # A number or a float (`1.5e-06`), an email address and a reference to an environment variable (`os.environ/OPENAI_API_KEY`, the
 # way a config file names a secret without holding it) are not secrets either.
 NON_SECRET_VALUE = re.compile(
@@ -118,25 +123,30 @@ def _token_looks_real(value: str) -> bool:
     if _placeholder_shaped(value) or "..." in value or "\u2026" in value or "EXAMPLE" in value:
         return False
     mixed = any(c.isupper() for c in value) and any(c.islower() for c in value) and any(c.isdigit() for c in value)
-    return mixed or (len(value) >= 24 and _entropy(value) >= 3.3)
+    return mixed or (len(value) >= 24 and _entropy(value) >= 3.3) or (len(value) >= 16 and any(c.isdigit() for c in value) and _entropy(value) >= 3.0)
 
 
 def _real_prefixed_key(found: re.Match) -> bool:
     return _token_looks_real(found.group("value"))
 
 
-# `Basic` carries `user:password` in base64, which is short and has no tell-tale shape, so only a placeholder is let through.
+# After an `Authorization` header the value is a credential whatever its length or shape (`Basic` is `user:password` in base64,
+# a bearer token may be a short hex string), so only a placeholder, a constant name or a gap is let through.
 def _real_authorization(found: re.Match) -> bool:
     value = found.group("value")
-    if found.group("scheme").lower() == "basic":
-        return not (_placeholder_shaped(value) or "..." in value or "\u2026" in value)
-    return _token_looks_real(value)
+    return not (_placeholder_shaped(value) or CODE_NAME.fullmatch(value) or "..." in value or "\u2026" in value)
 
 
 def _real_credentials(found: re.Match) -> bool:
     value = found.group("value")
     return not (
-        value[0] in "$%<{*:[" or _placeholder_shaped(value) or CODE_NAME.fullmatch(value) or NON_SECRET_VALUE.fullmatch(value)
+        value[0] in "$<{*["
+        or _template_percent(value)
+        or _annotation(value)
+        or _placeholder_shaped(value)
+        or CODE_NAME.fullmatch(value)
+        or NON_SECRET_VALUE.fullmatch(value)
+        or ENV_REFERENCE.fullmatch(value)
     )
 
 
@@ -145,9 +155,15 @@ def _real_credentials(found: re.Match) -> bool:
 # placeholder word.
 def _real_query_value(found: re.Match) -> bool:
     value = found.group("value").strip("'\"`,;)]}>")
-    if not value or value[0] in "$%<{*[:@(":
+    if not value or value[0] in "$<{*[@(" or _template_percent(value) or _annotation(value):
         return False
-    return not (CODE_NAME.fullmatch(value) or CODE_REFERENCE.fullmatch(value) or IDENTIFIER_WORDS.fullmatch(value) or PLACEHOLDER.fullmatch(value))
+    return not (
+        CODE_NAME.fullmatch(value)
+        or CODE_REFERENCE.fullmatch(value)
+        or IDENTIFIER_WORDS.fullmatch(value)
+        or PLACEHOLDER.fullmatch(value)
+        or ENV_REFERENCE.fullmatch(value)
+    )
 
 
 # What a match of one of these patterns must also be before it counts.
@@ -186,14 +202,18 @@ def _ascending_run(value: str, length: int = 6) -> bool:
 
 
 # 1234567890abcdef, xxxxxxxx, aaaaaaaaaa and `your-key-here` are what people write where a key goes; a random key has none of these.
+# A value made of lowercase words counts only when all of it is words: `alpha-bravo-` in front of a random tail does not.
 def _placeholder_shaped(value: str) -> bool:
     return (
         re.fullmatch(r"[a-z]+(?:[-_][a-z]+)*", value) is not None
+        or (
+            WORD_LIST.fullmatch(value) is not None
+            and sum(1 for part in re.split(r"[-_]", value) if re.fullmatch(r"[a-z]{4,}[0-9]{0,3}", part)) >= 2
+        )
         or FIXTURE_VALUE.fullmatch(value) is not None
-        or re.search(r"(.)\1{4,}", value) is not None
+        or PLACEHOLDER.fullmatch(value) is not None
+        or re.search(r"([A-Za-z0-9])\1{4,}", value) is not None
         or _ascending_run(value)
-        # two lowercase words of four letters or more joined by dashes or underscores (`base64-encoded-credentials-here`)
-        or sum(1 for part in re.split(r"[-_]", value) if re.fullmatch(r"[a-z]{4,}", part)) >= 2
     )
 
 
@@ -205,7 +225,30 @@ def _is_slug(value: str) -> bool:
         return False
     total = sum(len(part) for part in parts)
     covered = sum(len(part) for part in parts if SLUG_SEGMENT.fullmatch(part))
-    return covered >= 0.8 * total and sum(1 for part in parts if SLUG_WORD.fullmatch(part)) >= 2
+    # What the words do not explain must stay small: a random key put behind a long run of words is still a key.
+    return covered >= 0.8 * total and total - covered < 20 and sum(1 for part in parts if SLUG_WORD.fullmatch(part)) >= 2
+
+
+# What is left of a value after the `&`, `:` or `*` that annotation syntax puts around a type or a key (`&CancellationToken`,
+# `:Keyring`, `secretName:`) must itself be a code name; a password with a leading `&` is still a password.
+def _annotation(value: str) -> bool:
+    rest = value.strip("&:*")
+    if not rest or rest == value:
+        return False
+    return bool(
+        CODE_NAME.fullmatch(rest)
+        or TITLE_WORD.fullmatch(rest)
+        or IDENTIFIER_WORDS.fullmatch(rest)
+        or CODE_REFERENCE.fullmatch(rest)
+        or RUST_PATH.fullmatch(rest)
+        or re.fullmatch(r"[A-Za-z_]{2,}", rest)
+        or _type_name(rest)
+    )
+
+
+# `%s`, `%(name)s` and `%VAR%` are templates; `%23` and `%2B` are the first character of a URL-encoded value.
+def _template_percent(value: str) -> bool:
+    return value[0] == "%" and (re.fullmatch(r"%[A-Za-z_]\w*%", value) is not None or PERCENT_ESCAPE.match(value) is None)
 
 
 # A name made of letters only, in mixed case, whose words are about three letters or more (`UserAPIKeyAuth`, `StoredOAuthTokens`):
@@ -223,13 +266,21 @@ def _looks_like_path(value: str) -> bool:
 
 def _plausible_value(label: str, value: str) -> bool:
     # `:Type` and `&Type` are annotations, `key:` is a mapping key and a PEM header has its own rule.
-    if PLACEHOLDER.fullmatch(value) or value[0] in "$%<{*~.:&" or value.endswith(":") or value.startswith("-----") or "://" in value[:12] or _looks_like_path(value):
+    if (
+        PLACEHOLDER.fullmatch(value)
+        or value[0] in "$<{*~."
+        or _template_percent(value)
+        or _annotation(value)
+        or value.startswith("-----BEGIN")
+        or "://" in value[:12]
+        or _looks_like_path(value)
+    ):
         return False
     password = bool(PASSWORD_LABEL.search(label))
     if CODE_NAME.fullmatch(value) or TITLE_WORD.fullmatch(value) or (len(value) <= 48 and (FIXTURE_VALUE.fullmatch(value) or "EXAMPLE" in value)):
         return False
     if password:
-        if SNAKE_WORDS.fullmatch(value) or (len(value) <= 40 and PASSWORD_FIXTURE.fullmatch(value)):
+        if SNAKE_WORDS.fullmatch(value) or RUST_PATH.fullmatch(value) or (len(value) <= 40 and PASSWORD_FIXTURE.fullmatch(value)):
             return False
     elif (
         IDENTIFIER_WORDS.fullmatch(value)
@@ -259,7 +310,12 @@ def _labeled_secret(text: str, deadline: float) -> bool:
             return True
         if text[match.end("value") : match.end("value") + 1] in ("(", "["):
             continue
-        if _plausible_value(match.group("label"), match.group("value")):
+        value = match.group("value")
+        # `?token=abc&limit=10`: the value ends where the next parameter begins.
+        following = QUERY_CONTINUATION.match(value)
+        if following:
+            value = following.group(1)
+        if len(value) >= 1 and _plausible_value(match.group("label"), value):
             return True
     return False
 
