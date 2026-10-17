@@ -86,6 +86,24 @@ EVENT_SEARCH_BYTES = 64 * 1024
 RESERVED_EMAIL_DOMAINS = frozenset(
     {"example.com", "example.net", "example.org", "example.test", "localhost"}
 )
+# RFC 2606 names and their subdomains, and the domains test data uses for a made-up address.
+RESERVED_EMAIL_SUFFIXES = (".example.com", ".example.net", ".example.org", ".example", ".test", ".invalid", ".localhost", ".local")
+FIXTURE_EMAIL_DOMAINS = frozenset({"test.com", "domain.com", "company.com", "corp.com", "yourdomain.com", "yourcompany.com"})
+# The address of a mailbox that belongs to a role or to a program, and the `git@host` of a clone address, names no person.
+SHARED_EMAIL_LOCALS = frozenset(
+    {
+        "git", "ssh", "hg", "support", "info", "hello", "contact", "help", "security", "sales", "team", "legal", "privacy", "abuse",
+        "postmaster", "webmaster", "admin", "notifications", "mailer-daemon", "noreply", "no-reply", "donotreply", "do-not-reply",
+    }
+)
+
+
+def _identity_email(match: re.Match) -> bool:
+    domain = match.group(1).lower()
+    local = match.group(0).rsplit("@", 1)[0].lower()
+    if domain in RESERVED_EMAIL_DOMAINS or domain in FIXTURE_EMAIL_DOMAINS or domain.endswith(RESERVED_EMAIL_SUFFIXES):
+        return False
+    return local not in SHARED_EMAIL_LOCALS and not local.startswith(("noreply", "no-reply"))
 SHELL_PUNCTUATION = frozenset(";&|()\n")
 # Options that take a value before the subcommand of these tools, so the value is not mistaken for the subcommand.
 CLI_GLOBAL_VALUE_OPTIONS = {
@@ -123,13 +141,14 @@ DIRECT_IDENTITY_COMMANDS = frozenset(
 DEFINITION_PRINTERS = frozenset(
     {"alias", "declare", "export", "fc", "functions", "history", "local", "readonly", "set", "type", "typeset", "whence", "where"}
 )
+# `alias NAME=` needs a name (a keyword argument `alias = "x"` in code has none) and a printed function header starts its line.
 DEFINITION_OUTPUT_PATTERN = re.compile(
-    r"alias [^\s=]*="
+    r"alias [^\s=]+="
     r"| is an alias for "
     r"| is aliased to "
     r"|: aliased to "
     r"| is a shell function\b"
-    r"|(?m:^[ \t]*\S+ \(\) ?\{?[ \t]*$)"
+    r"|(?m:^\S+ \(\) ?\{?[ \t]*$)"
 )
 # zsh and bash also expose these tables as parameters, so reading one prints the same definitions.
 DEFINITION_PARAMETER_PATTERN = re.compile(r"\$\{?[(@~^=%#a-z)]*(?:aliases|galiases|saliases|functions|dis_aliases|dis_functions|bash_aliases)\b")
@@ -1349,11 +1368,16 @@ def _shows_host_details(command: str, text: str) -> bool:
 
 
 def _sensitive_output(command: str, response: Any) -> bool:
+    return _withheld_because(command, response) is not None
+
+
+# What made an output sensitive, as a short key (`secret`, `email`, `identity`, `definition`, `address`, `host`), or None.
+def _withheld_because(command: str, response: Any) -> str | None:
     text = _response_text(response)
     # A secret shape is looked for in the values alone (a token at the very start) and next to its label (`password=...`).
     if contains_secret(_response_values(response)) or contains_secret(_response_labels(response)):
-        return True
-    private_email = any(match.group(1).lower() not in RESERVED_EMAIL_DOMAINS for match in EMAIL_PATTERN.finditer(text))
+        return "secret"
+    private_email = any(_identity_email(match) for match in EMAIL_PATTERN.finditer(text))
     identity_context = any(
         _normalized(token) in {"account", "auth", "doctor", "identity", "org", "organization", "profile", "status", "whoami"}
         or "identity" in _normalized(token)
@@ -1363,13 +1387,17 @@ def _sensitive_output(command: str, response: Any) -> bool:
     )
     labeled_non_email_identity = NON_EMAIL_IDENTITY_FIELD_PATTERN.search(text) is not None
     values = _response_values(response)
-    return (
-        private_email
-        or (identity_context and labeled_non_email_identity)
-        or DEFINITION_OUTPUT_PATTERN.search(values) is not None
-        or _shows_private_address(values)
-        or _shows_host_details(command, values)
-    )
+    if private_email:
+        return "email"
+    if identity_context and labeled_non_email_identity:
+        return "identity"
+    if DEFINITION_OUTPUT_PATTERN.search(values) is not None:
+        return "definition"
+    if _shows_private_address(values):
+        return "address"
+    if _shows_host_details(command, values):
+        return "host"
+    return None
 
 
 MAX_SHAPE_DEPTH = 6
@@ -1402,7 +1430,17 @@ def _withheld_shape(value: Any, *, root: bool = True, depth: int = 0) -> Any:
     return None
 
 
-def _withhold_post_hook(runtime: str, response: Any) -> None:
+WITHHELD_WHY = {
+    "secret": "safe_tool.withheld.why.secret",
+    "email": "safe_tool.withheld.why.email",
+    "identity": "safe_tool.withheld.why.identity",
+    "definition": "safe_tool.withheld.why.definition",
+    "address": "safe_tool.withheld.why.address",
+    "host": "safe_tool.withheld.why.host",
+}
+
+
+def _withhold_post_hook(runtime: str, response: Any, why: str | None = None) -> None:
     _decision_made[0] = True
     if runtime == "claude":
         if not isinstance(response, dict):
@@ -1411,16 +1449,15 @@ def _withhold_post_hook(runtime: str, response: Any) -> None:
             shape = _withheld_shape(response)
         except Exception:
             shape = {"stdout": message("safe_tool.withheld.placeholder"), "stderr": "", "interrupted": False, "isImage": False}
-        emit(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PostToolUse",
-                    "updatedToolOutput": shape,
-                }
-            }
-        )
+        specific: dict[str, Any] = {"hookEventName": "PostToolUse", "updatedToolOutput": shape}
+        if why:
+            specific["additionalContext"] = message("safe_tool.withheld.context", why=message(WITHHELD_WHY[why]))
+        emit({"hookSpecificOutput": specific})
         return
-    emit({"decision": "block", "reason": message("safe_tool.withheld.reason")})
+    if why:
+        emit({"decision": "block", "reason": message("safe_tool.withheld.reason_why", why=message(WITHHELD_WHY[why]))})
+    else:
+        emit({"decision": "block", "reason": message("safe_tool.withheld.reason")})
 
 
 def _command_of(payload: dict[str, Any]) -> str | None:
@@ -1454,8 +1491,10 @@ def _handle_event(runtime: str, event: str, payload: dict[str, Any]) -> None:
             _deny_hook("safe_tool.deny.rtk")
         elif runtime == "claude" and _requires_local_artifact_approval(command, payload.get("cwd")):
             _ask_local_artifact_hook()
-    elif _sensitive_output(command, payload.get("tool_response")):
-        _withhold_post_hook(runtime, payload.get("tool_response"))
+    else:
+        reason = _withheld_because(command, payload.get("tool_response"))
+        if reason is not None:
+            _withhold_post_hook(runtime, payload.get("tool_response"), reason)
 
 
 # The hook registration names its own event, so an unreadable payload still gets the right kind of refusal.

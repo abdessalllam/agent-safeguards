@@ -41,9 +41,11 @@ The message reads `Sensitive-output command blocked. Use safe-tool or ask the us
 
 The message reads `Sensitive command output was withheld.` (Claude Code shows `[withheld: sensitive output]`). The output contained one of:
 
-- a real email address (anything except `example.com`, `example.net`, `example.org`, `example.test`, `localhost`), even one inside source code;
+- a personal-looking email address, even one inside source code (not a role or program address such as `support@`, `info@`, `noreply@` or the `git@` of a clone address, and not the names reserved for examples and tests: `example.com` and its subdomains, `.test`, `.local`, `test.com`);
 - a secret-shaped value: a private key header, a JWT, an `AKIA...` key, a `ghp_...`, `github_pat_...`, `glpat-...`, `npm_...`, `sk-...`, `xox...-`, or `sk_live_...` token, an `api_key=`, `access_token=`, or `password=` assignment, or `user:pass@` in a URL;
 - a labeled `name=`, `user=`, `account=`, or `org=` field in the output of an account, auth, status, or doctor command.
+
+The message says which of these was found. Placeholders (`your-key-here`, `sk-test-...`, `AKIAIOSFODNN7EXAMPLE`), code that only names a secret (`api_key: UserAPIKeyAuth`, `os.environ/OPENAI_API_KEY`, `token=access_token`), templates (`${KEY}`, `{token}`), development database URLs (`postgres://user:password@localhost`) and long dashed paths or slugs are not treated as secrets.
 
 Narrow the output and retry: list paths only (`rg -l`), count (`rg -c`), drop matching lines (`| rg -v '@'`), select fields with `jq`, or search for structure instead of values. Never print Git authors.
 
