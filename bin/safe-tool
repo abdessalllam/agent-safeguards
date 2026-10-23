@@ -451,21 +451,17 @@ GENERIC_PRIVATE_SUBCOMMANDS = frozenset(
 GENERIC_PRIVATE_ACTIONS = frozenset(
     {"current", "get", "list", "login", "logout", "org", "show", "status", "switch", "whoami"}
 )
-SAFE_LOG_FORMATS = frozenset(
+# What a `git log --format` placeholder can print. Hashes, subjects, ref names and dates name nobody; the author, committer and
+# reflog names and emails, the body (it can end in `Signed-off-by:` and `Co-authored-by:` lines), notes and signature details do.
+# A placeholder that is not on this list is refused, so a new one is never let through by default.
+SAFE_LOG_PLACEHOLDERS = frozenset("HhTtPpdDefmnsS")
+SAFE_LOG_DATE_LETTERS = {"a": "dDiIstr", "c": "dDiIstr", "g": "Dds"}
+SAFE_PRETTY_NAMES = frozenset({"oneline", "reference"})
+SAFE_FOR_EACH_REF_FIELDS = frozenset(
     {
-        "%H",
-        "%h",
-        "%s",
-        "%H%x09%s",
-        "%h%x09%s",
-        "%H%x09%ct%x09%s",
-        "format:%H",
-        "format:%h",
-        "format:%s",
-        "format:%H%x09%s",
-        "format:%h%x09%s",
-        "format:%H%x09%ct%x09%s",
-        "oneline",
+        "refname", "objectname", "objecttype", "objectsize", "deltabase", "tree", "parent", "numparent", "object", "type", "tag",
+        "subject", "authordate", "committerdate", "taggerdate", "creatordate", "upstream", "push", "head", "symref", "worktreepath",
+        "flag", "head", "HEAD", "describe", "ahead-behind", "align", "if", "then", "else", "end", "rest", "color",
     }
 )
 SAFE_ENV_KEYS = (
@@ -585,6 +581,88 @@ def _git_subcommand(words: list[str]) -> tuple[str | None, list[str]]:
     return None, []
 
 
+# Whether every placeholder of a `--format` string (after any `format:` or `tformat:` prefix) is one that names nobody.
+def _log_format_is_safe(template: str) -> bool:
+    if template in SAFE_PRETTY_NAMES:
+        return True
+    for prefix in ("tformat:", "format:"):
+        if template.startswith(prefix):
+            template = template[len(prefix) :]
+            break
+    else:
+        if "%" not in template and template:
+            return False
+    index = 0
+    length = len(template)
+    while index < length:
+        if template[index] != "%":
+            index += 1
+            continue
+        index += 1
+        # `%+d`, `%-d` and `% d` add or drop a line break or a space around the placeholder that follows.
+        while index < length and template[index] in "+- ":
+            index += 1
+        if index >= length:
+            return False
+        letter = template[index]
+        index += 1
+        if letter == "%":
+            continue
+        if letter == "x":
+            if not re.fullmatch(r"[0-9A-Fa-f]{2}", template[index : index + 2]):
+                return False
+            index += 2
+        elif letter == "C":
+            if template[index : index + 1] == "(":
+                closing = template.find(")", index)
+                if closing == -1:
+                    return False
+                index = closing + 1
+            else:
+                index += len(re.match(r"[A-Za-z]*", template[index:]).group(0))
+        elif letter in "w<>":
+            # `%w(...)` wraps and `%<(n)`, `%>(n)`, `%><(n)`, `%<|(n)`, `%>|(n)` pad or cut the placeholder that follows.
+            if letter != "w":
+                while index < length and template[index] in "<>|":
+                    index += 1
+            if template[index : index + 1] != "(":
+                return False
+            closing = template.find(")", index)
+            if closing == -1:
+                return False
+            index = closing + 1
+        elif letter == "(":
+            closing = template.find(")", index)
+            if closing == -1 or not re.match(r"(?:describe|decorate)\b", template[index:closing]):
+                return False
+            index = closing + 1
+        elif letter in SAFE_LOG_DATE_LETTERS:
+            if template[index : index + 1] not in tuple(SAFE_LOG_DATE_LETTERS[letter]):
+                return False
+            index += 1
+        elif letter == "G":
+            # Only the one-letter status; the signer, key and fingerprint name people.
+            if template[index : index + 1] != "?":
+                return False
+            index += 1
+        elif letter not in SAFE_LOG_PLACEHOLDERS:
+            return False
+    return True
+
+
+# Whether every `%(field)` of a `git for-each-ref --format` string is one that names nobody.
+def _ref_format_is_safe(template: str) -> bool:
+    for found in re.finditer(r"%\(([^)]*)\)", template):
+        name = found.group(1).lstrip("*")
+        base, _, argument = name.partition(":")
+        if base == "contents":
+            if argument not in {"subject", "size"}:
+                return False
+        elif base not in SAFE_FOR_EACH_REF_FIELDS:
+            return False
+    return True
+
+
 # Git applies the last format option, so only that one decides whether author details can print.
 def _safe_history_arguments(arguments: list[str], *, show: bool) -> bool:
     effective: str | None = None
@@ -600,9 +678,9 @@ def _safe_history_arguments(arguments: list[str], *, show: bool) -> bool:
             effective = "default"
     if effective is None:
         return False
-    if show and not effective:
-        return True
-    return effective in SAFE_LOG_FORMATS
+    if effective == "default":
+        return False
+    return _log_format_is_safe(effective) if effective else True
 
 
 def _shows_only_blobs(arguments: list[str]) -> bool:
@@ -613,6 +691,29 @@ def _shows_only_blobs(arguments: list[str]) -> bool:
         if not argument.startswith("-"):
             operands.append(argument)
     return bool(operands) and all(GIT_BLOB_SPEC.fullmatch(operand) for operand in operands)
+
+
+# `rev-list` and `for-each-ref` print only what their format names: the last `--format` (or `--pretty`) is judged, a bare one
+# prints the default, which holds names for `rev-list --header`, and anything after `--` is not an option.
+def _formats_are_unsafe(arguments: list[str], *headers: str, refs: bool = False) -> bool:
+    fmt: str | None = None
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        index += 1
+        if argument == "--":
+            break
+        if argument in headers:
+            return True
+        lowered = argument.lower()
+        if lowered.startswith(("--format=", "--pretty=")):
+            fmt = argument.split("=", 1)[1]
+        elif lowered in {"--format", "--pretty"}:
+            fmt = arguments[index] if index < len(arguments) else ""
+            index += 1
+    if fmt is None:
+        return False
+    return not (_ref_format_is_safe(fmt) if refs else _log_format_is_safe(fmt))
 
 
 def _sensitive_git_command(words: list[str]) -> bool:
@@ -628,9 +729,9 @@ def _sensitive_git_command(words: list[str]) -> bool:
     if subcommand == "remote":
         return any(argument in {"-v", "--verbose", "get-url"} for argument in arguments)
     if subcommand == "rev-list":
-        return any(argument.startswith(("--format", "--pretty")) for argument in arguments)
+        return _formats_are_unsafe(arguments, "--header")
     if subcommand == "for-each-ref":
-        return any(re.search(r"(?i)(author|committer|creator|email|signature)", argument) for argument in arguments)
+        return _formats_are_unsafe(arguments, refs=True)
     return False
 
 
@@ -1216,6 +1317,18 @@ def _blocked_only_by_startup_file(command: str) -> bool:
 
 
 # When the proxy prefix is the only problem the agent needs the one-line fix, not the generic refusal.
+# A git history command whose format could print an author, a committer or a message body: the agent needs the way to ask for
+# hashes, subjects and dates, not the generic refusal.
+def _blocked_by_git_format(command: str) -> bool:
+    for text in (command, *command_substitutions(command)):
+        for chunk in _tokenize(text):
+            words, _ = _unwrap(chunk)
+            subcommand, _ = _git_subcommand(words)
+            if subcommand in {"log", "show", "rev-list", "for-each-ref"} and _sensitive_git_command(words):
+                return True
+    return False
+
+
 def _blocked_only_by_proxy(command: str) -> bool:
     without_proxy = PROXY_PREFIX.sub("rtk", command)
     return without_proxy != command and not _sensitive_command(without_proxy)
@@ -1486,7 +1599,12 @@ def _handle_event(runtime: str, event: str, payload: dict[str, Any]) -> None:
             if _blocked_only_by_proxy(command):
                 _deny_hook("safe_tool.deny.proxy")
             else:
-                _deny_hook("safe_tool.deny.startup_file" if _blocked_only_by_startup_file(command) else "safe_tool.deny.sensitive")
+                if _blocked_only_by_startup_file(command):
+                    _deny_hook("safe_tool.deny.startup_file")
+                elif _blocked_by_git_format(command):
+                    _deny_hook("safe_tool.deny.git_format")
+                else:
+                    _deny_hook("safe_tool.deny.sensitive")
         elif _require_rtk() and _rtk_required(command):
             _deny_hook("safe_tool.deny.rtk")
         elif runtime == "claude" and _requires_local_artifact_approval(command, payload.get("cwd")):
