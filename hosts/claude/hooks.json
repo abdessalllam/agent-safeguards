@@ -27,11 +27,31 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "^Read$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh\" safe-tool claude PreToolUse",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "PostToolUse": [
       {
         "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh\" safe-tool claude PostToolUse",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "^(Read|Edit|Write|MultiEdit|NotebookEdit|Grep|mcp__.*)$",
         "hooks": [
           {
             "type": "command",

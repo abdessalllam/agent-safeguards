@@ -57,6 +57,7 @@ Keep credentials out of the transcript. Keep deletes away from your drive.
 Shell-command guardrails for Claude Code and Codex. Two small hooks check every shell command an agent runs:
 
 - **safe-tool** keeps identity and credential data out of the transcript. It blocks commands that print it and withholds output that contains it.
+  Agents may write keys into files for you, but never read them. A Claude Code `Read` of lines that hold a key is refused before it runs, and a result of `Read`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `Grep` or an MCP tool that holds a key is withheld. These tools are judged by key format alone (provider tokens, private keys, `Authorization` headers, URL credentials, JWTs; `?token=` query strings and signed-URL parameters are left out because source and docs are full of them), so test passwords, hashes, emails and addresses in source stay readable. Codex gets the result check for `apply_patch`, `Edit`, `Write` and MCP tools; it has no read tool, so its reads go through the shell check. Codex also saves its own raw copy of every command output in the session file, which no hook can change.
 - **delete-guard** stops deletes that could wipe a drive. It blocks recursive deletes outside the current repository and temp folders.
 
 Everything runs locally. There is no network access, no telemetry, and no account. The only dependency is `python3` (standard library only), plus `git` for the Git features.
@@ -297,6 +298,9 @@ host (Claude Code or Codex)
   PreToolUse  Bash -> scripts/hook.sh -> bin/safe-tool    hook <host>   deny or ask
                    -> scripts/hook.sh -> bin/delete-guard hook <host>   deny
   PostToolUse Bash -> scripts/hook.sh -> bin/safe-tool    hook <host>   withhold output
+  PreToolUse  Read -> scripts/hook.sh -> bin/safe-tool    hook claude   refuse a read of lines that hold a key
+  PostToolUse Read, Edit, Write, MultiEdit, NotebookEdit, Grep, MCP tools (Codex: apply_patch, Edit, Write, MCP tools)
+                   -> scripts/hook.sh -> bin/safe-tool    hook <host>   withhold a result that holds a key
 ```
 
 - Each manifest points at its own hook file (`hosts/claude/hooks.json`, `hosts/codex/hooks.json`), so neither host loads the other's.

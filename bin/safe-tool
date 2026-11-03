@@ -57,7 +57,7 @@ from agent_safeguards.common import (  # noqa: E402
     strip_wrappers,
     unquoted_lines,
 )
-from agent_safeguards.secret_scan import contains_secret  # noqa: E402
+from agent_safeguards.secret_scan import contains_key, contains_secret  # noqa: E402
 
 # These immutable contracts stay at module scope so hooks and commands share one policy.
 TOOL_NAME = "safe-tool"
@@ -1553,15 +1553,18 @@ WITHHELD_WHY = {
 }
 
 
-def _withhold_post_hook(runtime: str, response: Any, why: str | None = None) -> None:
+def _withhold_post_hook(runtime: str, response: Any, why: str | None = None, replacement: Any = None) -> None:
     _decision_made[0] = True
     if runtime == "claude":
-        if not isinstance(response, dict):
-            response = {"stdout": "", "stderr": "", "interrupted": False, "isImage": False}
-        try:
-            shape = _withheld_shape(response)
-        except Exception:
-            shape = {"stdout": message("safe_tool.withheld.placeholder"), "stderr": "", "interrupted": False, "isImage": False}
+        if replacement is not None:
+            shape = replacement
+        else:
+            if not isinstance(response, dict):
+                response = {"stdout": "", "stderr": "", "interrupted": False, "isImage": False}
+            try:
+                shape = _withheld_shape(response)
+            except Exception:
+                shape = {"stdout": message("safe_tool.withheld.placeholder"), "stderr": "", "interrupted": False, "isImage": False}
         specific: dict[str, Any] = {"hookEventName": "PostToolUse", "updatedToolOutput": shape}
         if why:
             specific["additionalContext"] = message("safe_tool.withheld.context", why=message(WITHHELD_WHY[why]))
@@ -1579,6 +1582,103 @@ def _command_of(payload: dict[str, Any]) -> str | None:
     return command if isinstance(command, str) else None
 
 
+# These tools show file content or search results. A key in what they show is withheld; a Read whose lines hold one is refused
+# before it runs, so the key never reaches the session log either. Agents may write keys into files for the user, never read them.
+CONTENT_TOOLS = frozenset({"Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "Grep", "apply_patch"})
+READ_DEFAULT_LINES = 2000
+READ_LINE_CHARACTERS = 2000
+READ_MAX_LINES = 200000
+# A content result is read up to this size (the shell output limit is MAX_OUTPUT_BYTES), so a large Edit result can still be redacted.
+CONTENT_INPUT_BYTES = 16 * 1024 * 1024
+TOOL_NAME_PATTERN = re.compile(rb'"tool_name"\s*:\s*"([^"]{1,64})"')
+READ_SKIPPED_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf")
+
+
+def _content_tool_name(name: Any) -> bool:
+    return isinstance(name, str) and (name in CONTENT_TOOLS or name.startswith("mcp__"))
+
+
+def _content_tool(payload: dict[str, Any]) -> bool:
+    return _content_tool_name(payload.get("tool_name"))
+
+
+# The strings of a response that hold a key, replaced one by one; what else the response holds is kept as it is.
+def _redact_keys(value: Any, depth: int = 0) -> tuple[Any, bool]:
+    if depth > MAX_RESPONSE_DEPTH:
+        raise _ResponseTooComplex
+    placeholder = message("safe_tool.withheld.placeholder")
+    if isinstance(value, str):
+        return (placeholder, True) if contains_key(value) else (value, False)
+    if isinstance(value, dict):
+        copy: dict[str, Any] = {}
+        found = False
+        for position, (key, child) in enumerate(value.items()):
+            name = f"field{position}" if contains_key(str(key)) else key
+            found = found or name is not key
+            if isinstance(child, str) and not contains_key(child) and contains_key(f"{str(key)[:256]}={child[:MAX_LABEL_VALUE]}"):
+                copy[name], found = placeholder, True
+                continue
+            copy[name], changed = _redact_keys(child, depth + 1)
+            found = found or changed
+        return copy, found
+    if isinstance(value, list):
+        items = [_redact_keys(child, depth + 1) for child in value]
+        return [item for item, _ in items], any(changed for _, changed in items)
+    return value, False
+
+
+# A number that is not a plain positive integer (a string, a float) cannot be placed, so the whole file is scanned instead.
+def _line_number(value: Any, default: int) -> int | None:
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value)
+    if isinstance(value, int):
+        return value if value > 0 else default
+    return None
+
+
+# The window is one line wider on each side than the one Read reports, so a count that starts at 0 or 1 cannot hide a line.
+def _read_lines(tool_input: dict[str, Any], cwd: Any) -> str | None:
+    path = tool_input.get("file_path")
+    if not isinstance(path, str) or path.lower().endswith(READ_SKIPPED_SUFFIXES):
+        return None
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path) and isinstance(cwd, str):
+        path = os.path.join(cwd, path)
+    first, count = _line_number(tool_input.get("offset"), 1), _line_number(tool_input.get("limit"), READ_DEFAULT_LINES)
+    start, stop = (0, READ_MAX_LINES) if first is None or count is None else (first - 1, min(first + count + 1, READ_MAX_LINES))
+    lines: list[str] = []
+    try:
+        with open(path, "rb") as handle:
+            for number, line in enumerate(handle, start=1):
+                if number > stop:
+                    break
+                if number >= start:
+                    if b"\0" in line:
+                        return None
+                    lines.append(line.decode("utf-8", "replace").rstrip("\r\n")[:READ_LINE_CHARACTERS])
+    except OSError:
+        return None
+    return "\n".join(lines)
+
+
+def _handle_content_tool(runtime: str, event: str, payload: dict[str, Any]) -> None:
+    if event == "PreToolUse":
+        tool_input = payload.get("tool_input")
+        if payload.get("tool_name") == "Read" and isinstance(tool_input, dict):
+            lines = _read_lines(tool_input, payload.get("cwd"))
+            if lines is not None and contains_key(lines):
+                _deny_hook("safe_tool.deny.key_file")
+        return
+    response = payload.get("tool_response")
+    if contains_key(_response_values(response)) or contains_key(_response_labels(response)):
+        # Claude Code ignores a replacement that is not valid for the tool, so only the strings that hold a key are replaced
+        # and the fields, numbers and kinds around them stay as the tool made them.
+        replacement, found = _redact_keys(response) if runtime == "claude" else (None, False)
+        _withhold_post_hook(runtime, response, "secret", replacement if found else None)
+
+
 def _handle_event(runtime: str, event: str, payload: dict[str, Any]) -> None:
     if event == "SessionStart":
         cwd = payload.get("cwd")
@@ -1588,6 +1688,9 @@ def _handle_event(runtime: str, event: str, payload: dict[str, Any]) -> None:
     if event not in {"PreToolUse", "PostToolUse"}:
         return
     command = _command_of(payload)
+    if command is None and _content_tool(payload):
+        _handle_content_tool(runtime, event, payload)
+        return
     if command is None:
         if event == "PostToolUse":
             _withhold_post_hook(runtime, payload.get("tool_response"))
@@ -1631,9 +1734,13 @@ def _fail_closed_unreadable(runtime: str, raw_input: bytes, expected_event: str 
 def _run_hook(runtime: str, expected_event: str | None = None) -> int:
     raw_input = b""
     try:
-        raw_input = sys.stdin.buffer.read(MAX_OUTPUT_BYTES + 1)
-        if len(raw_input) > MAX_OUTPUT_BYTES:
+        raw_input = sys.stdin.buffer.read(CONTENT_INPUT_BYTES + 1)
+        if len(raw_input) > CONTENT_INPUT_BYTES:
             raise ValueError
+        if len(raw_input) > MAX_OUTPUT_BYTES:
+            named = TOOL_NAME_PATTERN.search(raw_input[:EVENT_SEARCH_BYTES])
+            if not (named and _content_tool_name(named.group(1).decode("utf-8", "replace"))):
+                raise ValueError
         payload = json.loads(raw_input)
         if not isinstance(payload, dict):
             raise ValueError

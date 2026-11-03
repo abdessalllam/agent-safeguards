@@ -49,6 +49,10 @@ The message says which of these was found. Placeholders (`your-key-here`, `sk-te
 
 Narrow the output and retry: list paths only (`rg -l`), count (`rg -c`), drop matching lines (`| rg -v '@'`), select fields with `jq`, or search for structure instead of values. Never print Git authors.
 
+## safe-tool: a file read refused, or a file result withheld
+
+`Read blocked: those lines hold a key` means the lines the Read would return contain a key. Agents never read keys: read a range that leaves the key out (`offset` and `limit`), find what you need with `rg -l` or `rg -c`, or ask the user. A result of `Edit`, `Write`, `Grep` or an MCP tool shown as `[withheld: sensitive output]` held a key as well; the tool still ran.
+
 ## safe-tool: commands
 
 `safe-tool git commit -m "<subject>" -m "<body>"` commits what is staged and prints JSON. Run it from inside the repository or worktree. The message cannot be empty or over 16 KB and cannot contain an email address or a secret. When the operator enabled `AGENT_SAFEGUARDS_BLOCK_ATTRIBUTION`, it also cannot contain a `Co-authored-by:` or `Generated-by:` trailer.

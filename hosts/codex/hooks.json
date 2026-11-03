@@ -27,6 +27,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "^(apply_patch|Edit|Write|mcp__.*)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/hook.sh\" safe-tool codex PostToolUse",
+            "timeout": 5
+          }
+        ]
       }
     ]
   }

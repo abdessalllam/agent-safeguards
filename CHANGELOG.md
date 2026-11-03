@@ -4,6 +4,8 @@
 
 First release.
 
+- safe-tool: a `Read` of lines that hold a key is refused before it runs (Claude Code), and results of `Read`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `Grep` and MCP tools (Codex: `apply_patch`, `Edit`, `Write`, MCP tools) that hold a key are withheld. These tools use a key-format scan only (`contains_key`), which leaves out the labelled-value and bare-string guesses, so ordinary source stays readable. Found by scanning 17.6 GB of agent session logs: real LLM keys had entered through an `Edit` result that the shell-only hooks never saw.
+
 - safe-tool: blocks commands that print identity or credential data, withholds output that contains it, and provides `git identity`, `git commit`, and `status coderabbit`. It looks through variable prefixes, shell keywords and wrappers, checks every line of a multi-line command, catches relative credential paths, and judges Git log formats by the last format option.
 - delete-guard: blocks recursive deletes outside the current repository and temp folders, plus disk-erase commands (`mkfs.*`, `newfs_*`, `dd` onto a device). It refuses glob-plus-`..` targets, understands wrapper and `xargs` options, and does not trust a `cd` it cannot follow.
 - Both hooks block on unreadable or oversized input and on internal errors, and the launcher blocks when the tool crashes.

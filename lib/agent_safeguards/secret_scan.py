@@ -23,6 +23,8 @@ BEARER_VALUE = re.compile(r"(?i)bearer\s+(?![$<{])(?P<value>[A-Za-z0-9._~+/=-]{2
 QUERY_SECRET = re.compile(r"(?i)[?&](?:[a-z0-9.-]{0,30}_)?(?P<name>token|key|secret|password|passwd|apikey)=(?P<value>[^\s&#]+)")
 URL_CREDENTIALS = re.compile(r"(?i)[a-z][a-z0-9+.-]{0,30}://[^\s/:@]*:(?P<value>[^\s/@]+)@")
 
+SIGNED_URL = re.compile(r"(?i)[?&](?:sig|signature|x-amz-signature)=[A-Za-z0-9%+/=_-]{20,}")
+
 FORMAT_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY[A-Z ]{0,40}-----"),
     re.compile(r"LS0tLS1CRUdJTi[A-Za-z0-9+/]{16,}"),
@@ -46,7 +48,7 @@ FORMAT_PATTERNS = (
     BEARER_VALUE,
     re.compile(r"(?i)\blogin\s+\S+\s+password\s+\S{4,}"),
     re.compile(r"(?i)\"auth\"\s*:\s*\"[A-Za-z0-9+/=]{16,}\""),
-    re.compile(r"(?i)[?&](?:sig|signature|x-amz-signature)=[A-Za-z0-9%+/=_-]{20,}"),
+    SIGNED_URL,
     QUERY_SECRET,
     # Repeats are bounded where several match starts can share one run of characters (here the scheme),
     # which keeps every pattern linear: a hook that overruns its timeout lets the output through.
@@ -375,3 +377,17 @@ def contains_secret(text: str) -> bool:
             return True
     found = _jwt_secret(text) or _labeled_secret(text, deadline) or _bare_secret(text, deadline)
     return found or time.monotonic() > deadline
+
+
+# The keys a file or a tool result holds, judged by their format alone: what a read of source code or a config would show.
+# The labelled-value and bare-string guesses stay out (they flag test passwords, hashes and encoded data in ordinary files), and so do
+# `?token=value` and signed-URL parameters, which source code and docs are full of (a third of the files this scan would refuse).
+KEY_PATTERNS = tuple(pattern for pattern in FORMAT_PATTERNS if pattern not in (QUERY_SECRET, SIGNED_URL))
+
+
+def contains_key(text: str) -> bool:
+    deadline = time.monotonic() + SCAN_BUDGET_SECONDS
+    for pattern in KEY_PATTERNS:
+        if _format_secret(pattern, text, deadline) or time.monotonic() > deadline:
+            return True
+    return _jwt_secret(text) or time.monotonic() > deadline
