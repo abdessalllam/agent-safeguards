@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use crate::decision::Change;
 use crate::Provider;
 
-const MAX_OLD_FILE: u64 = 2 * 1024 * 1024;
+pub const MAX_OLD_FILE: u64 = 2 * 1024 * 1024;
 
 enum Mode {
     None,

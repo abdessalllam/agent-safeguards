@@ -65,6 +65,7 @@ SELF_PATH = os.path.realpath(__file__)
 GIT_PATH = find_executable("git")
 RTK_PATH = find_executable("rtk")
 CODERABBIT_PATH = find_executable("coderabbit")
+COMMENT_GUARD_PATH = find_executable("comment-guard")
 MAX_OUTPUT_BYTES = 1024 * 1024
 STATUS_TIMEOUT_SECONDS = 20
 GIT_TIMEOUT_SECONDS = 300
@@ -484,6 +485,7 @@ SAFE_FOR_EACH_REF_FIELDS = frozenset(
     }
 )
 SAFE_ENV_KEYS = (
+    "AGENT_SAFEGUARDS_COMMENT_GUARD",
     "SSH_AUTH_SOCK",
     "TERM",
 )
@@ -2066,6 +2068,15 @@ def _object_id(output: bytes) -> str | None:
     return value if OBJECT_ID_PATTERN.fullmatch(value) else None
 
 
+def _comment_guard_denial(root: str, tree: str) -> str | None:
+    if COMMENT_GUARD_PATH is None:
+        return None
+    completed = _run([COMMENT_GUARD_PATH, "tree", tree], cwd=root, timeout=STATUS_TIMEOUT_SECONDS)
+    if completed is None or completed.returncode != 1:
+        return None
+    return completed.stdout.decode("utf-8", "replace").strip() or None
+
+
 def _git_commit(messages: list[str]) -> int:
     commit_message = "\n\n".join(messages).strip()
     if (
@@ -2096,6 +2107,10 @@ def _git_commit(messages: list[str]) -> int:
     if candidate_tree is None or paths is None or paths.returncode != 0:
         emit({"tool": "git", "operation": "commit", "status": "operation_failed"})
         return 2
+    reason = _comment_guard_denial(root, candidate_tree)
+    if reason is not None:
+        emit({"tool": "git", "operation": "commit", "status": "comments_blocked", "reason": reason})
+        return 1
     arguments = ["commit", "--quiet", "--no-status"]
     for paragraph in messages:
         arguments.extend(("--message", paragraph))

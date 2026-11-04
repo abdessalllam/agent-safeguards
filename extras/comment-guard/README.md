@@ -1,6 +1,6 @@
 # comment-guard (optional, off by default)
 
-A small Rust program that keeps coding agents from flooding code with comments. It runs as a `PreToolUse` hook for Claude Code (`Edit`, `Write`, `MultiEdit`) and Codex (`apply_patch`), reads the text an edit is about to add, and refuses the call with a reason when the new comments break the rule. The agent then retries with fewer comments.
+A small Rust program that keeps coding agents from flooding code with comments. It runs as a `PreToolUse` hook for Claude Code (`Edit`, `Write`, `MultiEdit`) and Codex (`apply_patch`), reads the text an edit is about to add, and refuses the call with a reason when the new comments break the rule. The agent then retries with fewer comments. `safe-tool git commit` also runs it on the files of the commit about to be made, which catches comments added in many small edits.
 
 It is a quality guard, not a security guard. It is **off** until you turn it on, it is not part of the plugin's default hooks, and it fails open: bad input, an internal error or an oversized payload allow the call and print one line on stderr.
 
@@ -20,6 +20,15 @@ A comment already present in the old text is not new, so moving code together wi
 These are never counted: a shebang, a PHP `#[attribute]`, and comments that start with a lint, type, license or tooling directive (`noqa`, `type:`, `pragma`, `pylint:`, `eslint-`, `@ts-`, `go:`, `nolint`, `spdx-license-identifier`, `copyright`, `license`, `shellcheck`, `region`, `mark:`, `-*-` and similar; the full list is `EXEMPT` in `src/comments.rs`).
 
 Languages are chosen by file extension: `#` comments for `py pyi rb sh bash zsh fish pl pm r ex exs nim cr`, `//` and `/* */` for `rs go js jsx mjs cjs ts tsx java kt kts swift c h cc cpp cxx hpp hh cs dart scala groovy gradle m mm zig proto sol`, both for `php`, and `--` for `lua sql hs elm`. Markdown, JSON, YAML, TOML and other files are not checked.
+
+## Commit-time check
+
+`safe-tool git commit` runs `comment-guard tree <tree-id>` on the tree it is about to commit, when `comment-guard` is installed in one of safe-tool's trusted folders (`~/.local/bin` is one) and the guard is switched on. The program compares that tree with `HEAD` and applies the same rule to each source file: at most 2 new comment lines in 1 block per file in the whole commit, no history markers, no line over 100 characters. Many small edits that each passed the hook add up here.
+
+- A refusal makes `safe-tool git commit` print `{"status":"comments_blocked","reason":"..."}`, exit 1 and create no commit. The agent shortens or removes the comments in the staged files and commits again.
+- A comment already present in the old file is not new. A rename is followed only when git detects it (at least half of the file unchanged, and not more files than git's `diff.renameLimit`); a file moved and mostly rewritten counts as new.
+- Nothing is checked while a merge, squash merge, cherry-pick, revert or rebase is in progress (the commit then holds other people's changes), for a file over 2 MiB or that is not UTF-8, for a path that holds a newline or is not valid UTF-8, or past 8 MiB of file content in one commit.
+- Any failure (no `git`, an unreadable tree, a timeout) allows the commit; run by hand, the program says why on stderr. The same switch controls the hook and this check.
 
 ## Build and install
 
@@ -54,7 +63,8 @@ The hook files here are not wired in by default. Merge one into your own setting
 
 ## Limits
 
-- The check is per tool call. An agent that is refused nine comment lines can still add them in several small edits of two lines each, and every one of those edits passes. This was seen in a live Claude Code run. The guard slows the flood down and tells the agent the rule; it does not make the limit absolute.
+- The hook judges one tool call at a time. An agent that is refused nine comment lines can still add them in several small edits of two lines each, and every one of those edits passes. This was seen in a live Claude Code run. The commit-time check refuses the result when it is committed through `safe-tool git commit`, but not when the same comments are spread over several commits (each commit then adds two lines next to the earlier ones), and not for a commit made some other way.
+- The commit-time check also refuses a generated or vendored source file that is full of comments. The agent should tell you; turn the guard off for that commit.
 - Comments after code on the same line are not counted, and neither are docstrings (they are strings). An agent that is refused comments may move the text into a docstring.
 - `MultiEdit` is handled, but current Claude Code versions no longer offer that tool.
 - `NotebookEdit` is not checked.
@@ -64,7 +74,7 @@ The hook files here are not wired in by default. Merge one into your own setting
 
 ```sh
 cd extras/comment-guard
-cargo test --locked
+cargo test --locked    # needs git: the commit-time tests build small repositories
 cargo clippy --locked --all-targets -- -D warnings
 ```
 

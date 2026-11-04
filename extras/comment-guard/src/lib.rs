@@ -5,6 +5,7 @@ pub mod comments;
 pub mod decision;
 pub mod languages;
 pub mod locale;
+pub mod tree;
 
 use std::path::PathBuf;
 
@@ -12,6 +13,7 @@ use serde_json::Value;
 
 pub use changes::collect;
 pub use decision::{evaluate, Change};
+pub use tree::judge_tree;
 
 pub const MAX_INPUT: usize = 8 * 1024 * 1024;
 

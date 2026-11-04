@@ -147,7 +147,7 @@ Every refusal says what to do instead: `git worktree remove <path>` for a worktr
 
 ### comment-guard (optional)
 
-A small Rust program in `extras/comment-guard/` that refuses an `Edit`, `Write` or `apply_patch` call that adds more than one short comment (two lines at most), or a comment with a date, a decision number or an edit-history phrase, and tells the agent to retry with fewer comments. It is off by default, is not part of the plugin's hooks, and fails open. Build it, switch it on and register its hook by hand: see [extras/comment-guard/README.md](extras/comment-guard/README.md). The limit is per tool call, so an agent can still add comments in several small edits.
+A small Rust program in `extras/comment-guard/` that refuses an `Edit`, `Write` or `apply_patch` call that adds more than one short comment (two lines at most), or a comment with a date, a decision number or an edit-history phrase, and tells the agent to retry with fewer comments. It is off by default, is not part of the plugin's hooks, and fails open. Build it, switch it on and register its hook by hand: see [extras/comment-guard/README.md](extras/comment-guard/README.md). The hook judges one tool call at a time, so `safe-tool git commit` runs the same rule on the files of the commit as well, which catches comments added in many small edits.
 
 ## What it does not do
 
