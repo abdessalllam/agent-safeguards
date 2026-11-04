@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Manifests and catalog are valid JSON
         run: |
-          for file in .claude-plugin/*.json .codex-plugin/plugin.json .agents/plugins/marketplace.json hosts/*/hooks.json locales/*.json; do
+          for file in .claude-plugin/*.json .codex-plugin/plugin.json .agents/plugins/marketplace.json hosts/*/hooks.json extras/comment-guard/hooks/*.json locales/*.json; do
             python3 -m json.tool "$file" > /dev/null
           done
       - name: Launcher syntax
@@ -28,3 +28,19 @@ jobs:
         run: |
           python3 -I bin/safe-tool self-test
           python3 -I bin/delete-guard self-test
+
+  comment-guard:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: extras/comment-guard
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Tests and lints
+        run: |
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings

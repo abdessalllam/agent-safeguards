@@ -36,6 +36,7 @@ Keep credentials out of the transcript. Keep deletes away from your drive.
 - [What it does](#what-it-does)
   - [safe-tool](#safe-tool)
   - [delete-guard](#delete-guard)
+  - [comment-guard (optional)](#comment-guard-optional)
 - [What it does not do](#what-it-does-not-do)
 - [Install](#install)
   - [Claude Code](#claude-code)
@@ -60,7 +61,7 @@ Shell-command guardrails for Claude Code and Codex. Two small hooks check every 
   Agents may write keys into files for you, but never read them. A Claude Code `Read` of lines that hold a key is refused before it runs, and a result of `Read`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `Grep` or an MCP tool that holds a key is withheld. These tools are judged by key format alone (provider tokens, private keys, `Authorization` headers, URL credentials, JWTs; `?token=` query strings and signed-URL parameters are left out because source and docs are full of them), so test passwords, hashes, emails and addresses in source stay readable. Codex gets the result check for `apply_patch`, `Edit`, `Write` and MCP tools; it has no read tool, so its reads go through the shell check. Codex also saves its own raw copy of every command output in the session file, which no hook can change.
 - **delete-guard** stops deletes that could wipe a drive. It blocks recursive deletes outside the current repository and temp folders.
 
-Everything runs locally. There is no network access, no telemetry, and no account. The only dependency is `python3` (standard library only), plus `git` for the Git features.
+Everything runs locally. There is no network access, no telemetry, and no account. The only dependency is `python3` (standard library only), plus `git` for the Git features. The optional comment-guard extra is a Rust program you build yourself.
 
 ## Quick start
 
@@ -143,6 +144,10 @@ Sending a whole Git repository to the Trash is asked about, not refused: a folde
 Temp folders are exempt from all of this, even when a repository lives inside one, so scratch clones can be cleaned up. The temp root itself is not: `rm -rf /tmp` and `rm -rf /tmp/*` are refused, while `rm -rf /tmp/agent-probe-*` is fine. `cd` is followed only when the target exists and the command has no grouping; otherwise relative delete targets are refused because the folder is unknown.
 
 Every refusal says what to do instead: `git worktree remove <path>` for a worktree, the Trash for everything else.
+
+### comment-guard (optional)
+
+A small Rust program in `extras/comment-guard/` that refuses an `Edit`, `Write` or `apply_patch` call that adds more than one short comment (two lines at most), or a comment with a date, a decision number or an edit-history phrase, and tells the agent to retry with fewer comments. It is off by default, is not part of the plugin's hooks, and fails open. Build it, switch it on and register its hook by hand: see [extras/comment-guard/README.md](extras/comment-guard/README.md). The limit is per tool call, so an agent can still add comments in several small edits.
 
 ## What it does not do
 

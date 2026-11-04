@@ -4,6 +4,7 @@
 
 First release.
 
+- comment-guard (optional extra, `extras/comment-guard/`): a small Rust `PreToolUse` hook, off by default, that refuses an `Edit`, `Write` or `apply_patch` call that adds more than one short comment (two lines at most, 100 characters a line) or a comment with a date, a decision number or an edit-history phrase, and asks the agent to retry with fewer. Turned on with `AGENT_SAFEGUARDS_COMMENT_GUARD=1` or a config file; not part of the plugin's default hooks; fails open. New messages are under `comment_guard.*` in `locales/en.json`; CI builds, tests and lints it.
 - safe-tool: output that holds OpenSSH's host-key warnings (changed, revoked, unknown, or differing from the IP address), key-exchange and disconnect messages, or the connection lines of `sftp`, `ssh-keyscan`, `rsync` and `mosh` is withheld like the other login messages, because they print the machine's address. `Host key verification failed` on its own is not withheld.
 - safe-tool: a `Read` of lines that hold a key is refused before it runs (Claude Code), and results of `Read`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `Grep` and MCP tools (Codex: `apply_patch`, `Edit`, `Write`, MCP tools) that hold a key are withheld. These tools use a key-format scan only (`contains_key`), which leaves out the labelled-value and bare-string guesses, so ordinary source stays readable. Found by scanning 17.6 GB of agent session logs: real LLM keys had entered through an `Edit` result that the shell-only hooks never saw.
 
