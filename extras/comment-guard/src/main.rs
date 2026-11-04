@@ -23,11 +23,11 @@ fn main() -> ExitCode {
             say(&format!("comment-guard {}", env!("CARGO_PKG_VERSION")));
             ExitCode::SUCCESS
         }
-        Some("status") if args.len() == 1 => {
+        Some("check") if args.len() == 1 => {
             let key = if guard_enabled() {
-                "comment_guard.status.on"
+                "comment_guard.check.on"
             } else {
-                "comment_guard.status.off"
+                "comment_guard.check.off"
             };
             say(&message(key, &[]));
             ExitCode::SUCCESS

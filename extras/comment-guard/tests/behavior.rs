@@ -592,7 +592,7 @@ fn a_non_utf8_argument_prints_the_usage_and_exits_two() {
 fn switch_defaults_to_off() {
     let dir = temp_dir("switch-off");
     let output = Command::new(binary())
-        .arg("status")
+        .arg("check")
         .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD")
         .env("XDG_CONFIG_HOME", &dir)
         .output();
@@ -609,7 +609,7 @@ fn switch_defaults_to_off() {
 fn switch_env_var_turns_the_guard_on() {
     let dir = temp_dir("switch-env");
     let output = Command::new(binary())
-        .arg("status")
+        .arg("check")
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "YeS")
         .env("XDG_CONFIG_HOME", &dir)
         .output();
@@ -629,7 +629,7 @@ fn switch_file_turns_the_guard_on() {
     std::fs::create_dir_all(&folder).ok();
     std::fs::write(folder.join("comment-guard"), b"").ok();
     let output = Command::new(binary())
-        .arg("status")
+        .arg("check")
         .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD")
         .env("XDG_CONFIG_HOME", &dir)
         .output();

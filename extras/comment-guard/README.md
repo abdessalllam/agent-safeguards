@@ -39,7 +39,7 @@ Either of these switches the guard on; with neither, `comment-guard hook ...` ex
 ```sh
 export AGENT_SAFEGUARDS_COMMENT_GUARD=1                    # this shell, or an env block of a project's settings
 mkdir -p ~/.config/agent-safeguards && touch ~/.config/agent-safeguards/comment-guard   # everywhere
-comment-guard status
+comment-guard check
 ```
 
 `XDG_CONFIG_HOME` replaces `~/.config` when it is set to an absolute path. Remove the file (or unset the variable) to turn the guard off.
