@@ -1,6 +1,6 @@
 {
   "browser_hook.reason": "Browser screenshots must ask for a `scale` above 0 and at most {scale}, so the image stays small. Retry the same call with `scale` set to {scale} or lower (split a very large or deeply nested batch into smaller calls), or run `web-shot <url>` for a PNG file within the limits and read the path it prints.",
-  "comment_guard.cli.usage": "usage: comment-guard hook <claude|codex> [PreToolUse|PostToolUse] | tree <tree-id> | check | --version",
+  "comment_guard.cli.usage": "usage: comment-guard hook <claude|codex> [PreToolUse|PostToolUse] | check | --version",
   "comment_guard.deny": "Comment guard: {detail}. Add at most one short rationale comment (two lines at most) for a non-obvious structural placement decision, never narration, history, dates or decision numbers. Rewrite the change with fewer comments, or ask the user to turn the guard off (unset AGENT_SAFEGUARDS_COMMENT_GUARD, or remove the comment-guard file from the agent-safeguards config folder).",
   "comment_guard.after": "Comment guard: {detail}. That file changed while the command that just ran was running, and a command's file writes cannot be stopped in advance. Shorten or remove the new comments in that file now: at most two lines in one block, never narration, history, dates or decision numbers. If the file must keep them, ask the user to turn the guard off (unset AGENT_SAFEGUARDS_COMMENT_GUARD, or remove the comment-guard file from the agent-safeguards config folder).",
   "comment_guard.detail.history": "a new comment in {file} reads like narration or history ({marker})",
@@ -8,7 +8,6 @@
   "comment_guard.detail.too_many": "this change adds {lines} comment lines in {blocks} block(s) to {file}, and the limit is {max_lines} lines in one block",
   "comment_guard.error.input": "comment-guard could not read its input and allowed the call.",
   "comment_guard.error.internal": "comment-guard hit an internal error and allowed the call.",
-  "comment_guard.error.tree": "comment-guard could not read the files of this commit with git and allowed the commit.",
   "comment_guard.check.off":"Comment guard is off.",
   "comment_guard.check.on":"Comment guard is on.",
   "delete_guard.ask": "Delete guard asks first: {reason}. Allow it only if you mean to remove the whole project.",

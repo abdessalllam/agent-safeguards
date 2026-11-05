@@ -7,7 +7,6 @@ pub mod languages;
 pub mod locale;
 pub mod post;
 pub mod session;
-pub mod tree;
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +14,6 @@ use serde_json::{Map, Value};
 
 pub use changes::collect;
 pub use decision::{evaluate, Change};
-pub use tree::judge_tree;
 
 use decision::comment_lines;
 use languages::{language_for, Language};

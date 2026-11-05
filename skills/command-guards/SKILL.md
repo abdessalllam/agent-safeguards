@@ -65,7 +65,6 @@ Narrow the output and retry: list paths only (`rg -l`), count (`rg -c`), drop ma
 | `no_staged_changes` | Stage the intended files first. |
 | `not_repository` | `cd` into the repository or worktree. |
 | `hook_failed` | A repository commit hook failed. Run that check yourself, fix the cause, and retry. Never skip hooks. safe-tool runs with a minimal `PATH`, so a hook that needs another tool can fail here; report that case. |
-| `comments_blocked` | The optional comment guard refused the comments this commit adds; the `reason` field says where. Shorten or remove those comments in the staged files, restage, and retry. Never re-add them in smaller pieces. |
 | `unmerged_changes` | Resolve the conflicts first. |
 | `identity_missing`, `signing_failed` | Stop and tell the user; never set an identity or signing config. |
 | `commit_failed`, `operation_failed`, `verification_failed` | Retry once, then report the status. |

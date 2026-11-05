@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use serde_json::Value;
 
 use comment_guard::locale::message;
-use comment_guard::{judge, judge_after, judge_tree, Provider, Verdict, MAX_INPUT};
+use comment_guard::{judge, judge_after, Provider, Verdict, MAX_INPUT};
 
 fn main() -> ExitCode {
     std::panic::set_hook(Box::new(|_| {}));
@@ -36,10 +36,6 @@ fn main() -> ExitCode {
             Some("claude") => hook(Provider::Claude, third),
             Some("codex") => hook(Provider::Codex, third),
             _ => usage(),
-        },
-        Some("tree") if args.len() == 2 => match second {
-            Some(id) => tree(id),
-            None => usage(),
         },
         _ => usage(),
     }
@@ -131,28 +127,6 @@ fn hook(provider: Provider, event: Option<&str>) -> ExitCode {
                 print_deny(&reason);
             }
             ExitCode::SUCCESS
-        }
-        Err(_) => {
-            complain(&message("comment_guard.error.internal", &[]));
-            ExitCode::SUCCESS
-        }
-    }
-}
-
-fn tree(id: &str) -> ExitCode {
-    if !guard_enabled() {
-        return ExitCode::SUCCESS;
-    }
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| judge_tree(id)));
-    match outcome {
-        Ok(Verdict::Allow) => ExitCode::SUCCESS,
-        Ok(Verdict::BadInput) => {
-            complain(&message("comment_guard.error.tree", &[]));
-            ExitCode::SUCCESS
-        }
-        Ok(Verdict::Deny(reason)) => {
-            say(&reason);
-            ExitCode::from(1)
         }
         Err(_) => {
             complain(&message("comment_guard.error.internal", &[]));
