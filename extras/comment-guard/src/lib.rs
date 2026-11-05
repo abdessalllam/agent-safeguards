@@ -9,6 +9,7 @@ pub mod locale;
 pub mod post;
 pub mod session;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -63,12 +64,19 @@ fn ledger_of(payload: &Map<String, Value>, state: Option<&Path>) -> Option<Ledge
 }
 
 fn mark_start(payload: &Map<String, Value>, state: Option<&Path>) {
-    let Some(id) = payload.get("tool_use_id").and_then(Value::as_str) else {
+    let Some(ledger) = ledger_of(payload, state) else {
         return;
     };
-    if let Some(ledger) = ledger_of(payload, state) {
+    if let Some(id) = payload.get("tool_use_id").and_then(Value::as_str) {
         ledger.mark_start(id);
     }
+    post::refresh_named(payload, &ledger);
+}
+
+struct Prepared {
+    id: String,
+    before: u64,
+    after: session::Seen,
 }
 
 fn translated(old: &str, from: Language, record: &[String], to: Language) -> Vec<String> {
@@ -91,8 +99,8 @@ fn translated(old: &str, from: Language, record: &[String], to: Language) -> Vec
     out
 }
 
-fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) -> Vec<(String, u64)> {
-    let mut accepted = Vec::new();
+fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) -> HashMap<String, Prepared> {
+    let mut prepared = HashMap::new();
     for change in changes.iter_mut() {
         if change.partial {
             continue;
@@ -106,16 +114,26 @@ fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) -> Vec
             let record = ledger.read(&session::identity(&changes::resolve(base, source)))?;
             Some((from, record))
         });
-        let before = session::content_hash(&change.old);
+        let old_comments = comment_lines(&change.old, lang);
+        let before = session::seen_of(&change.old, &old_comments);
         let baseline = ledger.baseline_for(&id, before, || match origin {
             Some((from, record)) if from == lang => record,
             Some((from, record)) => translated(&change.old, from, &record, lang),
-            None => comment_lines(&change.old, lang),
+            None => old_comments.clone(),
         });
         change.baseline = Some(baseline);
-        accepted.push((id, session::content_hash(&change.new)));
+        change.carry = ledger.carry(&id, before.hash);
+        let after = session::seen_of(&change.new, &comment_lines(&change.new, lang));
+        prepared.insert(
+            change.file.clone(),
+            Prepared {
+                id,
+                before: before.hash,
+                after,
+            },
+        );
     }
-    accepted
+    prepared
 }
 
 pub fn judge(input: &str, provider: Provider) -> Verdict {
@@ -142,9 +160,9 @@ pub fn judge_in(input: &str, provider: Provider, state: Option<&Path>) -> Verdic
     let base = base_of(&payload);
     let mut changes = collect(tool, tool_input, provider, &base);
     let ledger = if changes.is_empty() { None } else { ledger_of(&payload, state) };
-    let accepted = match &ledger {
+    let prepared = match &ledger {
         Some(ledger) => attach_baselines(ledger, &mut changes, &base),
-        None => Vec::new(),
+        None => HashMap::new(),
     };
     let mut verdict = evaluate(&changes);
     if verdict.is_some() {
@@ -153,8 +171,11 @@ pub fn judge_in(input: &str, provider: Provider, state: Option<&Path>) -> Verdic
     }
     if verdict.is_none() {
         if let Some(ledger) = &ledger {
-            for (id, after) in &accepted {
-                ledger.accept(id, &[*after]);
+            for change in &changes {
+                if let Some(item) = prepared.get(&change.file) {
+                    ledger.accept(&item.id, &[item.after]);
+                    ledger.note(&item.id, item.before, decision::net_lines(change));
+                }
             }
         }
     }

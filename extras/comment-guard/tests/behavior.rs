@@ -427,14 +427,20 @@ fn windows_line_endings_are_counted() {
 }
 
 #[test]
-fn write_skips_a_big_file_and_a_non_utf8_file() {
+fn big_and_non_utf8_files_are_judged_and_only_files_over_the_limit_are_skipped() {
     let dir = temp_dir("write-skips");
     let big = dir.join("big.py");
-    std::fs::write(&big, "# a\n".repeat(600_000)).ok();
-    assert!(!denied(&write(&big.to_string_lossy(), "# a\n# b\n# c\n")));
+    let body = "x = 1\n".repeat(400_000);
+    std::fs::write(&big, format!("{body}# a\n")).ok();
+    assert!(!denied(&write(&big.to_string_lossy(), &format!("{body}# a\n# b\n# c\n"))));
+    assert!(denied(&write(&big.to_string_lossy(), &format!("{body}# a\n# b\n# c\n# d\n"))));
+    let huge = dir.join("huge.py");
+    std::fs::write(&huge, "x = 1\n".repeat(1_500_000)).ok();
+    assert!(!denied(&write(&huge.to_string_lossy(), "# a\n# b\n# c\n# d\n")));
     let bad = dir.join("bad.py");
-    std::fs::write(&bad, b"\xff\xfe# a\n").ok();
-    assert!(!denied(&write(&bad.to_string_lossy(), "# a\n# b\n# c\n")));
+    std::fs::write(&bad, b"\xff\xfe\nx = 1\n").ok();
+    assert!(!denied(&write(&bad.to_string_lossy(), "x = 1\n# a\n# b\n")));
+    assert!(denied(&write(&bad.to_string_lossy(), "# a\n# b\n# c\n# d\n")));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

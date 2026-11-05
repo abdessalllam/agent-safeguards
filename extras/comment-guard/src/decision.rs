@@ -26,6 +26,7 @@ pub struct Change {
     pub baseline: Option<Vec<String>>,
     pub partial: bool,
     pub origin: Option<String>,
+    pub carry: usize,
 }
 
 impl Change {
@@ -37,6 +38,7 @@ impl Change {
             baseline: None,
             partial: false,
             origin: None,
+            carry: 0,
         }
     }
 
@@ -48,6 +50,7 @@ impl Change {
             baseline: None,
             partial: true,
             origin: None,
+            carry: 0,
         }
     }
 }
@@ -79,6 +82,130 @@ pub fn evaluate_after(changes: &[Change]) -> Option<String> {
     Some(message("comment_guard.after", &[("detail", detail.as_str())]))
 }
 
+struct Measure<'a> {
+    net_lines: usize,
+    blocks: usize,
+    too_long: bool,
+    marker: Option<&'a str>,
+}
+
+fn letters(line: &str) -> usize {
+    body(line).chars().filter(|c| !c.is_whitespace()).count()
+}
+
+fn measure(change: &Change, lang: Language) -> Measure<'_> {
+    let mut pool: HashMap<&str, usize> = HashMap::new();
+    match &change.baseline {
+        Some(lines) if !change.partial => {
+            for line in lines {
+                *pool.entry(line.as_str()).or_insert(0) += 1;
+            }
+        }
+        _ => {
+            for kind in scan(&change.old, lang) {
+                if let LineKind::Comment(line) | LineKind::Also(line) = kind {
+                    *pool.entry(line).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let mut running = false;
+    let mut counted = false;
+    let mut fresh_lines = 0usize;
+    let mut fresh_blocks = 0usize;
+    let mut fresh_long = 0usize;
+    let mut fresh_letters = 0usize;
+    let mut fresh_markers: Vec<&str> = Vec::new();
+    for kind in scan(&change.new, lang) {
+        let (line, same_line) = match kind {
+            LineKind::Comment(line) => (line, false),
+            LineKind::Also(line) => (line, true),
+            LineKind::Other => {
+                running = false;
+                counted = false;
+                continue;
+            }
+        };
+        if !same_line {
+            counted = false;
+        }
+        let kept = match pool.get_mut(line) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                true
+            }
+            _ => false,
+        };
+        if kept {
+            if !same_line {
+                running = false;
+            }
+            continue;
+        }
+        if !counted {
+            if !running {
+                fresh_blocks = fresh_blocks.saturating_add(1);
+                running = true;
+            }
+            fresh_lines = fresh_lines.saturating_add(1);
+            counted = true;
+        }
+        if line.chars().count() > MAX_LINE_CHARS {
+            fresh_long = fresh_long.saturating_add(1);
+        }
+        fresh_letters = fresh_letters.saturating_add(letters(line));
+        if let Some(marker) = history_marker(body(line)) {
+            fresh_markers.push(marker);
+        }
+    }
+    let mut removed_total = 0usize;
+    let mut removed_long = 0usize;
+    let mut removed_letters = 0usize;
+    let mut removed_markers: HashMap<String, usize> = HashMap::new();
+    for (line, count) in &pool {
+        if *count == 0 {
+            continue;
+        }
+        removed_total = removed_total.saturating_add(*count);
+        removed_letters = removed_letters.saturating_add(letters(line).saturating_mul(*count));
+        if line.chars().count() > MAX_LINE_CHARS {
+            removed_long = removed_long.saturating_add(*count);
+        }
+        if let Some(marker) = history_marker(body(line)) {
+            let entry = removed_markers.entry(marker.to_ascii_lowercase()).or_insert(0);
+            *entry = entry.saturating_add(*count);
+        }
+    }
+    let mut net = fresh_lines.saturating_sub(removed_total);
+    if removed_total > 0 && fresh_letters <= removed_letters {
+        net = 0;
+    }
+    let mut marker = None;
+    for found in fresh_markers {
+        match removed_markers.get_mut(&found.to_ascii_lowercase()) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => {
+                marker = Some(found);
+                break;
+            }
+        }
+    }
+    Measure {
+        net_lines: net.saturating_add(change.carry),
+        blocks: fresh_blocks.min(net).saturating_add(usize::from(change.carry > 0)),
+        too_long: fresh_long > removed_long,
+        marker,
+    }
+}
+
+pub fn net_lines(change: &Change) -> usize {
+    let Some(lang) = language_for(&change.file) else {
+        return 0;
+    };
+    let lang = if change.partial { lang.fragment() } else { lang };
+    measure(change, lang).net_lines.saturating_sub(change.carry)
+}
+
 fn evaluate_detail(changes: &[Change]) -> Option<String> {
     let mut order: Vec<Aggregate<'_>> = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
@@ -105,100 +232,14 @@ fn evaluate_detail(changes: &[Change]) -> Option<String> {
         let Some(slot) = order.get_mut(entry) else {
             continue;
         };
-        let mut pool: HashMap<&str, usize> = HashMap::new();
-        match &change.baseline {
-            Some(lines) if !change.partial => {
-                for line in lines {
-                    *pool.entry(line.as_str()).or_insert(0) += 1;
-                }
-            }
-            _ => {
-                for kind in scan(&change.old, lang) {
-                    if let LineKind::Comment(line) | LineKind::Also(line) = kind {
-                        *pool.entry(line).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-        let mut running = false;
-        let mut counted = false;
-        let mut fresh_lines = 0usize;
-        let mut fresh_blocks = 0usize;
-        let mut fresh_long = 0usize;
-        let mut fresh_markers: Vec<&str> = Vec::new();
-        for kind in scan(&change.new, lang) {
-            let (line, same_line) = match kind {
-                LineKind::Comment(line) => (line, false),
-                LineKind::Also(line) => (line, true),
-                LineKind::Other => {
-                    running = false;
-                    counted = false;
-                    continue;
-                }
-            };
-            if !same_line {
-                counted = false;
-            }
-            let kept = match pool.get_mut(line) {
-                Some(count) if *count > 0 => {
-                    *count -= 1;
-                    true
-                }
-                _ => false,
-            };
-            if kept {
-                if !same_line {
-                    running = false;
-                }
-                continue;
-            }
-            if !counted {
-                if !running {
-                    fresh_blocks = fresh_blocks.saturating_add(1);
-                    running = true;
-                }
-                fresh_lines = fresh_lines.saturating_add(1);
-                counted = true;
-            }
-            if line.chars().count() > MAX_LINE_CHARS {
-                fresh_long = fresh_long.saturating_add(1);
-            }
-            if let Some(marker) = history_marker(body(line)) {
-                fresh_markers.push(marker);
-            }
-        }
-        let mut removed_total = 0usize;
-        let mut removed_long = 0usize;
-        let mut removed_markers: HashMap<String, usize> = HashMap::new();
-        for (line, count) in &pool {
-            if *count == 0 {
-                continue;
-            }
-            removed_total = removed_total.saturating_add(*count);
-            if line.chars().count() > MAX_LINE_CHARS {
-                removed_long = removed_long.saturating_add(*count);
-            }
-            if let Some(marker) = history_marker(body(line)) {
-                let entry = removed_markers.entry(marker.to_ascii_lowercase()).or_insert(0);
-                *entry = entry.saturating_add(*count);
-            }
-        }
-        let net_lines = fresh_lines.saturating_sub(removed_total);
-        slot.lines = slot.lines.saturating_add(net_lines);
-        slot.blocks = slot.blocks.saturating_add(fresh_blocks.min(net_lines));
-        if fresh_long > removed_long {
+        let measured = measure(change, lang);
+        slot.lines = slot.lines.saturating_add(measured.net_lines);
+        slot.blocks = slot.blocks.saturating_add(measured.blocks);
+        if measured.too_long {
             slot.too_long = true;
         }
         if slot.marker.is_none() {
-            for marker in fresh_markers {
-                match removed_markers.get_mut(&marker.to_ascii_lowercase()) {
-                    Some(count) if *count > 0 => *count -= 1,
-                    _ => {
-                        slot.marker = Some(marker);
-                        break;
-                    }
-                }
-            }
+            slot.marker = measured.marker;
         }
     }
 
@@ -338,8 +379,8 @@ fn find_phrase<'a>(text: &'a str, phrase: &str) -> Option<&'a str> {
         let end = i.saturating_add(needle.len());
         let window = haystack.get(i..end)?;
         if window.eq_ignore_ascii_case(needle)
-            && !word_before(text, i, false)
-            && !word_after(text, end, false)
+            && !word_before(text, i, true)
+            && !word_after(text, end, true)
         {
             return text.get(i..end);
         }

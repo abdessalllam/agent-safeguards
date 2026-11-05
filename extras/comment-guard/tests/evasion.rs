@@ -314,13 +314,17 @@ impl Rig {
     }
 
     fn pre_bash(&self, session: &str, tool_use_id: &str) {
+        self.pre_bash_with(session, tool_use_id, "true");
+    }
+
+    fn pre_bash_with(&self, session: &str, tool_use_id: &str, command: &str) {
         let payload = json!({
             "hook_event_name": "PreToolUse",
             "session_id": session,
             "tool_use_id": tool_use_id,
             "cwd": self.cwd.to_string_lossy(),
             "tool_name": "Bash",
-            "tool_input": { "command": "true" },
+            "tool_input": { "command": command },
         });
         let output = self.feed("PreToolUse", &payload);
         assert!(output.stdout.is_empty());
@@ -453,7 +457,7 @@ fn an_unreachable_git_is_not_taken_for_a_missing_file() {
 fn a_committed_file_too_large_to_compare_is_left_alone() {
     let rig = Rig::new("big-blob");
     init_repo(&rig.cwd);
-    let file = commit_file(&rig.cwd, "big.py", &"x = 1\n".repeat(600_000));
+    let file = commit_file(&rig.cwd, "big.py", &"x = 1\n".repeat(1_600_000));
     std::fs::write(&file, lines("#", "", 5)).expect("write");
     let out = rig.bash(Some("g2"), &format!("cat {}", file.display()));
     assert!(out.is_empty(), "{out}");
@@ -971,6 +975,228 @@ fn edits_and_commands_in_turn_keep_counting_from_the_original_file() {
     assert!(blocked(&ran), "{ran}");
     let again = rig.pre_edit("tn", &file, "y = 2", "# five\ny = 2");
     assert!(again.contains("\"permissionDecision\":\"deny\""), "{again}");
+}
+
+#[test]
+fn a_bulk_rename_through_a_command_is_not_reported_but_added_comments_still_are() {
+    let rig = Rig::new("bulk-rename");
+    init_repo(&rig.cwd);
+    for n in 0..12 {
+        let text = format!("# t3code note a\n# t3code note b\n# t3code note c\nx = {n}\n");
+        std::fs::write(rig.cwd.join(format!("f{n}.py")), text).expect("write");
+    }
+    git(&rig.cwd, &["add", "-A"]);
+    git(&rig.cwd, &["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "base"]);
+    rig.pre_bash("br", "t1");
+    for n in 0..12 {
+        let text = format!("# melara note a\n# melara note b\n# melara note c\nx = {n}\n");
+        std::fs::write(rig.cwd.join(format!("f{n}.py")), text).expect("write");
+    }
+    let renamed = rig.bash_with_id("br", "t1", "python3 rename.py");
+    assert!(renamed.is_empty(), "{renamed}");
+    rig.pre_bash("br", "t2");
+    let more = "# melara note a\n# melara note b\n# melara note c\n# extra one\n# extra two\n# extra three\nx = 0\n";
+    std::fs::write(rig.cwd.join("f0.py"), more).expect("write");
+    let loud = rig.bash_with_id("br", "t2", "python3 rename.py");
+    assert!(blocked(&loud), "{loud}");
+    assert!(loud.contains("f0.py"), "{loud}");
+}
+
+#[test]
+fn a_patch_that_rewords_comments_is_allowed_and_one_that_adds_them_is_not() {
+    let dir = temp_dir("patch-reword");
+    let path = dir.join("a.ts");
+    let old: String = (0..10).map(|n| format!("// note {n} about t3code\n")).collect();
+    std::fs::write(&path, format!("{old}const a = 1;\n")).expect("write");
+    let removed: String = (0..10).map(|n| format!("-// note {n} about t3code\n")).collect();
+    let added: String = (0..10).map(|n| format!("+// note {n} about melara\n")).collect();
+    let patch = format!("*** Begin Patch\n*** Update File: {}\n@@\n{removed}{added}*** End Patch\n", path.display());
+    let verdict = pre(None, None, "apply_patch", json!({ "command": patch }), Provider::Codex);
+    assert!(!denied(&verdict));
+    let extra: String = (0..5).map(|n| format!("+// extra {n}\n")).collect();
+    let growing = format!("*** Begin Patch\n*** Update File: {}\n@@\n{removed}{added}{extra}*** End Patch\n", path.display());
+    let verdict = pre(None, None, "apply_patch", json!({ "command": growing }), Provider::Codex);
+    assert!(denied(&verdict));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn files_with_windows_line_endings_are_judged_like_any_other() {
+    let dir = temp_dir("crlf");
+    let path = dir.join("a.py");
+    let old = "# one\r\n# two\r\n# three\r\nx = 1\r\n";
+    std::fs::write(&path, old).expect("write");
+    assert!(!denied(&write_file(None, None, &path, old)));
+    assert!(!denied(&write_file(None, None, &path, "# uno\r\n# dos\r\n# tres\r\nx = 1\r\n")));
+    assert!(denied(&write_file(None, None, &path, &format!("{old}# four\r\n# five\r\n# six\r\n"))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_file_that_is_not_utf8_is_handled_without_a_panic() {
+    let dir = temp_dir("binary");
+    let path = dir.join("a.py");
+    let mut bytes = b"x = 1\n# keep\n".to_vec();
+    bytes.extend_from_slice(&[0xff, 0xfe, 0x00, b'\n']);
+    std::fs::write(&path, &bytes).expect("write");
+    assert!(!denied(&edit_file(None, None, &path, "x = 1", "x = 2")));
+    assert!(denied(&edit_file(None, None, &path, "x = 1", "# a\n# b\n# c\nx = 1")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_git_command_that_rewrites_a_file_unchanged_does_not_reset_the_allowance() {
+    let rig = Rig::new("stash-pop");
+    init_repo(&rig.cwd);
+    let file = commit_file(&rig.cwd, "a.py", "x = 1\ny = 2\n");
+    let first = rig.pre_edit("sp", &file, "x = 1", "# one\n# two\nx = 1");
+    assert!(first.is_empty(), "{first}");
+    std::fs::write(&file, "# one\n# two\nx = 1\ny = 2\n").expect("write");
+    rig.pre_bash("sp", "t1");
+    std::fs::write(&file, "# one\n# two\nx = 1\ny = 2\n").expect("write");
+    let popped = rig.bash_with_id("sp", "t1", "git stash && git stash pop");
+    assert!(popped.is_empty(), "{popped}");
+    let again = rig.pre_edit("sp", &file, "y = 2", "# three\n# four\ny = 2");
+    assert!(again.contains("\"permissionDecision\":\"deny\""), "{again}");
+}
+
+#[test]
+fn two_edits_judged_against_the_same_file_state_share_one_allowance() {
+    let dir = temp_dir("parallel-edits");
+    let state = temp_dir("parallel-edits-state");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "x = 1\ny = 2\n").expect("write");
+    let first = edit_file(Some(&state), Some("pe"), &path, "x = 1", "# one\n# two\nx = 1");
+    assert!(!denied(&first));
+    let second = edit_file(Some(&state), Some("pe"), &path, "y = 2", "# three\n# four\ny = 2");
+    assert!(denied(&second));
+    assert!(reason(&second).contains("4 comment lines"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn a_file_the_user_edited_before_a_command_that_names_it_is_not_blamed_on_the_command() {
+    let rig = Rig::new("named-refresh");
+    let file = rig.cwd.join("a.py");
+    std::fs::write(&file, "x = 1\n").expect("write");
+    let first = rig.pre_edit("nr", &file, "x = 1", "x = 2");
+    assert!(first.is_empty(), "{first}");
+    std::fs::write(&file, "x = 2\n").expect("write");
+    let command = format!("black {}", file.display());
+    std::fs::write(&file, format!("{}x = 2\n", lines("#", "by hand", 4))).expect("write");
+    rig.pre_bash_with("nr", "t1", &command);
+    std::fs::write(&file, format!("{}x = 2\n", lines("#", "by hand", 4))).expect("write");
+    let out = rig.bash_with_id("nr", "t1", &command);
+    assert!(out.is_empty(), "{out}");
+}
+
+#[test]
+fn copying_a_commented_file_is_not_adding_comments() {
+    let rig = Rig::new("copy");
+    std::fs::create_dir_all(rig.cwd.join("vendor")).expect("dir");
+    std::fs::create_dir_all(rig.cwd.join("src")).expect("dir");
+    let source = rig.cwd.join("vendor").join("widget.py");
+    let content = format!("{}x = 1\n", lines("#", "widget", 10));
+    std::fs::write(&source, &content).expect("write");
+    let copy = rig.cwd.join("src").join("widget.py");
+    let command = "cp vendor/widget.py src/widget.py";
+    rig.pre_bash_with("cp", "t1", command);
+    std::fs::write(&copy, &content).expect("write");
+    if !creation_time_is_known(&copy) {
+        return;
+    }
+    let out = rig.bash_with_id("cp", "t1", command);
+    assert!(out.is_empty(), "{out}");
+    rig.pre_bash_with("cp", "t2", command);
+    std::fs::write(&copy, format!("{}x = 1\n", lines("#", "new text", 10))).expect("write");
+    let loud = rig.bash_with_id("cp", "t2", command);
+    assert!(blocked(&loud), "{loud}");
+    let tree = "cp -r vendor src2";
+    rig.pre_bash_with("cp", "t3", tree);
+    std::fs::create_dir_all(rig.cwd.join("src2")).expect("dir");
+    std::fs::write(rig.cwd.join("src2").join("widget.py"), &content).expect("write");
+    let copied = rig.bash_with_id("cp", "t3", tree);
+    assert!(copied.is_empty(), "{copied}");
+}
+
+#[test]
+fn a_symbol_with_a_history_word_inside_it_is_not_a_history_comment() {
+    let dir = temp_dir("snake");
+    let path = dir.join("a.ts");
+    let plain = write_file(None, None, &path, "// clear previously_cached entries\nconst a = 1;\n");
+    assert!(!denied(&plain));
+    let real = write_file(None, None, &path, "// previously cached entries\nconst a = 1;\n");
+    assert!(denied(&real));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rewrapping_a_comment_is_not_adding_lines() {
+    let dir = temp_dir("rewrap");
+    let path = dir.join("a.rs");
+    std::fs::write(&path, "// one long comment about renaming things across the whole codebase quickly\nfn a() {}\n")
+        .expect("write");
+    let wrapped = "// one long comment about\n// renaming things across\n// the whole codebase\n// quickly\nfn a() {}\n";
+    assert!(!denied(&write_file(None, None, &path, wrapped)));
+    let grown = "// one long comment about\n// renaming things across\n// the whole codebase\n// quickly and also\n// a lot of new words\nfn a() {}\n";
+    assert!(denied(&write_file(None, None, &path, grown)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn git_commands_that_could_run_hooks_or_other_code_are_judged_like_any_command() {
+    let rig = Rig::new("hooks");
+    init_repo(&rig.cwd);
+    let file = commit_file(&rig.cwd, "a.py", "x = 1\n");
+    for (n, command) in [
+        "git -c core.hooksPath=/tmp/h checkout -- a.py",
+        "git commit --allow-empty -m m",
+        "git checkout-index -f -- a.py",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = format!("h{n}");
+        rig.pre_bash_with("hk", &id, command);
+        std::fs::write(&file, format!("{}x = 1\n", lines("#", &format!("planted {n}"), 6))).expect("write");
+        let out = rig.bash_with_id("hk", &id, command);
+        assert!(blocked(&out), "{command}: {out}");
+        std::fs::write(&file, "x = 1\n").expect("write");
+    }
+}
+
+#[test]
+fn many_marked_upstream_files_in_one_patch_are_all_skipped() {
+    let rig = Rig::new("many-marked");
+    init_repo(&rig.cwd);
+    mark_paths(&rig.cwd);
+    let mut patch = String::from("*** Begin Patch\n");
+    for n in 0..60 {
+        let path = rig.cwd.join("up").join(format!("f{n}.py"));
+        patch.push_str(&format!("*** Add File: {}\n+x = {n}\n+# a\n+# b\n+# c\n", path.display()));
+    }
+    patch.push_str("*** End Patch\n");
+    let verdict = pre(None, None, "apply_patch", json!({ "command": patch }), Provider::Codex);
+    assert!(!denied(&verdict));
+    let own = rig.cwd.join("own").join("e.py");
+    let loud = format!("*** Begin Patch\n*** Add File: {}\n+x = 1\n+# a\n+# b\n+# c\n*** End Patch\n", own.display());
+    assert!(denied(&pre(None, None, "apply_patch", json!({ "command": loud }), Provider::Codex)));
+}
+
+#[test]
+fn a_file_rewritten_with_other_line_endings_is_still_in_a_known_state() {
+    let dir = temp_dir("endings");
+    let state = temp_dir("endings-state");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "x = 1\ny = 2\n").expect("write");
+    let first = edit_file(Some(&state), Some("le"), &path, "x = 1", "# one\n# two\nx = 1");
+    assert!(!denied(&first));
+    std::fs::write(&path, "# one\r\n# two\r\nx = 1\r\ny = 2\r\n").expect("write");
+    let second = edit_file(Some(&state), Some("le"), &path, "y = 2", "# three\n# four\ny = 2");
+    assert!(denied(&second));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
 }
 
 fn creation_time_is_known(path: &Path) -> bool {

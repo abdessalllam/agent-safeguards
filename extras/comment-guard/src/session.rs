@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,14 +9,27 @@ use serde_json::{json, Value};
 const RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const PRUNE_LIMIT: usize = 200;
 const PRUNE_VISITS: usize = 2000;
+const LOCK_TRIES: u32 = 40;
+const LOCK_STALE: Duration = Duration::from_secs(5);
+const REMEMBERED_STATES: usize = 8;
+const PENDING_SECONDS: u64 = 3;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Seen {
+    pub hash: u64,
+    pub sig: u64,
+}
+
+struct Pending {
+    from: u64,
+    net: usize,
+    at: u64,
+}
 
 struct Stored {
     comments: Vec<String>,
-    seen: Vec<u64>,
-}
-
-pub fn content_hash(text: &str) -> u64 {
-    hash(text)
+    seen: Vec<Seen>,
+    pending: Option<Pending>,
 }
 
 pub struct Ledger {
@@ -31,6 +45,30 @@ fn hash(text: &str) -> u64 {
         value = value.wrapping_mul(0x0000_0100_0000_01b3);
     }
     value
+}
+
+pub fn content_hash(text: &str) -> u64 {
+    hash(text)
+}
+
+pub fn signature(comments: &[String]) -> u64 {
+    let mut sorted: Vec<&str> = comments.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    hash(&sorted.join("\n"))
+}
+
+pub fn seen_of(text: &str, comments: &[String]) -> Seen {
+    Seen {
+        hash: hash(text),
+        sig: signature(comments),
+    }
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 fn absolute_dir(variable: &str) -> Option<PathBuf> {
@@ -92,9 +130,14 @@ fn owned(name: &str) -> bool {
     let stem = name
         .strip_suffix(".json")
         .or_else(|| name.strip_suffix(".stamp"))
-        .or_else(|| name.strip_suffix(".start"));
+        .or_else(|| name.strip_suffix(".start"))
+        .or_else(|| name.strip_suffix(".lock"));
     stem.and_then(|stem| stem.split_once('-'))
         .is_some_and(|(session, entry)| hex16(session) && hex16(entry))
+}
+
+fn parse_hex(value: &Value) -> Option<u64> {
+    u64::from_str_radix(value.as_str()?, 16).ok()
 }
 
 impl Ledger {
@@ -110,19 +153,21 @@ impl Ledger {
         })
     }
 
-    fn entry(&self, identity: &str) -> PathBuf {
+    fn named(&self, key: &str, extension: &str) -> PathBuf {
         self.dir
-            .join(format!("{:016x}-{:016x}.json", self.session, hash(identity)))
+            .join(format!("{:016x}-{:016x}.{extension}", self.session, hash(key)))
+    }
+
+    fn entry(&self, identity: &str) -> PathBuf {
+        self.named(identity, "json")
     }
 
     fn stamp(&self, key: &str) -> PathBuf {
-        self.dir
-            .join(format!("{:016x}-{:016x}.stamp", self.session, hash(key)))
+        self.named(key, "stamp")
     }
 
     fn start_file(&self, id: &str) -> PathBuf {
-        self.dir
-            .join(format!("{:016x}-{:016x}.start", self.session, hash(id)))
+        self.named(id, "start")
     }
 
     fn temp(&self) -> PathBuf {
@@ -132,6 +177,36 @@ impl Ledger {
             .unwrap_or(0);
         self.dir
             .join(format!(".tmp-{}-{nanos}", std::process::id()))
+    }
+
+    fn locked<T>(&self, identity: &str, work: impl FnOnce() -> T) -> T {
+        let lock = self.named(identity, "lock");
+        let mut held = false;
+        for _ in 0..LOCK_TRIES {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+                Ok(_) => {
+                    held = true;
+                    break;
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&lock)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > LOCK_STALE);
+                    if stale {
+                        let _ = fs::remove_file(&lock);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+        let result = work();
+        if held {
+            let _ = fs::remove_file(&lock);
+        }
+        result
     }
 
     fn load(&self, identity: &str) -> Option<Stored> {
@@ -152,16 +227,36 @@ impl Ledger {
             .map(|items| {
                 items
                     .iter()
-                    .filter_map(|item| item.as_str().and_then(|text| u64::from_str_radix(text, 16).ok()))
+                    .filter_map(|item| {
+                        Some(Seen {
+                            hash: parse_hex(item.get("h")?)?,
+                            sig: parse_hex(item.get("s")?)?,
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default();
-        Some(Stored { comments, seen })
+        let pending = value.get("pending").and_then(|item| {
+            Some(Pending {
+                from: parse_hex(item.get("from")?)?,
+                net: usize::try_from(item.get("net")?.as_u64()?).ok()?,
+                at: item.get("at")?.as_u64()?,
+            })
+        });
+        Some(Stored { comments, seen, pending })
     }
 
     fn store(&self, identity: &str, stored: &Stored) {
-        let seen: Vec<String> = stored.seen.iter().map(|value| format!("{value:016x}")).collect();
-        let body = json!({ "path": identity, "comments": stored.comments, "seen": seen }).to_string();
+        let seen: Vec<Value> = stored
+            .seen
+            .iter()
+            .map(|state| json!({ "h": format!("{:016x}", state.hash), "s": format!("{:016x}", state.sig) }))
+            .collect();
+        let pending = stored.pending.as_ref().map(|item| {
+            json!({ "from": format!("{:016x}", item.from), "net": item.net, "at": item.at })
+        });
+        let body = json!({ "path": identity, "comments": stored.comments, "seen": seen, "pending": pending })
+            .to_string();
         let temp = self.temp();
         if fs::write(&temp, body).is_err() {
             return;
@@ -175,22 +270,42 @@ impl Ledger {
         self.load(identity).map(|stored| stored.comments)
     }
 
-    pub fn baseline_for(&self, identity: &str, current: u64, make: impl FnOnce() -> Vec<String>) -> Vec<String> {
-        if let Some(stored) = self.load(identity) {
-            if stored.seen.contains(&current) {
-                return stored.comments;
-            }
-        }
-        self.rebaseline(identity, make(), current)
+    pub fn knows(&self, identity: &str, state: Seen) -> bool {
+        self.load(identity).is_some_and(|stored| {
+            stored
+                .seen
+                .iter()
+                .any(|known| known.hash == state.hash || known.sig == state.sig)
+        })
     }
 
-    pub fn rebaseline(&self, identity: &str, comments: Vec<String>, current: u64) -> Vec<String> {
+    pub fn baseline_for(&self, identity: &str, state: Seen, make: impl FnOnce() -> Vec<String>) -> Vec<String> {
+        self.locked(identity, || {
+            if let Some(stored) = self.load(identity) {
+                let known = stored
+                    .seen
+                    .iter()
+                    .any(|seen| seen.hash == state.hash || seen.sig == state.sig);
+                if known {
+                    return stored.comments;
+                }
+            }
+            self.write_fresh(identity, make(), state)
+        })
+    }
+
+    pub fn rebaseline(&self, identity: &str, comments: Vec<String>, state: Seen) -> Vec<String> {
+        self.locked(identity, || self.write_fresh(identity, comments, state))
+    }
+
+    fn write_fresh(&self, identity: &str, comments: Vec<String>, state: Seen) -> Vec<String> {
         let first = !self.entry(identity).exists();
         self.store(
             identity,
             &Stored {
                 comments: comments.clone(),
-                seen: vec![current],
+                seen: vec![state],
+                pending: None,
             },
         );
         if first {
@@ -199,19 +314,59 @@ impl Ledger {
         comments
     }
 
-    pub fn accept(&self, identity: &str, hashes: &[u64]) {
-        let Some(mut stored) = self.load(identity) else {
-            return;
-        };
-        for value in hashes {
-            if !stored.seen.contains(value) {
-                stored.seen.push(*value);
+    pub fn accept(&self, identity: &str, states: &[Seen]) {
+        self.locked(identity, || {
+            let Some(mut stored) = self.load(identity) else {
+                return;
+            };
+            for state in states {
+                if !stored.seen.contains(state) {
+                    stored.seen.push(*state);
+                }
             }
+            while stored.seen.len() > REMEMBERED_STATES {
+                stored.seen.remove(0);
+            }
+            self.store(identity, &stored);
+        });
+    }
+
+    pub fn carry(&self, identity: &str, from: u64) -> usize {
+        self.carry_at(identity, from, now_seconds())
+    }
+
+    fn carry_at(&self, identity: &str, from: u64, now: u64) -> usize {
+        match self.load(identity).and_then(|stored| stored.pending) {
+            Some(pending) if pending.from == from && now.saturating_sub(pending.at) <= PENDING_SECONDS => pending.net,
+            _ => 0,
         }
-        while stored.seen.len() > 8 {
-            stored.seen.remove(0);
+    }
+
+    pub fn note(&self, identity: &str, from: u64, net: usize) {
+        self.note_at(identity, from, net, now_seconds());
+    }
+
+    fn note_at(&self, identity: &str, from: u64, net: usize, now: u64) {
+        if net == 0 {
+            return;
         }
-        self.store(identity, &stored);
+        self.locked(identity, || {
+            let Some(mut stored) = self.load(identity) else {
+                return;
+            };
+            let carried = match &stored.pending {
+                Some(pending) if pending.from == from && now.saturating_sub(pending.at) <= PENDING_SECONDS => {
+                    pending.net
+                }
+                _ => 0,
+            };
+            stored.pending = Some(Pending {
+                from,
+                net: carried.saturating_add(net),
+                at: now,
+            });
+            self.store(identity, &stored);
+        });
     }
 
     pub fn last_check(&self, key: &str) -> Option<SystemTime> {
@@ -277,7 +432,7 @@ impl Ledger {
 
 #[cfg(test)]
 mod tests {
-    use super::{hash, identity, lexical, owned, Ledger, RETENTION};
+    use super::{hash, identity, lexical, owned, seen_of, signature, Ledger, Seen, RETENTION};
     use std::path::Path;
     use std::time::{Duration, SystemTime};
 
@@ -294,21 +449,25 @@ mod tests {
         file.set_modified(old).expect("set time");
     }
 
+    fn state(number: u64) -> Seen {
+        Seen { hash: number, sig: number + 1_000 }
+    }
+
     #[test]
     fn a_baseline_holds_while_the_file_is_in_a_known_state_and_resets_when_it_is_not() {
         let dir = scratch("first");
         let ledger = Ledger::open(&dir, "session-a").expect("ledger");
-        let first = ledger.baseline_for("/x/a.py", 1, || vec!["# one".to_owned()]);
-        let again = ledger.baseline_for("/x/a.py", 1, || vec!["# one".to_owned(), "# two".to_owned()]);
+        let first = ledger.baseline_for("/x/a.py", state(1), || vec!["# one".to_owned()]);
+        let again = ledger.baseline_for("/x/a.py", state(1), || vec!["# one".to_owned(), "# two".to_owned()]);
         assert_eq!(first, vec!["# one".to_owned()]);
         assert_eq!(again, first);
-        ledger.accept("/x/a.py", &[2]);
-        assert_eq!(ledger.baseline_for("/x/a.py", 2, || vec!["# other".to_owned()]), first);
-        let changed = ledger.baseline_for("/x/a.py", 3, || vec!["# fresh".to_owned()]);
+        ledger.accept("/x/a.py", &[state(2)]);
+        assert_eq!(ledger.baseline_for("/x/a.py", state(2), || vec!["# other".to_owned()]), first);
+        let changed = ledger.baseline_for("/x/a.py", state(3), || vec!["# fresh".to_owned()]);
         assert_eq!(changed, vec!["# fresh".to_owned()]);
-        assert!(ledger.baseline_for("/x/a.py", 1, Vec::new).is_empty());
+        assert!(ledger.baseline_for("/x/a.py", state(1), Vec::new).is_empty());
         assert!(ledger.read("/x/b.py").is_none());
-        ledger.accept("/x/missing.py", &[1]);
+        ledger.accept("/x/missing.py", &[state(1)]);
         assert!(ledger.read("/x/missing.py").is_none());
         let other = Ledger::open(&dir, "session-b").expect("ledger");
         assert!(other.read("/x/a.py").is_none());
@@ -316,15 +475,135 @@ mod tests {
     }
 
     #[test]
+    fn a_state_with_the_same_comments_is_known_even_when_the_bytes_differ() {
+        let dir = scratch("signature");
+        let ledger = Ledger::open(&dir, "session-s").expect("ledger");
+        let comments = vec!["# one".to_owned(), "# two".to_owned()];
+        let written = seen_of("x\n# one\n# two\n", &comments);
+        ledger.baseline_for("/x/a.py", written, || vec!["# base".to_owned()]);
+        let reformatted = seen_of("x \r\n# one\r\n# two\r\n", &[comments[1].clone(), comments[0].clone()]);
+        assert_ne!(written.hash, reformatted.hash);
+        assert_eq!(written.sig, reformatted.sig);
+        assert!(ledger.knows("/x/a.py", reformatted));
+        assert_eq!(signature(&[]), signature(&[]));
+        assert_ne!(signature(&["# a".to_owned()]), signature(&["# b".to_owned()]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn only_the_most_recent_states_are_remembered() {
         let dir = scratch("seen");
         let ledger = Ledger::open(&dir, "session-g").expect("ledger");
-        ledger.baseline_for("/x/a.py", 100, || vec!["# keep".to_owned()]);
+        ledger.baseline_for("/x/a.py", state(100), || vec!["# keep".to_owned()]);
         for value in 1..=20u64 {
-            ledger.accept("/x/a.py", &[value]);
+            ledger.accept("/x/a.py", &[state(value)]);
         }
-        assert_eq!(ledger.baseline_for("/x/a.py", 20, Vec::new), vec!["# keep".to_owned()]);
-        assert!(ledger.baseline_for("/x/a.py", 100, Vec::new).is_empty());
+        assert_eq!(ledger.baseline_for("/x/a.py", state(20), Vec::new), vec!["# keep".to_owned()]);
+        assert!(ledger.baseline_for("/x/a.py", state(100), Vec::new).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_edits_are_carried_only_for_the_same_pre_image_within_a_few_seconds() {
+        let dir = scratch("pending");
+        let ledger = Ledger::open(&dir, "session-q").expect("ledger");
+        ledger.baseline_for("/x/a.py", state(1), Vec::new);
+        ledger.note_at("/x/a.py", 1, 2, 100);
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 101), 2);
+        assert_eq!(ledger.carry_at("/x/a.py", 9, 101), 0);
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 104), 0);
+        ledger.note_at("/x/a.py", 1, 1, 101);
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 102), 3);
+        ledger.note_at("/x/a.py", 1, 0, 102);
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 102), 3);
+        ledger.note_at("/x/a.py", 5, 1, 103);
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 103), 0);
+        assert_eq!(ledger.carry_at("/x/a.py", 5, 103), 1);
+        ledger.note_at("/x/none.py", 1, 2, 100);
+        assert_eq!(ledger.carry_at("/x/none.py", 1, 100), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parallel_hook_runs_never_corrupt_a_record_or_lose_an_update() {
+        let dir = scratch("parallel");
+        let seed = Ledger::open(&dir, "session-p").expect("ledger");
+        seed.baseline_for("/x/a.py", state(0), || vec!["# base".to_owned()]);
+        let mut workers = Vec::new();
+        for worker in 1..=4u64 {
+            let folder = dir.clone();
+            workers.push(std::thread::spawn(move || {
+                let ledger = Ledger::open(&folder, "session-p").expect("ledger");
+                for round in 0..25u64 {
+                    ledger.accept("/x/a.py", &[state(worker * 1000 + round)]);
+                    let _ = ledger.read("/x/a.py");
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("worker panicked");
+        }
+        let ledger = Ledger::open(&dir, "session-p").expect("ledger");
+        assert_eq!(ledger.read("/x/a.py").expect("record must still parse"), vec!["# base".to_owned()]);
+        let leftovers = std::fs::read_dir(&dir)
+            .expect("list")
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with(".tmp-") || name.ends_with(".lock")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_accepts_do_not_drop_each_others_states() {
+        let dir = scratch("accepts");
+        let seed = Ledger::open(&dir, "session-r").expect("ledger");
+        seed.baseline_for("/x/a.py", state(0), Vec::new);
+        let mut workers = Vec::new();
+        for worker in 1..=4u64 {
+            let folder = dir.clone();
+            workers.push(std::thread::spawn(move || {
+                let ledger = Ledger::open(&folder, "session-r").expect("ledger");
+                ledger.accept("/x/a.py", &[state(worker * 10)]);
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("worker panicked");
+        }
+        let ledger = Ledger::open(&dir, "session-r").expect("ledger");
+        for worker in 1..=4u64 {
+            assert!(ledger.knows("/x/a.py", state(worker * 10)), "state {worker} was lost");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_lock_serialises_read_modify_write_updates() {
+        let dir = scratch("lock");
+        let counter = dir.join("counter.txt");
+        std::fs::write(&counter, "0").expect("write");
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let folder = dir.clone();
+            let file = counter.clone();
+            workers.push(std::thread::spawn(move || {
+                let ledger = Ledger::open(&folder, "session-l").expect("ledger");
+                for _ in 0..40 {
+                    ledger.locked("/x/a.py", || {
+                        let now: u64 = std::fs::read_to_string(&file).expect("read").trim().parse().expect("number");
+                        std::thread::sleep(Duration::from_micros(200));
+                        std::fs::write(&file, (now + 1).to_string()).expect("write");
+                    });
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("worker panicked");
+        }
+        assert_eq!(std::fs::read_to_string(&counter).expect("read").trim(), "320");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -395,6 +674,7 @@ mod tests {
         assert!(owned("0123456789abcdef-fedcba9876543210.json"));
         assert!(owned("0123456789abcdef-fedcba9876543210.stamp"));
         assert!(owned("0123456789abcdef-fedcba9876543210.start"));
+        assert!(owned("0123456789abcdef-fedcba9876543210.lock"));
         assert!(owned(".tmp-123-456789"));
         assert!(!owned("notes.json"));
         assert!(!owned("backup.stamp"));
@@ -420,7 +700,7 @@ mod tests {
         age(&foreign_old, 30);
         age(&stamp_like, 30);
         let ledger = Ledger::open(&dir, "session-e").expect("ledger");
-        ledger.baseline_for("/x/a.py", 1, Vec::new);
+        ledger.baseline_for("/x/a.py", state(1), Vec::new);
         assert!(!owned_old.exists());
         assert!(owned_new.exists());
         assert!(foreign_old.exists());
@@ -429,7 +709,7 @@ mod tests {
         let second_old = dir.join("2123456789abcdef-fedcba9876543210.json");
         std::fs::write(&second_old, "{}").expect("write");
         age(&second_old, 1);
-        ledger.baseline_for("/x/b.py", 1, Vec::new);
+        ledger.baseline_for("/x/b.py", state(1), Vec::new);
         assert!(second_old.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use crate::decision::Change;
 use crate::{Provider, MAX_INPUT};
 
-pub const MAX_OLD_FILE: u64 = 2 * 1024 * 1024;
+pub const MAX_OLD_FILE: u64 = 8 * 1024 * 1024;
 const MAX_WORK: usize = 64 * 1024 * 1024;
 const MAX_HUNKS: usize = 2000;
 const MAX_STARTS: usize = 5_000_000;
@@ -95,7 +95,7 @@ pub fn read_old(path: &Path) -> Option<String> {
     if bytes.len() as u64 > MAX_OLD_FILE {
         return None;
     }
-    String::from_utf8(bytes).ok()
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn current_text(path: &Path) -> Option<String> {
