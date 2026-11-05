@@ -1649,7 +1649,22 @@ fn a_rewrap_that_also_rewords_is_judged_as_a_plain_replacement() {
     let both = "// one long comment about\n// renaming stuff across\n// the whole codebase\n// very quickly\nfn a() {}\n";
     assert!(denied(&write_file(None, None, &path, both)));
     let wrapped = "// one long comment about\n// renaming things across\n// the whole codebase\n// quickly\nfn a() {}\n";
+    let state = temp_dir("reword-wrap-state");
+    assert!(!denied(&write_file(Some(&state), Some("rw"), &path, wrapped)));
     std::fs::write(&path, wrapped).expect("write");
-    assert!(!denied(&write_file(None, None, &path, both)));
+    assert!(denied(&write_file(Some(&state), Some("rw"), &path, both)));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn blank_lines_are_still_charged_after_a_rewrap_is_forgiven() {
+    let dir = temp_dir("wrap-blanks");
+    let path = dir.join("a.rs");
+    std::fs::write(&path, "// alpha beta gamma delta\nfn a() {}\n").expect("write");
+    let hollow = "// alpha beta\n// gamma delta\n//\n//\nfn a() {}\n";
+    assert!(denied(&write_file(None, None, &path, hollow)));
+    let wrapped = "// alpha beta\n// gamma delta\nfn a() {}\n";
+    assert!(!denied(&write_file(None, None, &path, wrapped)));
     let _ = std::fs::remove_dir_all(&dir);
 }
