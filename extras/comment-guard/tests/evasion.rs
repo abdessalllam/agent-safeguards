@@ -733,6 +733,26 @@ fn a_patch_that_runs_out_of_budget_does_not_judge_its_earlier_intermediate_file(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn once_the_patch_budget_is_spent_later_sections_do_not_restart_from_the_original() {
+    let dir = temp_dir("patch-sticky");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "flag = 0\n").expect("write");
+    let target = path.display();
+    let padding = "x".repeat(1024 * 1024);
+    let mut patch = String::from("*** Begin Patch\n");
+    patch.push_str(&format!("*** Update File: {target}\n@@\n+DATA = \"\"\"\n+{padding}\n"));
+    for n in 0..64 {
+        let (from, to) = if n % 2 == 0 { ("flag = 0", "flag = 1") } else { ("flag = 1", "flag = 0") };
+        patch.push_str(&format!("*** Update File: {target}\n@@\n-{from}\n+{to}\n"));
+    }
+    patch.push_str(&format!("*** Update File: {target}\n@@\n+# one\n+# two\n+# three\n+\"\"\"\n"));
+    patch.push_str("*** End Patch\n");
+    let verdict = pre(None, None, "apply_patch", json!({ "command": patch }), Provider::Codex);
+    assert!(!denied(&verdict));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn creation_time_is_known(path: &Path) -> bool {
     std::fs::metadata(path).and_then(|meta| meta.created()).is_ok()
 }

@@ -377,6 +377,10 @@ fn assemble(
     }
     let source = section.source.clone().unwrap_or_else(|| section.path.clone());
     let previous = lookup.get(&source).copied();
+    if budget.0.out || budget.1.out {
+        abandon(changes, previous);
+        return;
+    }
     let current = match previous.and_then(|at| changes.get(at)) {
         Some(change) if change.partial => None,
         Some(change) => Some(change.new.clone()),
