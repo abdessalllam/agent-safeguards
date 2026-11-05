@@ -122,8 +122,8 @@ fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) -> Has
             None => old_comments.clone(),
         });
         change.baseline = Some(baseline);
-        change.carry = ledger.carry(&id, before.hash);
         let after = session::seen_of(&change.new, &comment_lines(&change.new, lang));
+        change.carry = ledger.carry(&id, before.hash, after.hash);
         prepared.insert(
             change.file.clone(),
             Prepared {
@@ -171,10 +171,31 @@ pub fn judge_in(input: &str, provider: Provider, state: Option<&Path>) -> Verdic
     }
     if verdict.is_none() {
         if let Some(ledger) = &ledger {
-            for change in &changes {
-                if let Some(item) = prepared.get(&change.file) {
-                    ledger.accept(&item.id, &[item.after]);
-                    ledger.note(&item.id, item.before, decision::net_lines(change));
+            let mut retry: Vec<(String, u64, u64, usize)> = Vec::new();
+            for change in changes.iter_mut() {
+                let Some(item) = prepared.get(&change.file) else {
+                    continue;
+                };
+                let net = decision::net_lines(change);
+                if let Err(current) = ledger.commit_note(&item.id, item.before, item.after.hash, net, change.carry) {
+                    change.carry = current;
+                    retry.push((item.id.clone(), item.before, item.after.hash, net));
+                }
+            }
+            if !retry.is_empty() {
+                verdict = evaluate(&changes);
+                if verdict.is_none() {
+                    for (id, before, after, net) in &retry {
+                        let current = ledger.carry(id, *before, *after);
+                        let _ = ledger.commit_note(id, *before, *after, *net, current);
+                    }
+                }
+            }
+            if verdict.is_none() {
+                for change in &changes {
+                    if let Some(item) = prepared.get(&change.file) {
+                        ledger.accept(&item.id, &[item.after]);
+                    }
                 }
             }
         }

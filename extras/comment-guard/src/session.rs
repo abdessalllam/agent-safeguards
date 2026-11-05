@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +22,7 @@ pub struct Seen {
 
 struct Pending {
     from: u64,
+    to: u64,
     net: usize,
     at: u64,
 }
@@ -181,10 +182,16 @@ impl Ledger {
 
     fn locked<T>(&self, identity: &str, work: impl FnOnce() -> T) -> T {
         let lock = self.named(identity, "lock");
+        let token = self
+            .temp()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let mut held = false;
         for _ in 0..LOCK_TRIES {
             match fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
-                Ok(_) => {
+                Ok(mut file) => {
+                    let _ = file.write_all(token.as_bytes());
                     held = true;
                     break;
                 }
@@ -203,7 +210,7 @@ impl Ledger {
             }
         }
         let result = work();
-        if held {
+        if held && fs::read_to_string(&lock).is_ok_and(|content| content == token) {
             let _ = fs::remove_file(&lock);
         }
         result
@@ -239,6 +246,7 @@ impl Ledger {
         let pending = value.get("pending").and_then(|item| {
             Some(Pending {
                 from: parse_hex(item.get("from")?)?,
+                to: parse_hex(item.get("to")?)?,
                 net: usize::try_from(item.get("net")?.as_u64()?).ok()?,
                 at: item.get("at")?.as_u64()?,
             })
@@ -253,7 +261,7 @@ impl Ledger {
             .map(|state| json!({ "h": format!("{:016x}", state.hash), "s": format!("{:016x}", state.sig) }))
             .collect();
         let pending = stored.pending.as_ref().map(|item| {
-            json!({ "from": format!("{:016x}", item.from), "net": item.net, "at": item.at })
+            json!({ "from": format!("{:016x}", item.from), "to": format!("{:016x}", item.to), "net": item.net, "at": item.at })
         });
         let body = json!({ "path": identity, "comments": stored.comments, "seen": seen, "pending": pending })
             .to_string();
@@ -331,42 +339,67 @@ impl Ledger {
         });
     }
 
-    pub fn carry(&self, identity: &str, from: u64) -> usize {
-        self.carry_at(identity, from, now_seconds())
+    pub fn carry(&self, identity: &str, from: u64, to: u64) -> usize {
+        self.carry_at(identity, from, to, now_seconds())
     }
 
-    fn carry_at(&self, identity: &str, from: u64, now: u64) -> usize {
+    fn carry_at(&self, identity: &str, from: u64, to: u64, now: u64) -> usize {
         match self.load(identity).and_then(|stored| stored.pending) {
-            Some(pending) if pending.from == from && now.saturating_sub(pending.at) <= PENDING_SECONDS => pending.net,
-            _ => 0,
+            Some(pending) => Self::carried(&pending, from, to, now),
+            None => 0,
         }
     }
 
-    pub fn note(&self, identity: &str, from: u64, net: usize) {
-        self.note_at(identity, from, net, now_seconds());
+    fn carried(pending: &Pending, from: u64, to: u64, now: u64) -> usize {
+        let recent = now.saturating_sub(pending.at) <= PENDING_SECONDS;
+        if pending.from == from && pending.to != to && recent {
+            pending.net
+        } else {
+            0
+        }
     }
 
-    fn note_at(&self, identity: &str, from: u64, net: usize, now: u64) {
-        if net == 0 {
-            return;
-        }
+    pub fn commit_note(&self, identity: &str, from: u64, to: u64, net: usize, expected: usize) -> Result<(), usize> {
+        self.commit_note_at(identity, from, to, net, expected, now_seconds())
+    }
+
+    fn commit_note_at(
+        &self,
+        identity: &str,
+        from: u64,
+        to: u64,
+        net: usize,
+        expected: usize,
+        now: u64,
+    ) -> Result<(), usize> {
         self.locked(identity, || {
             let Some(mut stored) = self.load(identity) else {
-                return;
+                return Ok(());
             };
-            let carried = match &stored.pending {
-                Some(pending) if pending.from == from && now.saturating_sub(pending.at) <= PENDING_SECONDS => {
-                    pending.net
-                }
-                _ => 0,
-            };
+            let current = stored
+                .pending
+                .as_ref()
+                .map_or(0, |pending| Self::carried(pending, from, to, now));
+            if current != expected {
+                return Err(current);
+            }
+            if net == 0 {
+                return Ok(());
+            }
+            let carried = stored
+                .pending
+                .as_ref()
+                .filter(|pending| pending.from == from && now.saturating_sub(pending.at) <= PENDING_SECONDS)
+                .map_or(0, |pending| pending.net);
             stored.pending = Some(Pending {
                 from,
+                to,
                 net: carried.saturating_add(net),
                 at: now,
             });
             self.store(identity, &stored);
-        });
+            Ok(())
+        })
     }
 
     pub fn last_check(&self, key: &str) -> Option<SystemTime> {
@@ -508,19 +541,45 @@ mod tests {
         let dir = scratch("pending");
         let ledger = Ledger::open(&dir, "session-q").expect("ledger");
         ledger.baseline_for("/x/a.py", state(1), Vec::new);
-        ledger.note_at("/x/a.py", 1, 2, 100);
-        assert_eq!(ledger.carry_at("/x/a.py", 1, 101), 2);
-        assert_eq!(ledger.carry_at("/x/a.py", 9, 101), 0);
-        assert_eq!(ledger.carry_at("/x/a.py", 1, 104), 0);
-        ledger.note_at("/x/a.py", 1, 1, 101);
-        assert_eq!(ledger.carry_at("/x/a.py", 1, 102), 3);
-        ledger.note_at("/x/a.py", 1, 0, 102);
-        assert_eq!(ledger.carry_at("/x/a.py", 1, 102), 3);
-        ledger.note_at("/x/a.py", 5, 1, 103);
-        assert_eq!(ledger.carry_at("/x/a.py", 1, 103), 0);
-        assert_eq!(ledger.carry_at("/x/a.py", 5, 103), 1);
-        ledger.note_at("/x/none.py", 1, 2, 100);
-        assert_eq!(ledger.carry_at("/x/none.py", 1, 100), 0);
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, 0, 100), Ok(()));
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 11, 101), 2);
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 10, 101), 0);
+        assert_eq!(ledger.carry_at("/x/a.py", 9, 11, 101), 0);
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 11, 104), 0);
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 12, 1, 2, 101), Ok(()));
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 13, 102), 3);
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 14, 0, 3, 102), Ok(()));
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 13, 102), 3);
+        assert_eq!(ledger.commit_note_at("/x/a.py", 5, 15, 1, 0, 103), Ok(()));
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 13, 103), 0);
+        assert_eq!(ledger.carry_at("/x/a.py", 5, 16, 103), 1);
+        assert_eq!(ledger.commit_note_at("/x/none.py", 1, 10, 2, 0, 100), Ok(()));
+        assert_eq!(ledger.carry_at("/x/none.py", 1, 11, 100), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_note_is_refused_when_another_edit_was_noted_after_the_carry_was_read() {
+        let dir = scratch("overlap");
+        let ledger = Ledger::open(&dir, "session-o").expect("ledger");
+        ledger.baseline_for("/x/a.py", state(1), Vec::new);
+        let first_carry = ledger.carry_at("/x/a.py", 1, 10, 100);
+        let second_carry = ledger.carry_at("/x/a.py", 1, 20, 100);
+        assert_eq!((first_carry, second_carry), (0, 0));
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, first_carry, 100), Ok(()));
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 20, 2, second_carry, 100), Err(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lock_is_only_released_by_its_owner() {
+        let dir = scratch("owner");
+        let ledger = Ledger::open(&dir, "session-w").expect("ledger");
+        let lock = ledger.named("/x/a.py", "lock");
+        ledger.locked("/x/a.py", || {
+            std::fs::write(&lock, "someone-else").expect("write");
+        });
+        assert_eq!(std::fs::read_to_string(&lock).expect("read"), "someone-else");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

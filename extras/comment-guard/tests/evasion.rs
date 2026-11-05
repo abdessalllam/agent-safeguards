@@ -1108,9 +1108,12 @@ fn copying_a_commented_file_is_not_adding_comments() {
     }
     let out = rig.bash_with_id("cp", "t1", command);
     assert!(out.is_empty(), "{out}");
+    let after = rig.pre_edit("cp", &copy, "x = 1", "x = 2");
+    assert!(after.is_empty(), "{after}");
     rig.pre_bash_with("cp", "t2", command);
-    std::fs::write(&copy, format!("{}x = 1\n", lines("#", "new text", 10))).expect("write");
-    let loud = rig.bash_with_id("cp", "t2", command);
+    let other = rig.cwd.join("src").join("other.py");
+    std::fs::write(&other, format!("{}x = 1\n", lines("#", "new text", 10))).expect("write");
+    let loud = rig.bash_with_id("cp", "t2", &format!("{command} && printf x > {}", other.display()));
     assert!(blocked(&loud), "{loud}");
     let tree = "cp -r vendor src2";
     rig.pre_bash_with("cp", "t3", tree);
@@ -1197,6 +1200,111 @@ fn a_file_rewritten_with_other_line_endings_is_still_in_a_known_state() {
     assert!(denied(&second));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn copies_made_with_globs_dots_and_spaced_names_are_copies_too() {
+    let rig = Rig::new("copy-forms");
+    std::fs::create_dir_all(rig.cwd.join("vendor")).expect("dir");
+    std::fs::create_dir_all(rig.cwd.join("src")).expect("dir");
+    let content = format!("{}x = 1\n", lines("#", "widget", 10));
+    std::fs::write(rig.cwd.join("vendor").join("a.py"), &content).expect("write");
+    std::fs::write(rig.cwd.join("vendor").join("my widget.py"), &content).expect("write");
+    let glob = "cp vendor/*.py src/";
+    rig.pre_bash_with("cf", "t1", glob);
+    std::fs::write(rig.cwd.join("src").join("a.py"), &content).expect("write");
+    if !creation_time_is_known(&rig.cwd.join("src").join("a.py")) {
+        return;
+    }
+    let first = rig.bash_with_id("cf", "t1", glob);
+    assert!(first.is_empty(), "{first}");
+    let spaced = "cp \"vendor/my widget.py\" \"src/my widget.py\"";
+    rig.pre_bash_with("cf", "t2", spaced);
+    std::fs::write(rig.cwd.join("src").join("my widget.py"), &content).expect("write");
+    let second = rig.bash_with_id("cf", "t2", spaced);
+    assert!(second.is_empty(), "{second}");
+    let dot = "cp -r . dest";
+    rig.pre_bash_with("cf", "t3", dot);
+    std::fs::create_dir_all(rig.cwd.join("dest")).expect("dir");
+    std::fs::write(rig.cwd.join("dest").join("copy.py"), &content).expect("write");
+    let third = rig.bash_with_id("cf", "t3", dot);
+    assert!(third.is_empty(), "{third}");
+}
+
+#[test]
+fn blank_comment_lines_are_never_forgiven_as_a_rewrap() {
+    let dir = temp_dir("blank-lines");
+    let path = dir.join("a.rs");
+    std::fs::write(&path, "// alpha beta gamma delta\nfn a() {}\n").expect("write");
+    let blanks = format!("// alpha beta\n// gamma\n{}fn a() {{}}\n", "//\n".repeat(10));
+    assert!(denied(&write_file(None, None, &path, &blanks)));
+    let wrapped = "// alpha beta\n// gamma delta\nfn a() {}\n";
+    assert!(!denied(&write_file(None, None, &path, wrapped)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_same_edit_judged_twice_is_not_counted_twice() {
+    let dir = temp_dir("retry");
+    let state = temp_dir("retry-state");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "x = 1\n").expect("write");
+    let first = edit_file(Some(&state), Some("rt"), &path, "x = 1", "# one\nx = 1");
+    assert!(!denied(&first));
+    let again = edit_file(Some(&state), Some("rt"), &path, "x = 1", "# one\nx = 1");
+    assert!(!denied(&again));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn a_named_folder_or_a_spaced_file_is_refreshed_before_a_command_too() {
+    let rig = Rig::new("named-folder");
+    std::fs::create_dir_all(rig.cwd.join("src")).expect("dir");
+    let file = rig.cwd.join("src").join("a.py");
+    let spaced = rig.cwd.join("src").join("my file.py");
+    for target in [&file, &spaced] {
+        std::fs::write(target, "x = 1\n").expect("write");
+        let first = rig.pre_edit("nf", target, "x = 1", "x = 2");
+        assert!(first.is_empty(), "{first}");
+    }
+    let command = "black src && black \"src/my file.py\"";
+    for target in [&file, &spaced] {
+        std::fs::write(target, format!("{}x = 2\n", lines("#", "by hand", 4))).expect("write");
+    }
+    rig.pre_bash_with("nf", "t1", command);
+    for target in [&file, &spaced] {
+        std::fs::write(target, format!("{}x = 2\n", lines("#", "by hand", 4))).expect("write");
+    }
+    let out = rig.bash_with_id("nf", "t1", command);
+    assert!(out.is_empty(), "{out}");
+}
+
+#[test]
+fn two_hooks_running_at_the_same_time_cannot_both_use_the_whole_allowance() {
+    for trial in 0..20 {
+        let dir = temp_dir(&format!("overlap-{trial}"));
+        let state = temp_dir(&format!("overlap-state-{trial}"));
+        let path = dir.join("a.py");
+        std::fs::write(&path, "x = 1\ny = 2\n").expect("write");
+        let gate = std::sync::Barrier::new(2);
+        let results: Vec<bool> = std::thread::scope(|scope| {
+            let workers: Vec<_> = [("x = 1", "# one\n# two\nx = 1"), ("y = 2", "# three\n# four\ny = 2")]
+                .into_iter()
+                .map(|(old, new)| {
+                    let (gate, path, state) = (&gate, &path, &state);
+                    scope.spawn(move || {
+                        gate.wait();
+                        denied(&edit_file(Some(state), Some("ov"), path, old, new))
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|worker| worker.join().expect("worker")).collect()
+        });
+        assert_eq!(results.iter().filter(|denied| **denied).count(), 1, "trial {trial}: {results:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state);
+    }
 }
 
 fn creation_time_is_known(path: &Path) -> bool {

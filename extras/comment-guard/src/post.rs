@@ -17,6 +17,7 @@ const WALK_TIME: Duration = Duration::from_millis(800);
 const TOTAL_TIME: Duration = Duration::from_millis(3000);
 const MAX_CANDIDATES: usize = 40;
 const SOURCE_FILES: usize = 400;
+const GLOB_MATCHES: usize = 200;
 const SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const FIRST_WINDOW: Duration = Duration::from_secs(60);
 const SKIP_DIRS: [&str; 10] = [
@@ -107,7 +108,7 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger) -> Verdict {
     let mut verdict = evaluate_after(&changes);
     if verdict.is_some() {
         drop_marked(&mut changes, &cwd);
-        drop_copies(&mut changes, command, &cwd, since);
+        drop_copies(&mut changes, command, &cwd, since, ledger);
         verdict = evaluate_after(&changes);
     }
     match verdict {
@@ -126,7 +127,15 @@ fn command_of(payload: &Map<String, Value>) -> &str {
 
 pub fn refresh_named(payload: &Map<String, Value>, ledger: &Ledger) {
     let cwd = crate::base_of(payload);
-    for path in command_paths(command_of(payload), &cwd) {
+    let mut targets: Vec<PathBuf> = Vec::new();
+    for token in command_tokens(command_of(payload), &cwd) {
+        for file in source_files(&token) {
+            if !targets.contains(&file) {
+                targets.push(file);
+            }
+        }
+    }
+    for path in targets {
         let name = path.to_string_lossy().into_owned();
         let Some(lang) = language_for(&name) else {
             continue;
@@ -151,19 +160,95 @@ fn home() -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
+fn wildcard_match(pattern: &[char], name: &[char]) -> bool {
+    let (mut p, mut n) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                star = Some((p, n));
+                p += 1;
+            }
+            Some('?') => {
+                p += 1;
+                n += 1;
+            }
+            Some(c) if Some(c) == name.get(n) => {
+                p += 1;
+                n += 1;
+            }
+            _ => match star {
+                Some((star_at, matched)) => {
+                    p = star_at + 1;
+                    n = matched + 1;
+                    star = Some((star_at, matched + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    while pattern.get(p) == Some(&'*') {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+fn expand_glob(cwd: &Path, word: &str) -> Vec<PathBuf> {
+    let (folder, last) = match word.rsplit_once('/') {
+        Some((folder, last)) => (folder, last),
+        None => ("", word),
+    };
+    if folder.contains(['*', '?']) {
+        return Vec::new();
+    }
+    let dir = if folder.is_empty() { cwd.to_path_buf() } else { resolve(cwd, folder) };
+    let pattern: Vec<char> = last.chars().collect();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name: Vec<char> = entry.file_name().to_string_lossy().chars().collect();
+        if name.first() != Some(&'.') && wildcard_match(&pattern, &name) {
+            out.push(entry.path());
+            if out.len() >= GLOB_MATCHES {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn command_words(command: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    if let Some(parts) = segments(command) {
+        for part in parts {
+            words.extend(part);
+        }
+    }
+    let separators = |c: char| c.is_whitespace() || "\"'`<>|;&()=,{}[]".contains(c);
+    words.extend(command.split(separators).map(str::to_owned));
+    let mut seen: HashSet<String> = HashSet::new();
+    words.retain(|word| seen.insert(word.clone()));
+    words
+}
+
 fn command_tokens(command: &str, cwd: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    let separators = |c: char| c.is_whitespace() || "\"'`<>|;&()=,{}[]".contains(c);
-    for token in command.split(separators) {
-        if token.len() < 2 || token.chars().all(|c| c == '.') {
+    for word in command_words(command) {
+        if word.len() < 2 || word.chars().all(|c| c == '.') {
             continue;
         }
-        let path = match (token.strip_prefix("~/"), home()) {
-            (Some(rest), Some(root)) => root.join(rest),
-            _ => resolve(cwd, token),
-        };
-        if path.exists() {
-            out.push(path);
+        if word.contains(['*', '?']) {
+            out.extend(expand_glob(cwd, &word));
+        } else {
+            let path = match (word.strip_prefix("~/"), home()) {
+                (Some(rest), Some(root)) => root.join(rest),
+                _ => resolve(cwd, &word),
+            };
+            if path.exists() {
+                out.push(path);
+            }
         }
         if out.len() >= MAX_CANDIDATES {
             break;
@@ -237,10 +322,14 @@ fn source_files(path: &Path) -> Vec<PathBuf> {
     Vec::new()
 }
 
-fn drop_copies(changes: &mut Vec<Change>, command: &str, cwd: &Path, since: SystemTime) {
+fn drop_copies(changes: &mut Vec<Change>, command: &str, cwd: &Path, since: SystemTime, ledger: &Ledger) {
     let mut known: HashSet<u64> = HashSet::new();
     let mut budget = SOURCE_BYTES;
-    'tokens: for token in command_tokens(command, cwd) {
+    let mut roots = command_tokens(command, cwd);
+    if command_words(command).iter().any(|word| word == ".") {
+        roots.push(cwd.to_path_buf());
+    }
+    'roots: for token in roots {
         for file in source_files(&token) {
             if changed_since(&file, since) {
                 continue;
@@ -249,13 +338,25 @@ fn drop_copies(changes: &mut Vec<Change>, command: &str, cwd: &Path, since: Syst
                 continue;
             };
             if text.len() > budget {
-                break 'tokens;
+                break 'roots;
             }
             budget = budget.saturating_sub(text.len());
             known.insert(content_hash(&text));
         }
     }
-    changes.retain(|change| !known.contains(&content_hash(&change.new)));
+    let mut kept: Vec<Change> = Vec::new();
+    for change in changes.drain(..) {
+        if !known.contains(&content_hash(&change.new)) {
+            kept.push(change);
+            continue;
+        }
+        if let Some(lang) = language_for(&change.file) {
+            let comments = comment_lines(&change.new, lang);
+            let state = seen_of(&change.new, &comments);
+            ledger.rebaseline(&identity(Path::new(&change.file)), comments, state);
+        }
+    }
+    *changes = kept;
 }
 
 fn absent(stderr: &str, dir: &Path) -> bool {

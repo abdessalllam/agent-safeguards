@@ -115,6 +115,7 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
     let mut fresh_blocks = 0usize;
     let mut fresh_long = 0usize;
     let mut fresh_letters = 0usize;
+    let mut fresh_blank = 0usize;
     let mut fresh_markers: Vec<&str> = Vec::new();
     for kind in scan(&change.new, lang) {
         let (line, same_line) = match kind {
@@ -148,6 +149,9 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
                 running = true;
             }
             fresh_lines = fresh_lines.saturating_add(1);
+            if letters(line) == 0 {
+                fresh_blank = fresh_blank.saturating_add(1);
+            }
             counted = true;
         }
         if line.chars().count() > MAX_LINE_CHARS {
@@ -176,10 +180,12 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
             *entry = entry.saturating_add(*count);
         }
     }
-    let mut net = fresh_lines.saturating_sub(removed_total);
+    let lettered = fresh_lines.saturating_sub(fresh_blank);
+    let mut net = lettered.saturating_sub(removed_total);
     if removed_total > 0 && fresh_letters <= removed_letters {
         net = 0;
     }
+    net = net.saturating_add(fresh_blank);
     let mut marker = None;
     for found in fresh_markers {
         match removed_markers.get_mut(&found.to_ascii_lowercase()) {
