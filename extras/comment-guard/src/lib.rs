@@ -18,7 +18,7 @@ pub use decision::{evaluate, Change};
 pub use tree::judge_tree;
 
 use decision::comment_lines;
-use languages::language_for;
+use languages::{language_for, Language};
 use session::Ledger;
 
 pub const MAX_INPUT: usize = 8 * 1024 * 1024;
@@ -71,6 +71,26 @@ fn mark_start(payload: &Map<String, Value>, state: Option<&Path>) {
     }
 }
 
+fn translated(old: &str, from: Language, record: &[String], to: Language) -> Vec<String> {
+    let mut added: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for line in comment_lines(old, from) {
+        *added.entry(line).or_insert(0) += 1;
+    }
+    for line in record {
+        if let Some(count) = added.get_mut(line) {
+            *count = count.saturating_sub(1);
+        }
+    }
+    let mut out = Vec::new();
+    for line in comment_lines(old, to) {
+        match added.get_mut(&line) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => out.push(line),
+        }
+    }
+    out
+}
+
 fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) {
     for change in changes.iter_mut() {
         if change.partial {
@@ -80,16 +100,15 @@ fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) {
             continue;
         };
         let id = session::identity(&changes::resolve(base, &change.file));
-        let origin = change
-            .origin
-            .as_deref()
-            .filter(|source| language_for(source) == Some(lang))
-            .map(|path| session::identity(&changes::resolve(base, path)));
-        let baseline = ledger.baseline(&id, || {
-            match origin.as_deref().and_then(|source| ledger.read(source)) {
-                Some(found) => found,
-                None => comment_lines(&change.old, lang),
-            }
+        let origin = change.origin.as_deref().and_then(|source| {
+            let from = language_for(source)?;
+            let record = ledger.read(&session::identity(&changes::resolve(base, source)))?;
+            Some((from, record))
+        });
+        let baseline = ledger.baseline(&id, || match origin {
+            Some((from, record)) if from == lang => record,
+            Some((from, record)) => translated(&change.old, from, &record, lang),
+            None => comment_lines(&change.old, lang),
         });
         change.baseline = Some(baseline);
     }

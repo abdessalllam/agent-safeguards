@@ -3,6 +3,7 @@ use crate::languages::Language;
 #[derive(Clone, Copy)]
 pub enum LineKind<'a> {
     Comment(&'a str),
+    Also(&'a str),
     Other,
 }
 
@@ -191,17 +192,19 @@ impl<'a> Iterator for Scan<'a> {
     type Item = LineKind<'a>;
 
     fn next(&mut self) -> Option<LineKind<'a>> {
-        let kind = match self.extra.pop_front() {
-            Some(text) => LineKind::Comment(text),
-            None => {
-                let line = self.lines.next()?;
-                self.classify(line)
+        loop {
+            if let Some(text) = self.extra.pop_front() {
+                if is_exempt(body(text)) {
+                    continue;
+                }
+                return Some(LineKind::Also(text));
             }
-        };
-        Some(match kind {
-            LineKind::Comment(text) if is_exempt(body(text)) => LineKind::Other,
-            other => other,
-        })
+            let line = self.lines.next()?;
+            return Some(match self.classify(line) {
+                LineKind::Comment(text) if is_exempt(body(text)) => LineKind::Other,
+                other => other,
+            });
+        }
     }
 }
 
@@ -506,7 +509,7 @@ mod tests {
     fn comments(text: &str, lang: Language) -> Vec<&str> {
         scan(text, lang)
             .filter_map(|kind| match kind {
-                LineKind::Comment(line) => Some(line),
+                LineKind::Comment(line) | LineKind::Also(line) => Some(line),
                 LineKind::Other => None,
             })
             .collect()

@@ -348,6 +348,12 @@ fn apply_hunks(content: &str, hunks: &[Hunk], starts: &mut Work) -> Option<Strin
     Some(out)
 }
 
+fn abandon(changes: &mut [Change], previous: Option<usize>) {
+    if let Some(change) = previous.and_then(|at| changes.get_mut(at)) {
+        change.new = change.old.clone();
+    }
+}
+
 fn assemble(
     changes: &mut Vec<Change>,
     lookup: &mut HashMap<String, usize>,
@@ -377,12 +383,14 @@ fn assemble(
         None => read_old(&resolve(base, &source)),
     };
     if current.as_ref().is_some_and(|text| !budget.0.spend(text.len())) {
+        abandon(changes, previous);
         return;
     }
     let applied = current
         .as_deref()
         .and_then(|text| apply_hunks(text, &section.hunks, &mut budget.1));
     if applied.is_none() && budget.1.out {
+        abandon(changes, previous);
         return;
     }
     lookup.remove(&source);

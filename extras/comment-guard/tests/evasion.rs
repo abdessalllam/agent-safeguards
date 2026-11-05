@@ -679,6 +679,60 @@ fn a_multi_edit_that_exhausts_the_work_budget_is_allowed_not_judged_by_fragments
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn comments_on_one_physical_line_count_as_one_line_but_are_each_checked() {
+    let three = "int f(void) { return /* a */ 1 + /* b */ 2 + /* c */ 3; }\n";
+    assert!(!denied(&write_file(None, None, Path::new("a.c"), three)));
+    let two_lines = "int a = /* a */ 1; /* b */\nint b = /* c */ 2; /* d */\n";
+    assert!(!denied(&write_file(None, None, Path::new("a.c"), two_lines)));
+    let three_lines = "int a = /* a */ 1;\nint b = /* b */ 2;\nint c = /* c */ 3;\n";
+    assert!(denied(&write_file(None, None, Path::new("a.c"), three_lines)));
+    let verdict = write_file(None, None, Path::new("a.c"), "int a = /* fine */ 1; /* used to differ */\n");
+    assert!(denied(&verdict));
+    assert!(reason(&verdict).contains("used to"));
+}
+
+#[test]
+fn a_move_to_a_similar_language_keeps_the_allowance_that_was_used() {
+    let dir = temp_dir("similar-move");
+    let state = temp_dir("similar-move-state");
+    let from = dir.join("a.py");
+    let to = dir.join("b.rb");
+    std::fs::write(&from, "x = 1\n").expect("write");
+    let first = edit_file(Some(&state), Some("h1"), &from, "x = 1", "# one\n# two\nx = 1");
+    assert!(!denied(&first));
+    apply_edit(&from, "x = 1", "# one\n# two\nx = 1");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n*** Move to: {}\n@@\n # one\n # two\n+# three\n+# four\n x = 1\n*** End Patch\n",
+        from.display(),
+        to.display()
+    );
+    let verdict = pre(Some(&state), Some("h1"), "apply_patch", json!({ "command": patch }), Provider::Codex);
+    assert!(denied(&verdict));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn a_patch_that_runs_out_of_budget_does_not_judge_its_earlier_intermediate_file() {
+    let dir = temp_dir("patch-budget");
+    let path = dir.join("a.py");
+    let padding = "x".repeat(1024 * 1024);
+    std::fs::write(&path, format!("flag = 0\nDATA = \"\"\"\n{padding}\n\"\"\"\n")).expect("write");
+    let target = path.display();
+    let mut patch = String::from("*** Begin Patch\n");
+    patch.push_str(&format!("*** Update File: {target}\n@@\n+# one\n+# two\n+# three\n"));
+    for n in 0..70 {
+        let (from, to) = if n % 2 == 0 { ("flag = 0", "flag = 1") } else { ("flag = 1", "flag = 0") };
+        patch.push_str(&format!("*** Update File: {target}\n@@\n-{from}\n+{to}\n"));
+    }
+    patch.push_str(&format!("*** Update File: {target}\n@@\n-# one\n-# two\n-# three\n"));
+    patch.push_str("*** End Patch\n");
+    let verdict = pre(None, None, "apply_patch", json!({ "command": patch }), Provider::Codex);
+    assert!(!denied(&verdict));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn creation_time_is_known(path: &Path) -> bool {
     std::fs::metadata(path).and_then(|meta| meta.created()).is_ok()
 }

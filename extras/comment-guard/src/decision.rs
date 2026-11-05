@@ -55,7 +55,7 @@ impl Change {
 pub fn comment_lines(text: &str, lang: Language) -> Vec<String> {
     scan(text, lang)
         .filter_map(|kind| match kind {
-            LineKind::Comment(line) => Some(line.to_owned()),
+            LineKind::Comment(line) | LineKind::Also(line) => Some(line.to_owned()),
             LineKind::Other => None,
         })
         .collect()
@@ -114,40 +114,53 @@ fn evaluate_detail(changes: &[Change]) -> Option<String> {
             }
             _ => {
                 for kind in scan(&change.old, lang) {
-                    if let LineKind::Comment(line) = kind {
+                    if let LineKind::Comment(line) | LineKind::Also(line) = kind {
                         *pool.entry(line).or_insert(0) += 1;
                     }
                 }
             }
         }
         let mut running = false;
+        let mut counted = false;
         for kind in scan(&change.new, lang) {
-            match kind {
-                LineKind::Comment(line) => {
-                    let kept = match pool.get_mut(line) {
-                        Some(count) if *count > 0 => {
-                            *count -= 1;
-                            true
-                        }
-                        _ => false,
-                    };
-                    if kept {
-                        running = false;
-                        continue;
-                    }
-                    if !running {
-                        slot.blocks = slot.blocks.saturating_add(1);
-                        running = true;
-                    }
-                    slot.lines = slot.lines.saturating_add(1);
-                    if line.chars().count() > MAX_LINE_CHARS {
-                        slot.too_long = true;
-                    }
-                    if slot.marker.is_none() {
-                        slot.marker = history_marker(body(line));
-                    }
+            let (line, same_line) = match kind {
+                LineKind::Comment(line) => (line, false),
+                LineKind::Also(line) => (line, true),
+                LineKind::Other => {
+                    running = false;
+                    counted = false;
+                    continue;
                 }
-                LineKind::Other => running = false,
+            };
+            if !same_line {
+                counted = false;
+            }
+            let kept = match pool.get_mut(line) {
+                Some(count) if *count > 0 => {
+                    *count -= 1;
+                    true
+                }
+                _ => false,
+            };
+            if kept {
+                if !same_line {
+                    running = false;
+                }
+                continue;
+            }
+            if !counted {
+                if !running {
+                    slot.blocks = slot.blocks.saturating_add(1);
+                    running = true;
+                }
+                slot.lines = slot.lines.saturating_add(1);
+                counted = true;
+            }
+            if line.chars().count() > MAX_LINE_CHARS {
+                slot.too_long = true;
+            }
+            if slot.marker.is_none() {
+                slot.marker = history_marker(body(line));
             }
         }
     }
