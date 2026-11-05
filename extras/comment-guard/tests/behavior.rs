@@ -208,6 +208,16 @@ fn every_tool_directive_is_ignored() {
         "SPDX-License-Identifier: BSD-3-Clause",
         "SPDX-License-Identifier: CC-BY-4.0",
         "SPDX-License-Identifier: (MIT OR Apache-2.0) AND BSD-2-Clause",
+        "SPDX-License-Identifier: 0BSD",
+        "SPDX-License-Identifier: X11",
+        "SPDX-License-Identifier: MS-PL",
+        "SPDX-License-Identifier: MS-RL",
+        "SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note",
+        "SPDX-License-Identifier: LGPL-2.1+",
+        "SPDX-License-Identifier: BSD-3-Clause-Clear",
+        "SPDX-License-Identifier: CC-BY-SA-4.0",
+        "SPDX-License-Identifier: CC0-1.0",
+        "SPDX-License-Identifier: GPL-3.0-or-later",
         "go:build linux || darwin || windows || freebsd",
         "go:build (linux && amd64) || (darwin && arm64)",
     ];
@@ -239,6 +249,9 @@ fn a_directive_cannot_carry_a_sentence_in_its_arguments() {
         "SPDX-License-Identifier: note-one-explain-the-cache",
         "SPDX-License-Identifier: note-1-explain-the-cache",
         "SPDX-License-Identifier: MIT AND MIT AND MIT AND MIT AND MIT",
+        "SPDX-License-Identifier: GPL-note-one-explain-the-cache-1",
+        "SPDX-License-Identifier: MIT-note-three-explain-retry-3",
+        "SPDX-License-Identifier: CC-note-four-explain-fall-4",
         "istanbul ignore next for now",
     ];
     for sentence in sentences {

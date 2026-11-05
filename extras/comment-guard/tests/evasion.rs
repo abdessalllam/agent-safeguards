@@ -1754,6 +1754,9 @@ fn comment_forms_of_the_less_common_languages_are_all_seen() {
         ("b.lua", "--[=====[\nnote one\nnote two\nnote three\nnote four\n]=====]\nlocal a = 1\n"),
         ("b.bat", "@:: note one\n@:: note two\necho 3 & @:: note three\necho 4 & @:: note four\n"),
         ("b.f90", "!$ note one explain the cache\n!$ note two explain the lock\n!a$ note three explain the retry\n!x$ note four\nend\n"),
+        ("d.f90", "!$ call note one explain the cache\n!$ if note two explain the lock\n!$ do note three explain the retry\n!$ end note four explain the fallback\nend\n"),
+        ("c.pas", "{$R * note one explain the cache}\n{$R * note two explain the lock}\n{$R * note three explain the retry}\n{$R * note four explain the fallback}\nbegin end.\n"),
+        ("b.ps1", "$a = 1 \\# note one\n$b = 2 \\# note two\n$c = 3 \\# note three\n$d = 4 \\# note four\n"),
     ];
     for (name, text) in hidden {
         let path = dir.join(name);
@@ -1768,6 +1771,8 @@ fn comment_forms_of_the_less_common_languages_are_all_seen() {
         ("b.pas", "(*$MODE OBJFPC*)\n(*$H+*)\n(*$IFDEF UNIX*)\n(*$ENDIF*)\nbegin end.\n"),
         ("c.f90", "!dir$ IVDEP\n!DEC$ ATTRIBUTES DLLEXPORT :: a\n!$ call omp_set_num_threads(4)\n!$ use omp_lib\nend\n"),
         ("a.ps1", "Write-Host `# note one\nWrite-Host `# note two\n$a = \"say `\"# note three\"\n$b = \"say `\"# note four\"\n"),
+        ("c.ps1", "Write-Host `# note one\nWrite-Host `# note two\nWrite-Host `# note three\nWrite-Host `# note four\n"),
+        ("e.f90", "!$ subroutine note_one\n!$ function note_two()\n!$ module note_three\n!$ type note_four\nend\n"),
         ("a.lua", "local a = \"--[==[ one\"\nlocal b = \"--[==[ two\"\nlocal c = 3\n"),
         ("a.ml", "let a = \"(* one *)\"\nlet b = \"(* two *)\"\nlet c = \"(* three *)\"\n"),
     ];

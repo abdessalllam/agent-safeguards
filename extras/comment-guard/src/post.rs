@@ -802,6 +802,12 @@ fn git_segment(words: &[String]) -> Option<bool> {
     None
 }
 
+const HARMLESS_VARIABLES: &[&str] = &["LANG", "LANGUAGE", "TERM", "NO_COLOR", "COLUMNS", "LINES", "CLICOLOR", "TZ"];
+
+fn is_name(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn quiet_command(command: &str) -> bool {
     let Some(parts) = segments(command) else {
         return false;
@@ -811,8 +817,15 @@ fn quiet_command(command: &str) -> bool {
         && parts.iter().all(|words| {
             let start = words
                 .iter()
-                .take_while(|word| word.contains('=') && !word.starts_with('=') && !word.contains('/'))
+                .take_while(|word| word.split_once('=').is_some_and(|(name, _)| is_name(name)))
                 .count();
+            let harmless = |word: &String| {
+                let name = word.split('=').next().unwrap_or("");
+                HARMLESS_VARIABLES.contains(&name) || name.starts_with("LC_")
+            };
+            if !words.iter().take(start).all(harmless) {
+                return false;
+            }
             let words = words.get(start..).unwrap_or(&[]);
             !words.iter().any(|word| word == "--pre" || word.starts_with("--pre="))
                 && match words.split_first() {
@@ -1036,6 +1049,10 @@ mod tests {
     fn a_command_that_only_looks_is_quiet_and_one_that_can_run_something_is_not() {
         assert!(quiet_command("ls /other/repo"));
         assert!(quiet_command("LC_ALL=C ls /other/repo"));
+        assert!(!quiet_command("LD_PRELOAD=evil.so ls /other"));
+        assert!(!quiet_command("LD_LIBRARY_PATH=. LD_PRELOAD=evil.so ls /other"));
+        assert!(!quiet_command("GIT_EXTERNAL_DIFF=evil git diff"));
+        assert!(!quiet_command("PATH=/usr/bin ls /other"));
         assert!(quiet_command("cd /x && rg -n pattern /y | head"));
         assert!(quiet_command("git status"));
         assert!(!quiet_command("rg --pre cat pattern /y"));

@@ -76,19 +76,27 @@ const GO_DIRECTIVES: &[&str] = &[
 
 const LICENSE_NAMES: &[&str] = &[
     "mit", "isc", "bsd", "wtfpl", "unlicense", "zlib", "openssl", "curl", "postgresql", "ruby", "vim", "ncsa", "python", "php",
-    "boost", "artistic", "sleepycat",
+    "boost", "artistic", "sleepycat", "0bsd", "x11", "x11-distribute-modifications-variant", "ms-pl", "ms-rl",
 ];
 
 const LICENSE_FAMILIES: &[&str] = &[
-    "0bsd", "afl", "agpl", "apache", "artistic", "bsd", "bsl", "cc", "cddl", "ecl", "epl", "eupl", "gfdl", "gpl", "isc", "lgpl",
-    "mit", "mpl", "ms", "ofl", "osl", "odbl", "php", "python", "ruby", "unicode", "x11", "zpl",
+    "afl", "agpl", "apache", "artistic", "bsd", "bsl", "cc", "cc-by", "cc-by-sa", "cc-by-nc", "cc-by-nd", "cc-by-nc-sa",
+    "cc-by-nc-nd", "cddl", "ecl", "epl", "eupl", "gfdl", "gpl", "isc", "lgpl", "mit", "mpl", "ofl", "osl", "odbl", "php",
+    "python", "ruby", "unicode", "zpl",
 ];
+
+const LICENSE_QUALIFIERS: &[&str] = &[
+    "only", "or", "later", "clause", "clear", "patent", "attribution", "no", "new", "simplified", "modification", "views",
+    "universal", "zero",
+];
+
+const EXCEPTION_NAMES: &[&str] = &["linux-syscall-note", "llvm-exception", "gcc-exception-3.1", "classpath-exception-2.0"];
 
 const SENTINELS: &[&str] = &["!$omp", "!$acc", "!$ompx", "!dir$", "!dec$", "!gcc$", "!pgi$", "!mic$", "!cdir$", "!$pragma"];
 
 const CONDITIONAL_FORTRAN: &[&str] = &[
     "call", "use", "integer", "real", "logical", "double", "character", "implicit", "include", "if", "end", "else", "do",
-    "external", "parameter",
+    "external", "parameter", "subroutine", "function", "module", "type", "program", "contains", "private", "public", "interface",
 ];
 
 const PASCAL_MESSAGES: &[&str] = &["message", "warning", "hint", "note", "error", "fatal"];
@@ -154,12 +162,18 @@ fn license_id(token: &str) -> bool {
         return false;
     };
     let family = lower.get(..digit).unwrap_or("").trim_end_matches('-');
-    LICENSE_FAMILIES.contains(&family.split('-').next().unwrap_or(""))
+    LICENSE_FAMILIES.contains(&family)
+        && lower
+            .get(digit..)
+            .unwrap_or("")
+            .split('-')
+            .all(|part| (!part.is_empty() && part.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '+'))) || LICENSE_QUALIFIERS.contains(&part))
 }
 
 fn exception_id(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
     token.len() <= 60
-        && token.to_ascii_lowercase().contains("exception")
+        && (lower.contains("exception") || EXCEPTION_NAMES.contains(&lower.as_str()))
         && token.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
 }
 
@@ -274,7 +288,14 @@ fn is_sentinel(text: &str) -> bool {
             return lower.split_whitespace().count() <= 10;
         }
     }
-    lower.strip_prefix("!$ ").is_some_and(|rest| CONDITIONAL_FORTRAN.contains(&rest.split_whitespace().next().unwrap_or("")))
+    lower.strip_prefix("!$ ").is_some_and(|rest| {
+        let mut words = rest.split_whitespace();
+        let first = words.next().unwrap_or("");
+        let others: Vec<&str> = words.collect();
+        CONDITIONAL_FORTRAN.contains(&first)
+            && others.len() <= 10
+            && others.iter().filter(|word| !code_like(word)).count() <= MAX_DIRECTIVE_WORDS
+    })
 }
 
 fn is_directive_block(open: &str, rest: &str) -> bool {
@@ -282,9 +303,10 @@ fn is_directive_block(open: &str, rest: &str) -> bool {
         return false;
     }
     let body = rest.get(1..).unwrap_or("");
-    let inner = body.get(..body.find(['}', '*']).unwrap_or(body.len())).unwrap_or(body);
+    let closer = if open == "{" { "}" } else { "*)" };
+    let inner = body.get(..body.find(closer).unwrap_or(body.len())).unwrap_or(body);
     let first: String = inner.chars().take_while(char::is_ascii_alphabetic).collect();
-    !PASCAL_MESSAGES.contains(&first.to_ascii_lowercase().as_str()) && inner.split_whitespace().count() <= 8
+    !PASCAL_MESSAGES.contains(&first.to_ascii_lowercase().as_str()) && inner.split_whitespace().count() <= 4
 }
 
 fn is_exempt(text: &str) -> bool {
@@ -792,7 +814,7 @@ impl<'a> Scan<'a> {
                     }
                 }
             }
-            if first == '\\' {
+            if first == lang.escape {
                 at = at.saturating_add(2);
                 previous = None;
                 continue;
