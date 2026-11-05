@@ -28,6 +28,7 @@ struct Pending {
     to: u64,
     net: usize,
     at: u64,
+    since: u64,
 }
 
 struct Stored {
@@ -266,11 +267,13 @@ impl Ledger {
             })
             .unwrap_or_default();
         let pending = value.get("pending").and_then(|item| {
+            let at = item.get("at")?.as_u64()?;
             Some(Pending {
                 from: parse_hex(item.get("from")?)?,
                 to: parse_hex(item.get("to")?)?,
                 net: usize::try_from(item.get("net")?.as_u64()?).ok()?,
-                at: item.get("at")?.as_u64()?,
+                at,
+                since: item.get("since").and_then(Value::as_u64).unwrap_or(at),
             })
         });
         Some(Stored { comments, seen, pending })
@@ -283,7 +286,7 @@ impl Ledger {
             .map(|state| json!({ "h": format!("{:016x}", state.hash), "s": format!("{:016x}", state.sig) }))
             .collect();
         let pending = stored.pending.as_ref().map(|item| {
-            json!({ "from": format!("{:016x}", item.from), "to": format!("{:016x}", item.to), "net": item.net, "at": item.at })
+            json!({ "from": format!("{:016x}", item.from), "to": format!("{:016x}", item.to), "net": item.net, "at": item.at, "since": item.since })
         });
         let body = json!({ "path": identity, "comments": stored.comments, "seen": seen, "pending": pending })
             .to_string();
@@ -385,7 +388,7 @@ impl Ledger {
         }
     }
 
-    pub fn commit_note(&self, identity: &str, from: u64, to: u64, net: usize, expected: usize) -> Result<bool, usize> {
+    pub fn commit_note(&self, identity: &str, from: u64, to: u64, net: usize, expected: usize) -> Result<Option<u64>, usize> {
         self.commit_note_at(identity, from, to, net, expected, now_seconds())
     }
 
@@ -397,10 +400,10 @@ impl Ledger {
         net: usize,
         expected: usize,
         now: u64,
-    ) -> Result<bool, usize> {
+    ) -> Result<Option<u64>, usize> {
         self.locked(identity, || {
             let Some(mut stored) = self.load(identity) else {
-                return Ok(false);
+                return Ok(None);
             };
             let current = stored
                 .pending
@@ -410,29 +413,30 @@ impl Ledger {
                 return Err(current);
             }
             if net == 0 {
-                return Ok(false);
+                return Ok(None);
             }
-            let total = match stored.pending.as_ref() {
+            let (total, since) = match stored.pending.as_ref() {
                 Some(pending) if pending.from == from && now.saturating_sub(pending.at) <= PENDING_SECONDS => {
                     if pending.to == to {
-                        return Ok(false);
+                        return Ok(None);
                     }
-                    pending.net.saturating_add(net)
+                    (pending.net.saturating_add(net), pending.since)
                 }
-                _ => net,
+                _ => (net, now),
             };
             stored.pending = Some(Pending {
                 from,
                 to,
                 net: total,
                 at: now,
+                since,
             });
             self.store(identity, &stored);
-            Ok(true)
+            Ok(Some(now))
         })
     }
 
-    pub fn revoke_note(&self, identity: &str, from: u64, net: usize) {
+    pub fn revoke_note(&self, identity: &str, from: u64, net: usize, noted: u64) {
         self.locked(identity, || {
             let Some(mut stored) = self.load(identity) else {
                 return;
@@ -440,7 +444,7 @@ impl Ledger {
             let Some(pending) = stored.pending.as_mut() else {
                 return;
             };
-            if pending.from != from {
+            if pending.from != from || pending.since > noted {
                 return;
             }
             pending.net = pending.net.saturating_sub(net);
@@ -590,19 +594,19 @@ mod tests {
         let dir = scratch("pending");
         let ledger = Ledger::open(&dir, "session-q").expect("ledger");
         ledger.baseline_for("/x/a.py", state(1), Vec::new);
-        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, 0, 100), Ok(true));
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, 0, 100), Ok(Some(100)));
         assert_eq!(ledger.carry_at("/x/a.py", 1, 11, 101), 2);
         assert_eq!(ledger.carry_at("/x/a.py", 1, 10, 101), 0);
         assert_eq!(ledger.carry_at("/x/a.py", 9, 11, 101), 0);
         assert_eq!(ledger.carry_at("/x/a.py", 1, 11, 104), 0);
-        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 12, 1, 2, 101), Ok(true));
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 12, 1, 2, 101), Ok(Some(101)));
         assert_eq!(ledger.carry_at("/x/a.py", 1, 13, 102), 3);
-        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 14, 0, 3, 102), Ok(false));
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 14, 0, 3, 102), Ok(None));
         assert_eq!(ledger.carry_at("/x/a.py", 1, 13, 102), 3);
-        assert_eq!(ledger.commit_note_at("/x/a.py", 5, 15, 1, 0, 103), Ok(true));
+        assert_eq!(ledger.commit_note_at("/x/a.py", 5, 15, 1, 0, 103), Ok(Some(103)));
         assert_eq!(ledger.carry_at("/x/a.py", 1, 13, 103), 0);
         assert_eq!(ledger.carry_at("/x/a.py", 5, 16, 103), 1);
-        assert_eq!(ledger.commit_note_at("/x/none.py", 1, 10, 2, 0, 100), Ok(false));
+        assert_eq!(ledger.commit_note_at("/x/none.py", 1, 10, 2, 0, 100), Ok(None));
         assert_eq!(ledger.carry_at("/x/none.py", 1, 11, 100), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -615,7 +619,7 @@ mod tests {
         let first_carry = ledger.carry_at("/x/a.py", 1, 10, 100);
         let second_carry = ledger.carry_at("/x/a.py", 1, 20, 100);
         assert_eq!((first_carry, second_carry), (0, 0));
-        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, first_carry, 100), Ok(true));
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, first_carry, 100), Ok(Some(100)));
         assert_eq!(ledger.commit_note_at("/x/a.py", 1, 20, 2, second_carry, 100), Err(2));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -625,13 +629,25 @@ mod tests {
         let dir = scratch("same-edit");
         let ledger = Ledger::open(&dir, "session-n").expect("ledger");
         ledger.baseline_for("/x/a.py", state(1), Vec::new);
-        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, 0, 100), Ok(true));
-        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, 0, 101), Ok(false));
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, 0, 100), Ok(Some(100)));
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, 0, 101), Ok(None));
         assert_eq!(ledger.carry_at("/x/a.py", 1, 11, 101), 2);
-        ledger.revoke_note("/x/a.py", 9, 2);
+        ledger.revoke_note("/x/a.py", 9, 2, 100);
         assert_eq!(ledger.carry_at("/x/a.py", 1, 11, 101), 2);
-        ledger.revoke_note("/x/a.py", 1, 2);
+        ledger.revoke_note("/x/a.py", 1, 2, 100);
         assert_eq!(ledger.carry_at("/x/a.py", 1, 11, 101), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_note_that_was_replaced_is_not_revoked_from_its_replacement() {
+        let dir = scratch("revoke-replaced");
+        let ledger = Ledger::open(&dir, "session-q").expect("ledger");
+        ledger.baseline_for("/x/a.py", state(1), Vec::new);
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, 0, 100), Ok(Some(100)));
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 20, 1, 0, 110), Ok(Some(110)));
+        ledger.revoke_note("/x/a.py", 1, 2, 100);
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 30, 111), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -640,10 +656,10 @@ mod tests {
         let dir = scratch("revoke-later");
         let ledger = Ledger::open(&dir, "session-r").expect("ledger");
         ledger.baseline_for("/x/a.py", state(1), Vec::new);
-        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 1, 0, 100), Ok(true));
-        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 20, 1, 1, 100), Ok(true));
-        ledger.revoke_note("/x/a.py", 1, 1);
-        assert_eq!(ledger.carry_at("/x/a.py", 1, 30, 101), 1);
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 1, 0, 100), Ok(Some(100)));
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 20, 1, 1, 102), Ok(Some(102)));
+        ledger.revoke_note("/x/a.py", 1, 1, 100);
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 30, 103), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

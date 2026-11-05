@@ -8,6 +8,7 @@ pub const MAX_LINES: usize = 2;
 pub const MAX_BLOCKS: usize = 1;
 pub const MAX_LINE_CHARS: usize = 100;
 const REWRAP_FILL: usize = 24;
+const THIN_LINE: usize = 16;
 
 const HISTORY_PHRASES: [&str; 8] = [
     "previously",
@@ -117,6 +118,7 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
     let mut fresh_long = 0usize;
     let mut fresh_letters = 0usize;
     let mut fresh_blank = 0usize;
+    let mut fresh_thin = 0usize;
     let mut fresh_markers: Vec<&str> = Vec::new();
     for kind in scan(&change.new, lang) {
         let (line, same_line) = match kind {
@@ -150,8 +152,10 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
                 running = true;
             }
             fresh_lines = fresh_lines.saturating_add(1);
-            if letters(line) == 0 {
-                fresh_blank = fresh_blank.saturating_add(1);
+            match letters(line) {
+                0 => fresh_blank = fresh_blank.saturating_add(1),
+                found if found < THIN_LINE => fresh_thin = fresh_thin.saturating_add(1),
+                _ => {}
             }
             counted = true;
         }
@@ -166,6 +170,7 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
     let mut removed_total = 0usize;
     let mut removed_long = 0usize;
     let mut removed_letters = 0usize;
+    let mut removed_thin = 0usize;
     let mut removed_markers: HashMap<String, usize> = HashMap::new();
     for (line, count) in &pool {
         if *count == 0 {
@@ -173,6 +178,9 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
         }
         removed_total = removed_total.saturating_add(*count);
         removed_letters = removed_letters.saturating_add(letters(line).saturating_mul(*count));
+        if (1..THIN_LINE).contains(&letters(line)) {
+            removed_thin = removed_thin.saturating_add(*count);
+        }
         if line.chars().count() > MAX_LINE_CHARS {
             removed_long = removed_long.saturating_add(*count);
         }
@@ -184,8 +192,9 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
     let lettered = fresh_lines.saturating_sub(fresh_blank);
     let mut net = lettered.saturating_sub(removed_total);
     if removed_total > 0 && fresh_letters <= removed_letters {
-        let room = removed_total.max(fresh_letters.div_ceil(REWRAP_FILL).saturating_add(1));
-        net = lettered.saturating_sub(room);
+        let room = removed_total.max(fresh_letters.div_ceil(REWRAP_FILL));
+        let filled = lettered.saturating_sub(fresh_thin).saturating_sub(room);
+        net = net.min(filled.saturating_add(fresh_thin.saturating_sub(removed_thin)));
     }
     let spare = removed_total.saturating_sub(lettered);
     net = net.saturating_add(fresh_blank.saturating_sub(spare));

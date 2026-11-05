@@ -1547,3 +1547,31 @@ fn a_comment_split_into_thin_lines_is_not_a_rewrap() {
     assert!(denied(&write_file(None, None, &path, letters)));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_few_thin_lines_beside_a_full_line_are_not_a_rewrap_either() {
+    let dir = temp_dir("thin-tail");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "# The parser keeps the original token boundaries intact today\nx = 1\n").expect("write");
+    let split = "# The parser keeps the original token boundaries intact to\n# d\n# a\n# y\nx = 1\n";
+    assert!(denied(&write_file(None, None, &path, split)));
+    let cjk = "# \u{8fd9}\u{4e2a}\u{6a21}\u{5757}\u{89e3}\u{6790}\u{8bf7}\u{6c42}\u{8def}\u{5f84}\u{5e76}\u{89c4}\u{8303}\u{5316}\u{67e5}\u{8be2}\u{53c2}\u{6570}\u{7136}\u{540e}\u{8def}\u{7531}\nx = 1\n";
+    std::fs::write(&path, cjk).expect("write");
+    let pieces = "# \u{8fd9}\u{4e2a}\u{6a21}\u{5757}\u{89e3}\u{6790}\u{8bf7}\u{6c42}\u{8def}\u{5f84}\u{5e76}\u{89c4}\u{8303}\u{5316}\u{67e5}\u{8be2}\n# \u{53c2}\n# \u{6570}\n# \u{7136}\n# \u{540e}\n# \u{8def}\u{7531}\nx = 1\n";
+    assert!(denied(&write_file(None, None, &path, pieces)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn replacing_long_comments_with_shorter_ones_and_reflowing_stay_free() {
+    let dir = temp_dir("short-swap");
+    let path = dir.join("a.py");
+    let long = "# this function walks the whole tree and collects every matching entry\n# it stops early when the caller asks it to stop walking\n# the result is sorted before it is returned to the caller\nx = 1\n";
+    std::fs::write(&path, long).expect("write");
+    let short = "# walks the tree\n# stops early\n# sorted\nx = 1\n";
+    assert!(!denied(&write_file(None, None, &path, short)));
+    std::fs::write(&path, "# this function walks the whole tree and collects every matching entry it stops early\nx = 1\n").expect("write");
+    let reflowed = "# this function walks the whole tree and\n# collects every matching entry it stops\n# early\nx = 1\n";
+    assert!(!denied(&write_file(None, None, &path, reflowed)));
+    let _ = std::fs::remove_dir_all(&dir);
+}

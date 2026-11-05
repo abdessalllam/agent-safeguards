@@ -138,15 +138,15 @@ fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) -> Has
 
 fn settle(ledger: &Ledger, prepared: &HashMap<String, Prepared>, changes: &mut [Change]) -> Option<String> {
     let mut retry: Vec<(String, u64, u64, usize)> = Vec::new();
-    let mut committed: Vec<(String, u64, usize)> = Vec::new();
+    let mut committed: Vec<(String, u64, usize, u64)> = Vec::new();
     for change in changes.iter_mut() {
         let Some(item) = prepared.get(&change.file) else {
             continue;
         };
         let net = decision::net_lines(change);
         match ledger.commit_note(&item.id, item.before, item.after.hash, net, change.carry) {
-            Ok(true) => committed.push((item.id.clone(), item.before, net)),
-            Ok(false) => {}
+            Ok(Some(noted)) => committed.push((item.id.clone(), item.before, net, noted)),
+            Ok(None) => {}
             Err(current) => {
                 change.carry = current;
                 retry.push((item.id.clone(), item.before, item.after.hash, net));
@@ -170,8 +170,8 @@ fn settle(ledger: &Ledger, prepared: &HashMap<String, Prepared>, changes: &mut [
             }
         }
     } else {
-        for (id, before, net) in &committed {
-            ledger.revoke_note(id, *before, *net);
+        for (id, before, net, noted) in &committed {
+            ledger.revoke_note(id, *before, *net, *noted);
         }
     }
     verdict
@@ -279,7 +279,7 @@ mod tests {
         let ledger = Ledger::open(&dir, "settle").expect("ledger");
         let (prepared, mut changes) = pair(&ledger);
         let other = &prepared["/t/b.py"];
-        assert_eq!(ledger.commit_note(&other.id, other.before, 77, 2, 0), Ok(true));
+        assert!(matches!(ledger.commit_note(&other.id, other.before, 77, 2, 0), Ok(Some(_))));
         let verdict = settle(&ledger, &prepared, &mut changes);
         assert!(verdict.is_some());
         let first = &prepared["/t/a.py"];
@@ -293,9 +293,9 @@ mod tests {
         let ledger = Ledger::open(&dir, "settle").expect("ledger");
         let (prepared, mut changes) = pair(&ledger);
         let first = &prepared["/t/a.py"];
-        assert_eq!(ledger.commit_note(&first.id, first.before, first.after.hash, 1, 0), Ok(true));
+        assert!(matches!(ledger.commit_note(&first.id, first.before, first.after.hash, 1, 0), Ok(Some(_))));
         let other = &prepared["/t/b.py"];
-        assert_eq!(ledger.commit_note(&other.id, other.before, 77, 2, 0), Ok(true));
+        assert!(matches!(ledger.commit_note(&other.id, other.before, 77, 2, 0), Ok(Some(_))));
         let verdict = settle(&ledger, &prepared, &mut changes);
         assert!(verdict.is_some());
         assert_eq!(ledger.carry(&first.id, first.before, 12345), 1);
