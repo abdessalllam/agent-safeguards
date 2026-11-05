@@ -23,6 +23,7 @@ pub struct Language {
     pub long_bracket: Option<&'static str>,
     pub escape: char,
     pub markup: bool,
+    pub trim: bool,
 }
 
 const C_BLOCKS: &[(&str, &str)] = &[("/*", "*/")];
@@ -53,41 +54,42 @@ const BASE: Language = Language {
     long_bracket: None,
     escape: '\\',
     markup: false,
+    trim: false,
 };
 
 pub const HASH: Language = Language { line: &["#"], ..BASE };
-pub const SHELL: Language = Language { line: &["#"], hash_after_space: true, ..BASE };
-pub const PYTHON: Language = Language { line: &["#"], triple: BOTH_BLOCKS, docstring: true, ..BASE };
-pub const RUBY: Language = Language { line: &["#"], column_zero: &[("=begin", "=end")], ..BASE };
+pub const SHELL: Language = Language { line: &["#"], hash_after_space: true, trim: true, ..BASE };
+pub const PYTHON: Language = Language { line: &["#"], triple: BOTH_BLOCKS, docstring: true, trim: true, ..BASE };
+pub const RUBY: Language = Language { line: &["#"], column_zero: &[("=begin", "=end")], trim: true, ..BASE };
 pub const PERL: Language = Language { line: &["#"], pod: true, hash_after_space: true, ..BASE };
 pub const ELIXIR: Language = Language { line: &["#"], triple: BOTH_BLOCKS, doc_attributes: true, ..BASE };
 pub const NIM: Language = Language { line: &["#"], block: &[("#[", "]#")], quotes: "\"", ..BASE };
 
-pub const SLASH: Language = Language { line: &["//"], block: C_BLOCKS, ..BASE };
-pub const SCRIPT: Language = Language { line: &["//"], block: C_BLOCKS, backtick: true, regex: true, ..BASE };
-pub const GO: Language = Language { line: &["//"], block: C_BLOCKS, backtick: true, ..BASE };
+pub const SLASH: Language = Language { line: &["//"], block: C_BLOCKS, trim: true, ..BASE };
+pub const SCRIPT: Language = Language { line: &["//"], block: C_BLOCKS, backtick: true, regex: true, trim: true, ..BASE };
+pub const GO: Language = Language { line: &["//"], block: C_BLOCKS, backtick: true, trim: true, ..BASE };
 pub const RUST: Language = Language {
     line: &["//"],
     block: C_BLOCKS,
     quotes: "\"",
     lifetimes: true,
     nested: true,
-    ..BASE
+    trim: true, ..BASE
 };
-pub const TEXT: Language = Language { line: &["//"], block: C_BLOCKS, triple: TEXT_BLOCKS, ..BASE };
+pub const TEXT: Language = Language { line: &["//"], block: C_BLOCKS, triple: TEXT_BLOCKS, trim: true, ..BASE };
 pub const SWIFT: Language = Language {
     line: &["//"],
     block: C_BLOCKS,
     quotes: "\"",
     triple: TEXT_BLOCKS,
     nested: true,
-    ..BASE
+    trim: true, ..BASE
 };
-pub const GROOVY: Language = Language { line: &["//"], block: C_BLOCKS, triple: BOTH_BLOCKS, ..BASE };
-pub const PHP: Language = Language { line: &["#", "//"], block: C_BLOCKS, php: true, ..BASE };
+pub const GROOVY: Language = Language { line: &["//"], block: C_BLOCKS, triple: BOTH_BLOCKS, trim: true, ..BASE };
+pub const PHP: Language = Language { line: &["#", "//"], block: C_BLOCKS, php: true, trim: true, ..BASE };
 
-pub const LUA: Language = Language { line: &["--"], long_bracket: Some("--"), ..BASE };
-pub const SQL: Language = Language { line: &["--"], block: &[("/*", "*/")], quotes: "\"'`", ..BASE };
+pub const LUA: Language = Language { line: &["--"], long_bracket: Some("--"), trim: true, ..BASE };
+pub const SQL: Language = Language { line: &["--"], block: &[("/*", "*/")], quotes: "\"'`", trim: true, ..BASE };
 pub const HASKELL: Language = Language {
     line: &["--"],
     block: &[("{-", "-}")],
@@ -107,12 +109,12 @@ pub const COMPONENT: Language = Language {
     markup: true,
     ..BASE
 };
-pub const CSS: Language = Language { block: &[("/*", "*/")], ..BASE };
-pub const SCSS: Language = Language { line: &["//"], block: &[("/*", "*/")], ..BASE };
+pub const CSS: Language = Language { block: &[("/*", "*/")], trim: true, ..BASE };
+pub const SCSS: Language = Language { line: &["//"], block: &[("/*", "*/")], trim: true, ..BASE };
 
-pub const POWERSHELL: Language = Language { line: &["#"], block: &[("<#", "#>")], escape: '`', ..BASE };
-pub const MAKE: Language = Language { line: &["#"], ..BASE };
-pub const HCL: Language = Language { line: &["#", "//"], block: C_BLOCKS, quotes: "\"", ..BASE };
+pub const POWERSHELL: Language = Language { line: &["#"], block: &[("<#", "#>")], escape: '`', trim: true, ..BASE };
+pub const MAKE: Language = Language { line: &["#"], trim: true, ..BASE };
+pub const HCL: Language = Language { line: &["#", "//"], block: C_BLOCKS, quotes: "\"", trim: true, ..BASE };
 pub const CMAKE: Language = Language { line: &["#"], long_bracket: Some("#"), hash_after_space: true, ..BASE };
 pub const BATCH: Language = Language { rem: true, ..BASE };
 pub const BASIC: Language = Language { line: &["'"], quotes: "\"", rem: true, ..BASE };

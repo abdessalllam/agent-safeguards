@@ -2013,14 +2013,42 @@ fn comments_that_cannot_be_cut_safely_are_still_refused() {
     refuse("i.py", "x = 1  # a\ny = 2  # b\nz = 3  # c\n# one\n# two\n# three\n# four\n");
     refuse("j.go", "// #include <stdio.h>\n// one\n// two\n// three\nimport \"C\"\n");
     refuse("k.pug", "//\n  one\n  two\n  three\n  four\np hi\n");
+    refuse("x.nix", "s = ''\n# one\n# two\n# three\n# four\n'';\nx = 1\n");
+    refuse("a.rb", "list = %w(\n# one\n# two\n# three\n# four\n)\nx = 1\n");
+    refuse("b.rb", "text = %q{\n# one\n# two\n# three\n# four\n}\nx = 1\n");
+    refuse("a.pl", "my $s = q{\n# one\n# two\n# three\n# four\n};\nmy $x = 1;\n");
+    refuse("a.lua", "local s = [==[\n-- one\n-- two\n-- three\n-- four\n]==]\nlocal x = 1\n");
+    refuse("b.lua", "local s = [[\n-- one\n-- two\n-- three\n-- four\n]]\nlocal x = 1\n");
+    refuse("g.rs", "fn main() {\n    let s = r##\" \"\n// one\n// two\n// three\n// four\n\"##;\n    let x = 1;\n}\n");
+    refuse("a.ex", "s = ~s(\n# one\n# two\n# three\n# four\n)\nx = 1\n");
+    refuse("a.tcl", "set s {\n# one\n# two\n# three\n# four\n}\nset x 1\n");
+    refuse("a.jsonnet", "local s = |||\n# one\n# two\n# three\n# four\n|||;\nlocal x = 1;\n");
+    refuse("a.sql", "create function f() returns int as $$\n-- one\n-- two\n-- three\n-- four\nselect 1; $$ language sql;\n");
+    refuse("Makefile", "define text\n# one\n# two\n# three\n# four\nendef\nall:\n\techo hi\n");
+    refuse("a.ps1", "$s = @\"\n# one\n# two\n# three\n# four\n\"@\n$x = 1\n");
     refuse("l.sql", "/*+ one */\n/*+ two */\n/*+ three */\n/*+ four */\nselect 1;\n");
     refuse("m.html", "<!--[if IE]>\n<!--[if gt IE 8]>\n<!--[if lt IE 7]>\n<!--[if IE 9]>\n<p>hi</p>\n");
     let css = "/* one */\n/* two */\n/* three */\n/* four */\na { b: c }\n";
     let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("n.css"), css), Provider::Claude));
     assert_eq!(input["content"], "/* one */\n/* two */\na { b: c }\n");
-    let html = "<!-- one -->\n<!-- two -->\n<!-- three -->\n<p>hi</p>\n";
-    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("o.html"), html), Provider::Claude));
-    assert_eq!(input["content"], "<!-- one -->\n<!-- two -->\n<p>hi</p>\n");
+    refuse("o.html", "<!-- one -->\n<!-- two -->\n<!-- three -->\n<p>hi</p>\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn harmless_look_alikes_do_not_stop_a_trim_and_a_huge_file_is_trimmed_quickly() {
+    let dir = temp_dir("trim-alike");
+    let shift = "n = 1 << 4\n# one\n# two\n# three\n# four\nx = 1\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("a.py"), shift), Provider::Claude));
+    assert_eq!(input["content"], "n = 1 << 4\n# one\n# two\nx = 1\n");
+    let raw = "fn f() {\n    let s = r\"ok\";\n    let t = r#\"also \"fine\"\"#;\n    // one\n    // two\n    // three\n    // four\n    let x = 1;\n}\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("a.rs"), raw), Provider::Claude));
+    assert!(input["content"].as_str().is_some_and(|text| text.contains("// two") && !text.contains("// three")));
+    let many: String = (0..60_000).map(|n| format!("# c{n}\n")).chain(std::iter::once("x = 1\n".to_owned())).collect();
+    let started = std::time::Instant::now();
+    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("b.py"), &many), Provider::Claude));
+    assert_eq!(input["content"], "# c0\n# c1\nx = 1\n");
+    assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

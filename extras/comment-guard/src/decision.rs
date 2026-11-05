@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::comments::{body, scan, LineKind};
-use crate::languages::{language_for_text, Language};
+use crate::languages::{language_for_text, Language, GO, HCL, LUA, MAKE, PHP, POWERSHELL, RUBY, RUST, SHELL, SLASH, SQL};
 use crate::locale::message;
 
 pub const MAX_LINES: usize = 2;
@@ -239,18 +239,74 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
 
 pub struct Trimmed {
     pub text: String,
-    pub dropped: Vec<usize>,
+    pub dropped: HashSet<usize>,
     pub removed: Vec<String>,
 }
 
-const RISKY: [&str; 6] = ["<<", "R\"", "@\"", "import \"C\"", "\n__END__", "__DATA__"];
+fn raw_string_open(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut at = 0usize;
+    while let Some(&byte) = bytes.get(at) {
+        at = at.saturating_add(1);
+        if byte != b'r' {
+            continue;
+        }
+        let start = at.saturating_sub(1);
+        let mut before = start.checked_sub(1).and_then(|index| bytes.get(index)).copied();
+        if before == Some(b'b') {
+            before = start.checked_sub(2).and_then(|index| bytes.get(index)).copied();
+        }
+        if before.is_some_and(ident) {
+            continue;
+        }
+        let hashes = bytes.iter().skip(at).take_while(|byte| **byte == b'#').count();
+        let quote = at.saturating_add(hashes);
+        if bytes.get(quote) != Some(&b'"') {
+            continue;
+        }
+        let closer = format!("\"{}", "#".repeat(hashes));
+        match line.get(quote.saturating_add(1)..).and_then(|rest| rest.find(&closer)) {
+            Some(found) => at = quote.saturating_add(1).saturating_add(found).saturating_add(closer.len()),
+            None => return true,
+        }
+    }
+    false
+}
+
+fn percent_literal(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(at, byte)| {
+        if *byte != b'%' {
+            return false;
+        }
+        let first = bytes.get(at.saturating_add(1)).copied().unwrap_or(b' ');
+        let delimiter = if b"qQwWiIrRxs".contains(&first) { bytes.get(at.saturating_add(2)).copied().unwrap_or(b' ') } else { first };
+        b"([{<|!/".contains(&delimiter)
+    })
+}
+
+fn long_bracket(text: &str) -> bool {
+    text.match_indices('[').any(|(at, _)| {
+        let rest = text.get(at.saturating_add(1)..).unwrap_or("");
+        rest.trim_start_matches('=').starts_with('[')
+    })
+}
 
 fn risky(text: &str, lang: Language) -> bool {
-    RISKY.iter().any(|mark| text.contains(mark))
-        || text.contains("\\\n")
-        || (lang.lifetimes && (text.contains("r#\"") || text.contains("r\"")))
-        || (lang.long_bracket == Some("--") && text.contains("[["))
-        || (!lang.column_zero.is_empty() && (text.contains("%q") || text.contains("%Q")))
+    if !lang.trim || text.contains("\\\n") || text.contains("\n__END__") || text.contains("__DATA__") {
+        return true;
+    }
+    let heredocs = [SHELL, RUBY, PHP, HCL, MAKE];
+    (heredocs.contains(&lang) && text.contains("<<"))
+        || (lang == RUBY && percent_literal(text))
+        || (lang == RUST && text.lines().any(raw_string_open))
+        || (lang == SLASH && (text.contains("R\"") || text.contains("@\"") || text.contains("import \"C\"")))
+        || (lang == GO && text.contains("import \"C\""))
+        || (lang == LUA && long_bracket(text))
+        || (lang == POWERSHELL && (text.contains("@\"") || text.contains("@'")))
+        || (lang == SQL && text.matches('$').count() >= 2)
+        || (lang == MAKE && text.contains("endef"))
 }
 
 pub fn trimmed(change: &Change) -> Option<Trimmed> {
@@ -301,13 +357,13 @@ pub fn trimmed(change: &Change) -> Option<Trimmed> {
     let lines: Vec<&str> = change.new.split('\n').collect();
     for keep in [MAX_LINES, 1, 0] {
         let mut kept = 0usize;
-        let mut dropped: Vec<usize> = Vec::new();
+        let mut dropped: HashSet<usize> = HashSet::new();
         for (index, line) in &fresh {
             let fine = history_marker(body(line)).is_none() && line.chars().count() <= MAX_LINE_CHARS;
             if kept < keep && fine {
                 kept = kept.saturating_add(1);
             } else {
-                dropped.push(*index);
+                dropped.insert(*index);
             }
         }
         if dropped.is_empty() {
@@ -322,7 +378,9 @@ pub fn trimmed(change: &Change) -> Option<Trimmed> {
             .join("\n");
         let trial = Change { new: text.clone(), ..change.clone() };
         if evaluate(std::slice::from_ref(&trial)).is_none() {
-            let removed = dropped.iter().filter_map(|index| lines.get(*index)).map(|line| line.trim().to_owned()).collect();
+            let mut order: Vec<&usize> = dropped.iter().collect();
+            order.sort();
+            let removed = order.into_iter().filter_map(|index| lines.get(*index)).map(|line| line.trim().to_owned()).collect();
             return Some(Trimmed { text, dropped, removed });
         }
     }
