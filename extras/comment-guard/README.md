@@ -1,25 +1,35 @@
 # comment-guard (optional, off by default)
 
-A small Rust program that keeps coding agents from flooding code with comments. It runs as a `PreToolUse` hook for Claude Code (`Edit`, `Write`, `MultiEdit`) and Codex (`apply_patch`), reads the text an edit is about to add, and refuses the call with a reason when the new comments break the rule. The agent then retries with fewer comments. `safe-tool git commit` also runs it on the files of the commit about to be made, which catches comments added in many small edits.
+A small Rust program that keeps coding agents from flooding code with comments. It runs as a `PreToolUse` hook for Claude Code (`Edit`, `Write`, `MultiEdit`) and Codex (`apply_patch`), works out the whole file the edit would leave, and refuses the call with a reason when the comments the session has added to that file break the rule. The agent then retries with fewer comments. A `PostToolUse` hook on `Bash` reports files that a command wrote with too many comments, and `safe-tool git commit` runs the same rule on the files of the commit about to be made.
 
 It is a quality guard, not a security guard. It is **off** until you turn it on, it is not part of the plugin's default hooks, and it fails open: bad input, an internal error or an oversized payload allow the call and print one line on stderr.
 
 ## The rule
 
-At most one short rationale comment per file and per tool call, and never narration, history, dates or decision numbers.
+At most one short rationale comment per file, and never narration, history, dates or decision numbers.
 
 | Limit | Value |
 | --- | --- |
-| New comment lines per file | 2 |
+| New comment lines per file | 2 (counted against the file as the session first saw it, see below) |
 | New comment blocks per file | 1 (a block is a run of adjacent comment lines) |
 | Length of a comment line | 100 characters, counted on the trimmed line |
 | History markers | a date `YYYY-MM-DD`, a decision number such as `D556`, or one of `previously`, `used to`, `no longer`, `was already`, `originally`, `formerly`, `this change`, `as requested` |
 
-A comment already present in the old text is not new, so moving code together with its comment, or editing the code under it, is never refused. Only whole-line comments count.
+A comment already present in the old text is not new, so moving code together with its comment, or editing the code under it, is never refused.
+
+These count as comment lines: a whole-line comment, a comment after code on the same line (`x = 1  # why`, `run(); // why`, `{/* why */}`), every line of a block comment (`/* */`, `<!-- -->`, `{- -}`, `--[[ ]]`, Ruby `=begin`, Perl POD, Nim `#[ ]#`), and the text lines of a Python docstring or an Elixir `@doc`/`@moduledoc` heredoc. A comment marker inside a string (`"http://x"`, `'a # b'`), a triple-quoted value assigned to a variable, or a backtick string is data, not a comment.
 
 These are never counted: a shebang, a PHP `#[attribute]`, and comments that start with a lint, type, license or tooling directive (`noqa`, `type:`, `pragma`, `pylint:`, `eslint-`, `@ts-`, `go:`, `nolint`, `spdx-license-identifier`, `copyright`, `license`, `shellcheck`, `region`, `mark:`, `-*-` and similar; the full list is `EXEMPT` in `src/comments.rs`).
 
-Languages are chosen by file extension: `#` comments for `py pyi rb sh bash zsh fish pl pm r ex exs nim cr`, `//` and `/* */` for `rs go js jsx mjs cjs ts tsx java kt kts swift c h cc cpp cxx hpp hh cs dart scala groovy gradle m mm zig proto sol`, both for `php`, and `--` for `lua sql hs elm`. Markdown, JSON, YAML, TOML and other files are not checked.
+Languages are chosen by file extension: `#` comments for `py pyi rb sh bash zsh fish pl pm r ex exs nim cr`, `//` and `/* */` for `rs go js jsx mjs cjs ts tsx java kt kts swift c h cc cpp cxx hpp hh cs dart scala groovy gradle m mm zig proto sol`, both for `php`, `--` for `lua sql hs elm`, `<!-- -->` with `//` and `/* */` for `html htm xhtml vue svelte astro`, and `/* */` for `css` (plus `//` for `scss sass less`). Data, configuration and documentation files are not checked: Markdown, JSON, YAML, TOML, XML, INI and the like.
+
+## Across several edits
+
+The first time a session touches a file, the hook records the comments that file already had (under `$XDG_STATE_HOME/agent-safeguards/comment-guard`, or `~/.local/state/agent-safeguards/comment-guard`), and every later `Edit`, `Write` or `apply_patch` of that file in the same session is judged against that record. Two-line edits therefore cannot add up to more than two lines, while moving or keeping existing comments stays free. A new file starts from an empty record. Records are written once, never rewritten, and deleted after 14 days. The record is keyed by the `session_id` in the hook payload (Claude Code and Codex both send it); without one, each call is judged alone.
+
+## Commands that write files
+
+A command's writes (`printf ... > file`, `sed -i`, `tee`, a script) cannot be stopped in advance, so the `PostToolUse` hook on `Bash` looks afterwards. It looks at the source files the command names and the source files under the working folder, keeps only those whose content or status changed since the previous check in that folder (reading a file changes nothing), and judges each against the session's record, else against the last commit (`git show HEAD:`, with a size and time limit, and skipped when `git` cannot answer), else, for a file that did not exist before the command, against an empty file. Whichever baseline it uses is recorded, so a later edit of the same file is judged against it too. A violation answers `{"decision":"block","reason":...}` so the agent is told to shorten the comments; it cannot undo the write, and `safe-tool git commit` refuses the result anyway. Files whose first lines say `generated` or `do not edit` are skipped, as are hidden folders, `node_modules`, `target`, `dist`, `build` and similar; the check stops after 40 files, 4000 folder entries or 3 seconds, and does not walk the home folder or `/`. Each working folder keeps its own check time.
 
 ## Commit-time check
 
@@ -57,15 +67,19 @@ comment-guard check
 
 The hook files here are not wired in by default. Merge one into your own settings, next to the plugin's hooks.
 
-- **Claude Code:** add the entry of `hooks/claude.json` to `hooks.PreToolUse` in `~/.claude/settings.json` (or a project's `.claude/settings.json`).
-- **Codex:** add the entry of `hooks/codex.json` to `hooks.PreToolUse` in `~/.codex/hooks.json`, then approve the new hook in Codex.
+- **Claude Code:** add the `PreToolUse` and `PostToolUse` entries of `hooks/claude.json` to `hooks.PreToolUse` and `hooks.PostToolUse` in `~/.claude/settings.json` (or a project's `.claude/settings.json`).
+- **Codex:** add the `PreToolUse` and `PostToolUse` entries of `hooks/codex.json` to `hooks.PreToolUse` and `hooks.PostToolUse` in `~/.codex/hooks.json`, then approve the new hooks in Codex.
 - **Grok** reads the Claude Code settings, so the Claude registration covers it.
 
 ## Limits
 
-- The hook judges one tool call at a time. An agent that is refused nine comment lines can still add them in several small edits of two lines each, and every one of those edits passes. This was seen in a live Claude Code run. The commit-time check refuses the result when it is committed through `safe-tool git commit`, but not when the same comments are spread over several commits (each commit then adds two lines next to the earlier ones), and not for a commit made some other way.
+- The commit-time check does not stop comments spread over several commits (each commit then adds two lines next to the earlier ones), and does not run for a commit made some other way.
+- The `Bash` check reports after the fact. It sees only the files a command names and the recently changed source files under the working folder, so a script that writes somewhere else is missed. Outside a git repository, an existing file that the session never touched cannot be judged on its first change by a command (its comments are recorded for the next check).
 - The commit-time check also refuses a generated or vendored source file that is full of comments. The agent should tell you; turn the guard off for that commit.
-- Comments after code on the same line are not counted, and neither are docstrings (they are strings). An agent that is refused comments may move the text into a docstring.
+- Line-based reading has limits: a heredoc body or a multi-line plain string (not triple-quoted or backtick) can hide or invent a trailing comment, a regex literal that contains ` // ` can read as a comment, and a triple-quoted string that begins a Python line inside brackets reads as a docstring. A bare one-line string statement is not counted as a docstring.
+- A comment inside the `${ }` of a JavaScript or TypeScript template literal reads as part of the string and is not counted. Nested block comments are followed for Rust, Swift, Haskell and Elm, not for Kotlin or Scala.
+- The `Bash` check cannot tell a command's writes from a change made at the same time by something else (the user's editor, a watcher, a build tool writing into the working folder): such a file can be reported.
+- Embedded languages are read with the host file's rules (a `<script>` block in HTML gets `//` and `/* */`, not the language's own forms).
 - `MultiEdit` is handled, but current Claude Code versions no longer offer that tool.
 - `NotebookEdit` is not checked.
 - The Codex `apply_patch` handling follows the public patch grammar and is covered by payload tests; it has not been run inside a live Codex session.

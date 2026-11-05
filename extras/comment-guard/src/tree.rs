@@ -250,11 +250,7 @@ fn read_changes(tree: &str, base: &str, entries: &[Entry]) -> Option<Vec<Change>
             },
             None => String::new(),
         };
-        changes.push(Change {
-            file: entry.new.clone(),
-            old,
-            new,
-        });
+        changes.push(Change::whole(entry.new.clone(), old, new));
     }
     Some(changes)
 }

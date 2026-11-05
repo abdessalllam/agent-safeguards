@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use serde_json::Value;
 
 use comment_guard::locale::message;
-use comment_guard::{judge, judge_tree, Provider, Verdict, MAX_INPUT};
+use comment_guard::{judge, judge_after, judge_tree, Provider, Verdict, MAX_INPUT};
 
 fn main() -> ExitCode {
     std::panic::set_hook(Box::new(|_| {}));
@@ -96,11 +96,11 @@ fn guard_enabled() -> bool {
 }
 
 fn hook(provider: Provider, event: Option<&str>) -> ExitCode {
-    if let Some(event) = event {
-        if event != "PreToolUse" {
-            return usage();
-        }
-    }
+    let after = match event {
+        None | Some("PreToolUse") => false,
+        Some("PostToolUse") => true,
+        Some(_) => return usage(),
+    };
     if !guard_enabled() {
         return ExitCode::SUCCESS;
     }
@@ -111,8 +111,13 @@ fn hook(provider: Provider, event: Option<&str>) -> ExitCode {
         complain(&message("comment_guard.error.input", &[]));
         return ExitCode::SUCCESS;
     }
-    let outcome =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| judge(&input, provider)));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if after {
+            judge_after(&input)
+        } else {
+            judge(&input, provider)
+        }
+    }));
     match outcome {
         Ok(Verdict::Allow) => ExitCode::SUCCESS,
         Ok(Verdict::BadInput) => {
@@ -120,7 +125,11 @@ fn hook(provider: Provider, event: Option<&str>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Verdict::Deny(reason)) => {
-            print_deny(&reason);
+            if after {
+                print_block(&reason);
+            } else {
+                print_deny(&reason);
+            }
             ExitCode::SUCCESS
         }
         Err(_) => {
@@ -149,6 +158,15 @@ fn tree(id: &str) -> ExitCode {
             complain(&message("comment_guard.error.internal", &[]));
             ExitCode::SUCCESS
         }
+    }
+}
+
+fn print_block(reason: &str) {
+    let mut outer = serde_json::Map::new();
+    outer.insert("decision".to_owned(), Value::String("block".to_owned()));
+    outer.insert("reason".to_owned(), Value::String(reason.to_owned()));
+    if let Ok(text) = serde_json::to_string(&Value::Object(outer)) {
+        say(&text);
     }
 }
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::comments::{body, scan, LineKind};
-use crate::languages::language_for;
+use crate::languages::{language_for, Language};
 use crate::locale::message;
 
 pub const MAX_LINES: usize = 2;
@@ -23,6 +23,42 @@ pub struct Change {
     pub file: String,
     pub old: String,
     pub new: String,
+    pub baseline: Option<Vec<String>>,
+    pub partial: bool,
+    pub origin: Option<String>,
+}
+
+impl Change {
+    pub fn whole(file: String, old: String, new: String) -> Change {
+        Change {
+            file,
+            old,
+            new,
+            baseline: None,
+            partial: false,
+            origin: None,
+        }
+    }
+
+    pub fn partial(file: String, old: String, new: String) -> Change {
+        Change {
+            file,
+            old,
+            new,
+            baseline: None,
+            partial: true,
+            origin: None,
+        }
+    }
+}
+
+pub fn comment_lines(text: &str, lang: Language) -> Vec<String> {
+    scan(text, lang)
+        .filter_map(|kind| match kind {
+            LineKind::Comment(line) => Some(line.to_owned()),
+            LineKind::Other => None,
+        })
+        .collect()
 }
 
 struct Aggregate<'a> {
@@ -34,12 +70,23 @@ struct Aggregate<'a> {
 }
 
 pub fn evaluate(changes: &[Change]) -> Option<String> {
+    let detail = evaluate_detail(changes)?;
+    Some(message("comment_guard.deny", &[("detail", detail.as_str())]))
+}
+
+pub fn evaluate_after(changes: &[Change]) -> Option<String> {
+    let detail = evaluate_detail(changes)?;
+    Some(message("comment_guard.after", &[("detail", detail.as_str())]))
+}
+
+fn evaluate_detail(changes: &[Change]) -> Option<String> {
     let mut order: Vec<Aggregate<'_>> = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
     for change in changes {
         let Some(lang) = language_for(&change.file) else {
             continue;
         };
+        let lang = if change.partial { lang.fragment() } else { lang };
         let entry = match index.get(change.file.as_str()) {
             Some(found) => *found,
             None => {
@@ -59,9 +106,18 @@ pub fn evaluate(changes: &[Change]) -> Option<String> {
             continue;
         };
         let mut pool: HashMap<&str, usize> = HashMap::new();
-        for kind in scan(&change.old, lang) {
-            if let LineKind::Comment(line) = kind {
-                *pool.entry(line).or_insert(0) += 1;
+        match &change.baseline {
+            Some(lines) if !change.partial => {
+                for line in lines {
+                    *pool.entry(line.as_str()).or_insert(0) += 1;
+                }
+            }
+            _ => {
+                for kind in scan(&change.old, lang) {
+                    if let LineKind::Comment(line) = kind {
+                        *pool.entry(line).or_insert(0) += 1;
+                    }
+                }
             }
         }
         let mut running = false;
@@ -102,7 +158,7 @@ pub fn evaluate(changes: &[Change]) -> Option<String> {
                 "comment_guard.detail.history",
                 &[("file", aggregate.file), ("marker", marker)],
             );
-            return Some(message("comment_guard.deny", &[("detail", detail.as_str())]));
+            return Some(detail);
         }
         if aggregate.too_long {
             let limit = MAX_LINE_CHARS.to_string();
@@ -110,7 +166,7 @@ pub fn evaluate(changes: &[Change]) -> Option<String> {
                 "comment_guard.detail.too_long",
                 &[("file", aggregate.file), ("limit", limit.as_str())],
             );
-            return Some(message("comment_guard.deny", &[("detail", detail.as_str())]));
+            return Some(detail);
         }
         if aggregate.lines > MAX_LINES || aggregate.blocks > MAX_BLOCKS {
             let lines = aggregate.lines.to_string();
@@ -125,7 +181,7 @@ pub fn evaluate(changes: &[Change]) -> Option<String> {
                     ("max_lines", max_lines.as_str()),
                 ],
             );
-            return Some(message("comment_guard.deny", &[("detail", detail.as_str())]));
+            return Some(detail);
         }
     }
     None
