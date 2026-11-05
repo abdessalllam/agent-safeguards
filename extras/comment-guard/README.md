@@ -106,6 +106,7 @@ The hook files here are not wired in by default. Merge one into your own setting
 - The `Bash` check cannot tell a command's writes from a change made at the same time by something else (the user's editor, a watcher, a build tool writing into the working folder): such a file can be reported.
 - Embedded languages are read with the host file's rules (a `<script>` block in HTML gets `//` and `/* */`, not the language's own forms).
 - `MultiEdit` is handled, but current Claude Code versions no longer offer that tool.
+- A write that happens after the command has returned (a background job that sleeps first, a watcher) is not seen, and a hook that runs past its timeout (10 seconds for the edit hook, 20 for the `Bash` check in the sample files, which matters on a machine under very heavy load) lets the call through. A copy of a file that already has comments (`cp`, `mv`) is not new commentary.
 - Trimming leaves the file as the agent wrote it except for the left-out lines, but the agent may still believe its comments are there: a later `Edit` that names a left-out line fails and has to read the file again.
 - Rule names are an open vocabulary, so a directive such as `# type: ignore[some-name]` can carry one hyphenated word per argument; a sentence cannot pass.
 - Racket `#;` (comment out the next datum), a `.ipynb` over 8 MiB edited as text, and a folder the command only names (a save by someone else in it during the command, when the command is not a plain look such as `ls`) are not handled or can be misread.
