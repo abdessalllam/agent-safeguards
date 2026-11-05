@@ -1,14 +1,13 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Map, Value};
 
 use crate::changes::{read_old, resolve, MAX_OLD_FILE};
 use crate::decision::{comment_lines, evaluate_after, Change};
+use crate::git::{marked_upstream, run_git};
 use crate::languages::language_for;
 use crate::session::{identity, Ledger};
 use crate::Verdict;
@@ -16,7 +15,6 @@ use crate::Verdict;
 const WALK_ENTRIES: usize = 4000;
 const WALK_TIME: Duration = Duration::from_millis(800);
 const TOTAL_TIME: Duration = Duration::from_millis(3000);
-const GIT_TIME: Duration = Duration::from_millis(1000);
 const MAX_CANDIDATES: usize = 40;
 const FIRST_WINDOW: Duration = Duration::from_secs(60);
 const SKIP_DIRS: [&str; 10] = [
@@ -78,7 +76,12 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger) -> Verdict {
             changes.push(change);
         }
     }
-    match evaluate_after(&changes) {
+    let mut verdict = evaluate_after(&changes);
+    if verdict.is_some() {
+        changes.retain(|change| !marked_upstream(Path::new(&change.file), deadline));
+        verdict = evaluate_after(&changes);
+    }
+    match verdict {
         Some(reason) => Verdict::Deny(reason),
         None => Verdict::Allow,
     }
@@ -149,64 +152,6 @@ fn walk(root: &Path, since: SystemTime, files: &mut Vec<PathBuf>) {
             }
         }
     }
-}
-
-struct Ran {
-    success: bool,
-    stdout: Vec<u8>,
-    stderr: String,
-}
-
-fn reader<R: Read + Send + 'static>(source: R, limit: u64) -> std::sync::mpsc::Receiver<Vec<u8>> {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = source.take(limit).read_to_end(&mut bytes);
-        let _ = sender.send(bytes);
-    });
-    receiver
-}
-
-fn run_git(dir: &Path, args: &[&str], deadline: Instant) -> Option<Ran> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    };
-    let stdout = reader(out, MAX_OLD_FILE.saturating_add(1));
-    let stderr = reader(err, 4096);
-    let limit = deadline.min(Instant::now() + GIT_TIME);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < limit => std::thread::sleep(Duration::from_millis(5)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    };
-    let wait = limit
-        .saturating_duration_since(Instant::now())
-        .max(Duration::from_millis(100));
-    let stdout = stdout.recv_timeout(wait).ok()?;
-    let stderr = stderr.recv_timeout(wait).ok()?;
-    Some(Ran {
-        success: status.success(),
-        stdout,
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-    })
 }
 
 fn absent(stderr: &str, dir: &Path) -> bool {

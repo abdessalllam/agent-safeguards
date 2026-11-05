@@ -3,6 +3,7 @@
 pub mod changes;
 pub mod comments;
 pub mod decision;
+pub mod git;
 pub mod languages;
 pub mod locale;
 pub mod post;
@@ -140,7 +141,13 @@ pub fn judge_in(input: &str, provider: Provider, state: Option<&Path>) -> Verdic
             attach_baselines(&ledger, &mut changes, &base);
         }
     }
-    match evaluate(&changes) {
+    let mut verdict = evaluate(&changes);
+    if verdict.is_some() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        changes.retain(|change| !git::marked_upstream(&changes::resolve(&base, &change.file), deadline));
+        verdict = evaluate(&changes);
+    }
+    match verdict {
         Some(reason) => Verdict::Deny(reason),
         None => Verdict::Allow,
     }

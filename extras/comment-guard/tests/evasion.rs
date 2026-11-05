@@ -777,6 +777,56 @@ fn nothing_further_in_a_patch_is_judged_once_its_budget_is_spent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn mark_paths(dir: &Path) {
+    let rules = "up/** comment-guard=skip\nvendor/** linguist-vendored\ngen/** linguist-generated\nown/** -comment-guard\n";
+    std::fs::write(dir.join(".gitattributes"), rules).expect("write");
+}
+
+#[test]
+fn edits_to_marked_upstream_paths_are_not_checked() {
+    let rig = Rig::new("marked-edit");
+    init_repo(&rig.cwd);
+    mark_paths(&rig.cwd);
+    let nine = lines("#", "", 9);
+    for name in ["up/a.py", "up/deep/new/b.py", "vendor/c.py", "gen/d.py"] {
+        let verdict = write_file(None, None, &rig.cwd.join(name), &nine);
+        assert!(!denied(&verdict), "{name}");
+    }
+    for name in ["own/e.py", "plain.py"] {
+        let verdict = write_file(None, None, &rig.cwd.join(name), &nine);
+        assert!(denied(&verdict), "{name}");
+    }
+}
+
+#[test]
+fn a_folder_that_is_not_a_repository_has_no_exemptions() {
+    let dir = temp_dir("marked-plain");
+    mark_paths(&dir);
+    let verdict = write_file(None, None, &dir.join("up/a.py"), &lines("#", "", 9));
+    assert!(denied(&verdict));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn files_a_command_wrote_under_a_marked_path_are_not_reported() {
+    let rig = Rig::new("marked-bash");
+    init_repo(&rig.cwd);
+    mark_paths(&rig.cwd);
+    std::fs::create_dir_all(rig.cwd.join("up")).expect("dir");
+    let upstream = rig.cwd.join("up").join("x.py");
+    let own = rig.cwd.join("own.py");
+    std::fs::write(&upstream, lines("#", "", 6)).expect("write");
+    if !creation_time_is_known(&upstream) {
+        return;
+    }
+    let quiet = rig.bash(Some("m1"), &format!("rsync x {}", upstream.display()));
+    assert!(quiet.is_empty(), "{quiet}");
+    std::fs::write(&own, lines("#", "", 6)).expect("write");
+    let loud = rig.bash(Some("m1"), &format!("printf x > {}", own.display()));
+    assert!(blocked(&loud), "{loud}");
+    assert!(loud.contains("own.py"), "{loud}");
+}
+
 fn creation_time_is_known(path: &Path) -> bool {
     std::fs::metadata(path).and_then(|meta| meta.created()).is_ok()
 }

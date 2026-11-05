@@ -23,6 +23,18 @@ These are never counted: a shebang, a PHP `#[attribute]`, and comments that star
 
 Languages are chosen by file extension: `#` comments for `py pyi rb sh bash zsh fish pl pm r ex exs nim cr`, `//` and `/* */` for `rs go js jsx mjs cjs ts tsx java kt kts swift c h cc cpp cxx hpp hh cs dart scala groovy gradle m mm zig proto sol`, both for `php`, `--` for `lua sql hs elm`, `<!-- -->` with `//` and `/* */` for `html htm xhtml vue svelte astro`, and `/* */` for `css` (plus `//` for `scss sass less`). Data, configuration and documentation files are not checked: Markdown, JSON, YAML, TOML, XML, INI and the like.
 
+## Upstream and vendored files
+
+Mark the paths of code you did not write in a `.gitattributes` file and the guard leaves them alone, in the edit hook and in the `Bash` check:
+
+```
+upstream/** comment-guard=skip
+third_party/** linguist-vendored
+generated/** linguist-generated
+```
+
+`comment-guard=skip` is this program's own mark; `linguist-vendored` and `linguist-generated` are the conventions GitHub uses, so a path that is already marked for them is skipped too. Git decides what a mark covers (patterns, nesting, `.git/info/attributes`), the mark has to be in a repository, and a file that is not marked is judged as before. The check only runs when the guard is about to refuse something, so ordinary edits do not pay for it. A marked file is skipped as a whole, comments an agent adds to it included, and an agent can add the mark itself (it shows in the diff).
+
 ## Across several edits
 
 The first time a session touches a file, the hook records the comments that file already had (under `$XDG_STATE_HOME/agent-safeguards/comment-guard`, or `~/.local/state/agent-safeguards/comment-guard`), and every later `Edit`, `Write` or `apply_patch` of that file in the same session is judged against that record. Two-line edits therefore cannot add up to more than two lines, while moving or keeping existing comments stays free. A new file starts from an empty record. Records are written once, never rewritten, and deleted after 14 days. The record is keyed by the `session_id` in the hook payload (Claude Code and Codex both send it); without one, each call is judged alone.
