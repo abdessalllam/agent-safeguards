@@ -1743,6 +1743,15 @@ fn comment_forms_of_the_less_common_languages_are_all_seen() {
         ("a.idr", "||| note one\n||| note two\n||| note three\n||| note four\n"),
         ("a.f90", "! note one\n! note two\n! note three\n! note four\nend\n"),
         ("a.pas", "{ note one }\n{ note two }\n{ note three }\n{ note four }\nbegin end.\n"),
+        ("b.pas", "{$MESSAGE 'note one explain the cache'}\n{$MESSAGE 'note two explain the lock'}\n{$MESSAGE 'note three explain the retry'}\n{$MESSAGE 'note four explain the fallback'}\n"),
+        ("c.cmake", "#[=====[\nnote one\nnote two\nnote three\nnote four\n]=====]\nset(A 1)\n"),
+        ("d.cmake", "#[============[\nnote one\nnote two\nnote three\nnote four\n]============]\nset(A 1)\n"),
+        ("e.cmake", "#[[\nnote one\nnote two\nnote three\nnote four\n]]\nset(A 1)\n"),
+        ("f.cmake", "#[===[\nnote one\nnote two\nnote three\nnote four\n]===]\nset(A 1)\n"),
+        ("a.lua", "--[==[\nnote one\nnote two\nnote three\nnote four\n]==]\nlocal a = 1\n"),
+        ("b.lua", "--[=====[\nnote one\nnote two\nnote three\nnote four\n]=====]\nlocal a = 1\n"),
+        ("b.bat", "@:: note one\n@:: note two\necho 3 & @:: note three\necho 4 & @:: note four\n"),
+        ("b.f90", "!$ note one explain the cache\n!$ note two explain the lock\n!a$ note three explain the retry\n!x$ note four\nend\n"),
     ];
     for (name, text) in hidden {
         let path = dir.join(name);
@@ -1754,6 +1763,10 @@ fn comment_forms_of_the_less_common_languages_are_all_seen() {
         ("a.jsonnet", "local a = '# note one';\nlocal b = '# note two';\nlocal c = '# note three';\nlocal d = '# note four';\n"),
         ("a.pas", "{$MODE OBJFPC}\n{$H+}\n{$IFDEF UNIX}\n{$ENDIF}\nbegin end.\n"),
         ("a.pug", "p one\np two\n  span three\np four\n"),
+        ("b.pas", "(*$MODE OBJFPC*)\n(*$H+*)\n(*$IFDEF UNIX*)\n(*$ENDIF*)\nbegin end.\n"),
+        ("c.f90", "!dir$ IVDEP\n!DEC$ ATTRIBUTES DLLEXPORT :: a\n!$ call omp_set_num_threads(4)\n!$ use omp_lib\nend\n"),
+        ("a.ps1", "Write-Host `# note one\nWrite-Host `# note two\n$a = \"say `\"# note three\"\n$b = \"say `\"# note four\"\n"),
+        ("a.lua", "local a = \"--[==[ one\"\nlocal b = \"--[==[ two\"\nlocal c = 3\n"),
         ("a.ml", "let a = \"(* one *)\"\nlet b = \"(* two *)\"\nlet c = \"(* three *)\"\n"),
     ];
     for (name, text) in plain {

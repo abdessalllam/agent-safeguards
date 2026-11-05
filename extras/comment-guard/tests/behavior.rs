@@ -199,6 +199,17 @@ fn every_tool_directive_is_ignored() {
         "SPDX-License-Identifier: GPL-2.0-only WITH Classpath-exception-2.0",
         "noqa: PLR0913, ANN101",
         "nolint:gosec,errcheck,staticcheck",
+        "SPDX-License-Identifier: Unlicense",
+        "SPDX-License-Identifier: OpenSSL",
+        "SPDX-License-Identifier: Zlib",
+        "SPDX-License-Identifier: curl",
+        "SPDX-License-Identifier: PostgreSQL",
+        "SPDX-License-Identifier: LicenseRef-Company-Proprietary",
+        "SPDX-License-Identifier: BSD-3-Clause",
+        "SPDX-License-Identifier: CC-BY-4.0",
+        "SPDX-License-Identifier: (MIT OR Apache-2.0) AND BSD-2-Clause",
+        "go:build linux || darwin || windows || freebsd",
+        "go:build (linux && amd64) || (darwin && arm64)",
     ];
     for directive in directives {
         let line = format!("# {directive}\n# {directive}\n# {directive}\n");
@@ -223,6 +234,11 @@ fn a_directive_cannot_carry_a_sentence_in_its_arguments() {
         "pragma: no cover because it is hard",
         "fmt: off until the end of the table",
         "fmt: off on skip next line",
+        "noqa: E501explainthecachehere",
+        "SPDX-License-Identifier: HIDE AND THIS AND NOTE",
+        "SPDX-License-Identifier: note-one-explain-the-cache",
+        "SPDX-License-Identifier: note-1-explain-the-cache",
+        "SPDX-License-Identifier: MIT AND MIT AND MIT AND MIT AND MIT",
         "istanbul ignore next for now",
     ];
     for sentence in sentences {

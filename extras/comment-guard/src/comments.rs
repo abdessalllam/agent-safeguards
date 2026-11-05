@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::languages::Language;
 
 #[derive(Clone, Copy)]
@@ -72,6 +74,25 @@ const GO_DIRECTIVES: &[&str] = &[
     "cgo_export_static", "cgo_ldflag", "cgo_unsafe_args", "cgo_dynamic_linker",
 ];
 
+const LICENSE_NAMES: &[&str] = &[
+    "mit", "isc", "bsd", "wtfpl", "unlicense", "zlib", "openssl", "curl", "postgresql", "ruby", "vim", "ncsa", "python", "php",
+    "boost", "artistic", "sleepycat",
+];
+
+const LICENSE_FAMILIES: &[&str] = &[
+    "0bsd", "afl", "agpl", "apache", "artistic", "bsd", "bsl", "cc", "cddl", "ecl", "epl", "eupl", "gfdl", "gpl", "isc", "lgpl",
+    "mit", "mpl", "ms", "ofl", "osl", "odbl", "php", "python", "ruby", "unicode", "x11", "zpl",
+];
+
+const SENTINELS: &[&str] = &["!$omp", "!$acc", "!$ompx", "!dir$", "!dec$", "!gcc$", "!pgi$", "!mic$", "!cdir$", "!$pragma"];
+
+const CONDITIONAL_FORTRAN: &[&str] = &[
+    "call", "use", "integer", "real", "logical", "double", "character", "implicit", "include", "if", "end", "else", "do",
+    "external", "parameter",
+];
+
+const PASCAL_MESSAGES: &[&str] = &["message", "warning", "hint", "note", "error", "fatal"];
+
 const MAX_DIRECTIVE_TOKENS: usize = 6;
 const MAX_DIRECTIVE_WORDS: usize = 2;
 const MAX_TOKEN_CHARS: usize = 48;
@@ -107,7 +128,8 @@ fn directive_words(tail: &str, free: &[&str]) -> bool {
 fn is_code(token: &str) -> bool {
     let letters = token.chars().take_while(char::is_ascii_alphabetic).count();
     let digits = token.chars().skip(letters).take_while(char::is_ascii_digit).count();
-    (1..=6).contains(&letters)
+    token.chars().count() <= 10
+        && (1..=6).contains(&letters)
         && (1..=5).contains(&digits)
         && token.chars().skip(letters.saturating_add(digits)).all(|c| c.is_ascii_alphanumeric())
 }
@@ -121,10 +143,24 @@ fn directive_codes(tail: &str) -> bool {
 }
 
 fn license_id(token: &str) -> bool {
-    token.len() <= 40
+    let lower = token.to_ascii_lowercase();
+    if token.len() > 60 || !token.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-')) {
+        return false;
+    }
+    if LICENSE_NAMES.contains(&lower.as_str()) || lower.starts_with("licenseref-") || lower.starts_with("documentref-") {
+        return true;
+    }
+    let Some(digit) = lower.find(|c: char| c.is_ascii_digit()) else {
+        return false;
+    };
+    let family = lower.get(..digit).unwrap_or("").trim_end_matches('-');
+    LICENSE_FAMILIES.contains(&family.split('-').next().unwrap_or(""))
+}
+
+fn exception_id(token: &str) -> bool {
+    token.len() <= 60
+        && token.to_ascii_lowercase().contains("exception")
         && token.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
-        && (token.chars().any(|c| c.is_ascii_digit() || matches!(c, '.' | '+' | '-'))
-            || (token.len() <= 12 && token.chars().all(|c| c.is_ascii_uppercase())))
 }
 
 fn directive_licence(tail: &str) -> bool {
@@ -136,8 +172,14 @@ fn directive_licence(tail: &str) -> bool {
         return false;
     }
     let mut id_next = true;
+    let mut after_with = false;
     for part in &parts {
-        let fits = if id_next { license_id(part) } else { matches!(*part, "AND" | "OR" | "WITH") };
+        let fits = if id_next {
+            license_id(part) || (after_with && exception_id(part))
+        } else {
+            after_with = *part == "WITH";
+            matches!(*part, "AND" | "OR" | "WITH")
+        };
         if !fits {
             return false;
         }
@@ -165,7 +207,9 @@ fn directive_go(tail: &str) -> bool {
         return false;
     }
     let args = rest.get(name.len()..).unwrap_or("");
-    name == "generate" || (args.split_whitespace().count() <= 6 && args.split_whitespace().all(|word| word.chars().count() <= MAX_TOKEN_CHARS))
+    let words = args.split_whitespace().filter(|word| word.chars().any(char::is_alphanumeric));
+    let limit = if name == "build" { 10 } else { 6 };
+    name == "generate" || (words.clone().count() <= limit && words.clone().all(|word| word.chars().count() <= MAX_TOKEN_CHARS))
 }
 
 fn directive_tail(kind: Tail, tail: &str) -> bool {
@@ -217,15 +261,30 @@ fn is_remark(text: &str) -> bool {
     let word = text.trim_start_matches('@');
     let rem = word.get(..3).is_some_and(|head| head.eq_ignore_ascii_case("rem"))
         && word.get(3..).is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
-    rem || text.starts_with("::")
+    rem || word.starts_with("::")
 }
 
 fn is_sentinel(text: &str) -> bool {
-    let Some(rest) = text.trim_start().strip_prefix('!') else {
+    let lower = text.trim_start().to_ascii_lowercase();
+    for sentinel in SENTINELS {
+        let Some(tail) = lower.strip_prefix(sentinel) else {
+            continue;
+        };
+        if tail.chars().next().is_none_or(|c| !c.is_ascii_alphanumeric()) {
+            return lower.split_whitespace().count() <= 10;
+        }
+    }
+    lower.strip_prefix("!$ ").is_some_and(|rest| CONDITIONAL_FORTRAN.contains(&rest.split_whitespace().next().unwrap_or("")))
+}
+
+fn is_directive_block(open: &str, rest: &str) -> bool {
+    if !matches!(open, "{" | "(*") || !rest.starts_with('$') {
         return false;
-    };
-    let name = rest.chars().take_while(char::is_ascii_alphanumeric).count();
-    name <= 5 && rest.get(name..).is_some_and(|tail| tail.starts_with('$'))
+    }
+    let body = rest.get(1..).unwrap_or("");
+    let inner = body.get(..body.find(['}', '*']).unwrap_or(body.len())).unwrap_or(body);
+    let first: String = inner.chars().take_while(char::is_ascii_alphabetic).collect();
+    !PASCAL_MESSAGES.contains(&first.to_ascii_lowercase().as_str()) && inner.split_whitespace().count() <= 8
 }
 
 fn is_exempt(text: &str) -> bool {
@@ -250,11 +309,29 @@ fn find_unescaped(text: &str, needle: &str) -> Option<usize> {
     None
 }
 
-fn string_length(rest: &str, quote: char) -> Option<usize> {
+type Pair = (&'static str, &'static str);
+
+fn long_bracket_pair(text: &str, lang: Language) -> Option<Pair> {
+    static PAIRS: std::sync::OnceLock<std::sync::Mutex<HashMap<(&'static str, usize), Pair>>> = std::sync::OnceLock::new();
+    let prefix = lang.long_bracket?;
+    let after = text.strip_prefix(prefix)?.strip_prefix('[')?;
+    let level = after.chars().take_while(|c| *c == '=').count();
+    if level > 64 || !after.get(level..)?.starts_with('[') {
+        return None;
+    }
+    let mut pairs = PAIRS.get_or_init(Default::default).lock().ok()?;
+    Some(*pairs.entry((prefix, level)).or_insert_with(|| {
+        let open = format!("{prefix}[{}[", "=".repeat(level));
+        let close = format!("]{}]", "=".repeat(level));
+        (&*Box::leak(open.into_boxed_str()), &*Box::leak(close.into_boxed_str()))
+    }))
+}
+
+fn string_length(rest: &str, quote: char, escape: char) -> Option<usize> {
     let bytes = rest.as_bytes();
     let mut at = quote.len_utf8();
     while let Some(byte) = bytes.get(at) {
-        if *byte == b'\\' {
+        if *byte == escape as u8 {
             at = at.saturating_add(2);
             continue;
         }
@@ -531,9 +608,9 @@ impl<'a> Scan<'a> {
             self.state = State::Pod;
             return Some(LineKind::Comment(trimmed));
         }
-        for &(open, close) in lang.block {
+        for (open, close) in lang.block.iter().copied().chain(long_bracket_pair(trimmed, lang)) {
             if let Some(rest) = trimmed.strip_prefix(open) {
-                if lang.dollar_directive && open == "{" && rest.starts_with('$') {
+                if lang.dollar_directive && is_directive_block(open, rest) {
                     continue;
                 }
                 let mut in_string = false;
@@ -665,7 +742,7 @@ impl<'a> Scan<'a> {
                 continue;
             }
             if lang.quotes.contains(first) {
-                match string_length(rest, first) {
+                match string_length(rest, first, lang.escape) {
                     Some(length) => at = at.saturating_add(length),
                     None => return,
                 }
@@ -699,9 +776,9 @@ impl<'a> Scan<'a> {
                     return;
                 }
             }
-            for &(open, close) in lang.block {
+            for (open, close) in lang.block.iter().copied().chain(long_bracket_pair(rest, lang)) {
                 if let Some(tail) = rest.strip_prefix(open) {
-                    if lang.dollar_directive && open == "{" && tail.starts_with('$') {
+                    if lang.dollar_directive && is_directive_block(open, tail) {
                         continue;
                     }
                     let mut in_string = false;

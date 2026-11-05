@@ -20,6 +20,8 @@ pub struct Language {
     pub indent_block: bool,
     pub dollar_directive: bool,
     pub sentinel: bool,
+    pub long_bracket: Option<&'static str>,
+    pub escape: char,
 }
 
 const C_BLOCKS: &[(&str, &str)] = &[("/*", "*/")];
@@ -47,6 +49,8 @@ const BASE: Language = Language {
     indent_block: false,
     dollar_directive: false,
     sentinel: false,
+    long_bracket: None,
+    escape: '\\',
 };
 
 pub const HASH: Language = Language { line: &["#"], ..BASE };
@@ -80,11 +84,7 @@ pub const SWIFT: Language = Language {
 pub const GROOVY: Language = Language { line: &["//"], block: C_BLOCKS, triple: BOTH_BLOCKS, ..BASE };
 pub const PHP: Language = Language { line: &["#", "//"], block: C_BLOCKS, php: true, ..BASE };
 
-pub const LUA: Language = Language {
-    line: &["--"],
-    block: &[("--[[", "]]"), ("--[=[", "]=]")],
-    ..BASE
-};
+pub const LUA: Language = Language { line: &["--"], long_bracket: Some("--"), ..BASE };
 pub const SQL: Language = Language { line: &["--"], block: &[("/*", "*/")], quotes: "\"'`", ..BASE };
 pub const HASKELL: Language = Language {
     line: &["--"],
@@ -107,15 +107,10 @@ pub const COMPONENT: Language = Language {
 pub const CSS: Language = Language { block: &[("/*", "*/")], ..BASE };
 pub const SCSS: Language = Language { line: &["//"], block: &[("/*", "*/")], ..BASE };
 
-pub const POWERSHELL: Language = Language { line: &["#"], block: &[("<#", "#>")], ..BASE };
+pub const POWERSHELL: Language = Language { line: &["#"], block: &[("<#", "#>")], escape: '`', ..BASE };
 pub const MAKE: Language = Language { line: &["#"], ..BASE };
 pub const HCL: Language = Language { line: &["#", "//"], block: C_BLOCKS, quotes: "\"", ..BASE };
-pub const CMAKE: Language = Language {
-    line: &["#"],
-    block: &[("#[[", "]]"), ("#[=[", "]=]"), ("#[==[", "]==]"), ("#[===[", "]===]"), ("#[====[", "]====]")],
-    hash_after_space: true,
-    ..BASE
-};
+pub const CMAKE: Language = Language { line: &["#"], long_bracket: Some("#"), hash_after_space: true, ..BASE };
 pub const BATCH: Language = Language { rem: true, ..BASE };
 pub const BASIC: Language = Language { line: &["'"], quotes: "\"", rem: true, ..BASE };
 pub const LISP: Language = Language { line: &[";"], block: &[("#|", "|#")], quotes: "\"", nested: true, ..BASE };
