@@ -1575,3 +1575,81 @@ fn replacing_long_comments_with_shorter_ones_and_reflowing_stay_free() {
     assert!(!denied(&write_file(None, None, &path, reflowed)));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn removed_thin_lines_never_pay_for_padding_lines() {
+    let dir = temp_dir("thin-pay");
+    let path = dir.join("a.py");
+    let fat = ["restore the cached"; 9].join(" ");
+    std::fs::write(&path, format!("# {fat}\n# a\n# b\n# c\nx = 1\n")).expect("write");
+    let padded = format!("{}# d\n# e\n# f\nx = 1\n", "# restore the cached\n".repeat(9));
+    assert!(denied(&write_file(None, None, &path, &padded)));
+    let reused = format!("{}# a\n# b\n# c\nx = 1\n", "# restore the cached\n".repeat(9));
+    assert!(denied(&write_file(None, None, &path, &reused)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn one_sentence_per_line_is_a_rewrap_of_the_same_words() {
+    let dir = temp_dir("sentences");
+    let path = dir.join("a.rs");
+    std::fs::write(&path, "/// Returns the root. See also Item. On success, Ok. Never panics.\nfn a() {}\n").expect("write");
+    let split = "/// Returns the root.\n/// See also Item.\n/// On success, Ok.\n/// Never panics.\nfn a() {}\n";
+    assert!(!denied(&write_file(None, None, &path, split)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_long_comment_is_not_swapped_for_many_lines_of_other_words() {
+    let dir = temp_dir("other-words");
+    let path = dir.join("a.py");
+    let nato = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu";
+    std::fs::write(&path, format!("# {nato} {nato}\nx = 1\n")).expect("write");
+    let other = format!("{}x = 1\n", "# zebra yak xerus wolf vole urchin tapir\n".repeat(6));
+    assert!(denied(&write_file(None, None, &path, &other)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_rewrap_may_not_repeat_a_word_more_often_than_the_comment_it_replaced() {
+    let dir = temp_dir("word-count");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "# internationalization internationalization\nx = 1\n").expect("write");
+    let again = format!("{}x = 1\n", "# internationalization\n".repeat(4));
+    assert!(denied(&write_file(None, None, &path, &again)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn identical_removed_lines_each_lend_their_words() {
+    let dir = temp_dir("word-twice");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "# reconsideration of everything\n# reconsideration of everything\nx = 1\n").expect("write");
+    let split = "# reconsideration\n# of\n# everything\n# reconsideration\n# of everything\nx = 1\n";
+    assert!(!denied(&write_file(None, None, &path, split)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_rewrap_ignores_case_and_punctuation() {
+    let dir = temp_dir("word-case");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "# the loop ends early. when the cache is warm it returns\nx = 1\n").expect("write");
+    let wrapped = "# The loop ends early.\n# When the cache\n# is warm it\n# returns.\nx = 1\n";
+    assert!(!denied(&write_file(None, None, &path, wrapped)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_rewrap_that_also_rewords_is_judged_as_a_plain_replacement() {
+    let dir = temp_dir("reword-wrap");
+    let path = dir.join("a.rs");
+    std::fs::write(&path, "// one long comment about renaming things across the whole codebase quickly\nfn a() {}\n")
+        .expect("write");
+    let both = "// one long comment about\n// renaming stuff across\n// the whole codebase\n// very quickly\nfn a() {}\n";
+    assert!(denied(&write_file(None, None, &path, both)));
+    let wrapped = "// one long comment about\n// renaming things across\n// the whole codebase\n// quickly\nfn a() {}\n";
+    std::fs::write(&path, wrapped).expect("write");
+    assert!(!denied(&write_file(None, None, &path, both)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
