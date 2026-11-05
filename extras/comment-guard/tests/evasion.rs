@@ -1433,3 +1433,91 @@ fn the_post_command_hook_accepts_the_codex_form_too() {
         .expect("could not start the binary");
     assert_eq!(bad.status.code(), Some(2));
 }
+
+#[test]
+fn a_small_copy_starts_from_its_own_comments_too() {
+    let rig = Rig::new("small-copy");
+    std::fs::create_dir_all(rig.cwd.join("vendor")).expect("dir");
+    std::fs::create_dir_all(rig.cwd.join("src")).expect("dir");
+    let content = format!("{}x = 1\n", lines("#", "widget", 2));
+    std::fs::write(rig.cwd.join("vendor").join("a.py"), &content).expect("write");
+    let command = "cp vendor/a.py src/a.py";
+    rig.pre_bash_with("sc", "t1", command);
+    let copy = rig.cwd.join("src").join("a.py");
+    std::fs::write(&copy, &content).expect("write");
+    if !creation_time_is_known(&copy) {
+        return;
+    }
+    let out = rig.bash_with_id("sc", "t1", command);
+    assert!(out.is_empty(), "{out}");
+    let after = rig.pre_edit("sc", &copy, "x = 1", "# one more\nx = 1");
+    assert!(after.is_empty(), "{after}");
+}
+
+#[test]
+fn a_bare_star_and_a_redirect_do_not_hide_the_source_of_a_copy() {
+    let rig = Rig::new("star-copy");
+    std::fs::create_dir_all(rig.cwd.join("vendor")).expect("dir");
+    std::fs::create_dir_all(rig.cwd.join("dest")).expect("dir");
+    std::fs::create_dir_all(rig.cwd.join("src")).expect("dir");
+    let content = format!("{}x = 1\n", lines("#", "widget", 10));
+    std::fs::write(rig.cwd.join("one.py"), &content).expect("write");
+    std::fs::write(rig.cwd.join("vendor").join("my widget.py"), &content).expect("write");
+    let star = "cp * dest/";
+    rig.pre_bash_with("st", "t1", star);
+    let first = rig.cwd.join("dest").join("one.py");
+    std::fs::write(&first, &content).expect("write");
+    if !creation_time_is_known(&first) {
+        return;
+    }
+    let out = rig.bash_with_id("st", "t1", star);
+    assert!(out.is_empty(), "{out}");
+    let quiet = "cp \"vendor/my widget.py\" \"src/my widget.py\" >/dev/null 2>&1";
+    rig.pre_bash_with("st", "t2", quiet);
+    std::fs::write(rig.cwd.join("src").join("my widget.py"), &content).expect("write");
+    let second = rig.bash_with_id("st", "t2", quiet);
+    assert!(second.is_empty(), "{second}");
+}
+
+#[test]
+fn many_unchanged_files_named_by_a_command_do_not_crowd_out_the_one_it_wrote() {
+    let rig = Rig::new("crowd");
+    for n in 0..60 {
+        std::fs::write(rig.cwd.join(format!("f{n}.py")), "x = 1\n").expect("write");
+    }
+    std::fs::write(rig.cwd.join("gen.py"), "x = 1\n").expect("write");
+    let command = "python3 gen.py && cat f*.py";
+    rig.pre_bash_with("cr", "t1", command);
+    let out = rig.cwd.join("out.py");
+    std::fs::write(&out, format!("{}x = 1\n", lines("#", "typed by hand", 10))).expect("write");
+    if !creation_time_is_known(&out) {
+        return;
+    }
+    let reply = rig.bash_with_id("cr", "t1", command);
+    assert!(blocked(&reply), "{reply}");
+}
+
+#[test]
+fn empty_comment_lines_replaced_one_for_one_are_not_new_commentary() {
+    let dir = temp_dir("php-empty");
+    let path = dir.join("a.php");
+    std::fs::write(&path, "<?php\n#\n#\n#\n$a = 1;\n").expect("write");
+    let reworded = write_file(None, None, &path, "<?php\n//\n//\n//\n$a = 1;\n");
+    assert!(!denied(&reworded), "{}", reason(&reworded));
+    std::fs::write(&path, "<?php\n// ----\n$a = 1;\n").expect("write");
+    let ruler = write_file(None, None, &path, "<?php\n# ====\n$a = 1;\n");
+    assert!(!denied(&ruler), "{}", reason(&ruler));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn html_delimiter_lines_are_not_letters_that_a_rewrap_could_hide() {
+    let dir = temp_dir("html-delims");
+    let path = dir.join("page.html");
+    std::fs::write(&path, "<!-- ab -->\n<p>hi</p>\n").expect("write");
+    let hollow = write_file(None, None, &path, "<!--\n-->\n<!--\n-->\n<p>hi</p>\n");
+    assert!(denied(&hollow));
+    let plain = write_file(None, None, &path, "<!-- ab -->\n<p>hi there</p>\n");
+    assert!(!denied(&plain));
+    let _ = std::fs::remove_dir_all(&dir);
+}

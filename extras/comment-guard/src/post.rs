@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -17,7 +17,11 @@ const WALK_TIME: Duration = Duration::from_millis(800);
 const TOTAL_TIME: Duration = Duration::from_millis(3000);
 const MAX_CANDIDATES: usize = 40;
 const SOURCE_FILES: usize = 400;
-const GLOB_MATCHES: usize = 200;
+const NAMED_PATHS: usize = 2000;
+const GLOB_WORDS: usize = 64;
+const LISTING_ENTRIES: usize = 20000;
+const REFRESH_TIME: Duration = Duration::from_millis(1000);
+const COPY_TIME: Duration = Duration::from_millis(1500);
 const SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const FIRST_WINDOW: Duration = Duration::from_secs(60);
 const SKIP_DIRS: [&str; 10] = [
@@ -85,9 +89,12 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger) -> Verdict {
         .unwrap_or(SystemTime::UNIX_EPOCH);
     ledger.mark_check(&key);
     let importing = imports_history(command);
-    let mut files = command_paths(command, &cwd);
+    let (mut files, quiet): (Vec<PathBuf>, Vec<PathBuf>) = command_paths(command, &cwd, NAMED_PATHS, deadline)
+        .into_iter()
+        .partition(|path| changed_since(path, since));
     let room = MAX_CANDIDATES.saturating_sub(files.len());
-    files.extend(walk_files(&cwd, room, &|meta| modified_since(meta, since)));
+    files.extend(walk_files(&cwd, room, deadline, &|meta| modified_since(meta, since)));
+    files.extend(quiet.into_iter().take(MAX_CANDIDATES));
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut changes: Vec<Change> = Vec::new();
     for file in files {
@@ -105,10 +112,16 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger) -> Verdict {
             changes.push(change);
         }
     }
+    let born = changes.iter().any(|change| change.baseline.is_none());
+    if born {
+        drop_copies(&mut changes, command, &cwd, since, ledger);
+    }
     let mut verdict = evaluate_after(&changes);
     if verdict.is_some() {
         drop_marked(&mut changes, &cwd);
-        drop_copies(&mut changes, command, &cwd, since, ledger);
+        if !born {
+            drop_copies(&mut changes, command, &cwd, since, ledger);
+        }
         verdict = evaluate_after(&changes);
     }
     match verdict {
@@ -127,15 +140,20 @@ fn command_of(payload: &Map<String, Value>) -> &str {
 
 pub fn refresh_named(payload: &Map<String, Value>, ledger: &Ledger) {
     let cwd = crate::base_of(payload);
+    let deadline = Instant::now() + REFRESH_TIME;
     let mut targets: Vec<PathBuf> = Vec::new();
-    for token in command_tokens(command_of(payload), &cwd) {
-        for file in source_files(&token) {
-            if !targets.contains(&file) {
+    let mut listed: HashSet<PathBuf> = HashSet::new();
+    for token in command_tokens(command_of(payload), &cwd, NAMED_PATHS, deadline) {
+        for file in source_files(&token, deadline) {
+            if listed.len() < NAMED_PATHS * 2 && listed.insert(file.clone()) {
                 targets.push(file);
             }
         }
     }
     for path in targets {
+        if Instant::now() >= deadline {
+            break;
+        }
         let name = path.to_string_lossy().into_owned();
         let Some(lang) = language_for(&name) else {
             continue;
@@ -193,7 +211,25 @@ fn wildcard_match(pattern: &[char], name: &[char]) -> bool {
     p == pattern.len()
 }
 
-fn expand_glob(cwd: &Path, word: &str) -> Vec<PathBuf> {
+type Listings = HashMap<PathBuf, Vec<(Vec<char>, PathBuf)>>;
+
+fn listing<'a>(cache: &'a mut Listings, dir: &Path) -> &'a [(Vec<char>, PathBuf)] {
+    cache.entry(dir.to_path_buf()).or_insert_with(|| {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .take(LISTING_ENTRIES)
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                (!name.starts_with('.')).then(|| (name.chars().collect(), entry.path()))
+            })
+            .collect()
+    })
+}
+
+fn expand_glob(cwd: &Path, word: &str, cache: &mut Listings, room: usize) -> Vec<PathBuf> {
     let (folder, last) = match word.rsplit_once('/') {
         Some((folder, last)) => (folder, last),
         None => ("", word),
@@ -203,29 +239,64 @@ fn expand_glob(cwd: &Path, word: &str) -> Vec<PathBuf> {
     }
     let dir = if folder.is_empty() { cwd.to_path_buf() } else { resolve(cwd, folder) };
     let pattern: Vec<char> = last.chars().collect();
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let name: Vec<char> = entry.file_name().to_string_lossy().chars().collect();
-        if name.first() != Some(&'.') && wildcard_match(&pattern, &name) {
-            out.push(entry.path());
-            if out.len() >= GLOB_MATCHES {
-                break;
+    listing(cache, &dir)
+        .iter()
+        .filter(|(name, _)| wildcard_match(&pattern, name))
+        .map(|(_, path)| path.clone())
+        .take(room)
+        .collect()
+}
+
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut open = false;
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else if c == '\\' && q == '"' {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+            } else {
+                word.push(c);
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                open = true;
+            }
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                    open = true;
+                }
+            }
+            separator if separator.is_whitespace() || ";&|<>()`".contains(separator) => {
+                if open {
+                    words.push(std::mem::take(&mut word));
+                    open = false;
+                }
+            }
+            other => {
+                word.push(other);
+                open = true;
             }
         }
     }
-    out
+    if open {
+        words.push(word);
+    }
+    words
 }
 
 fn command_words(command: &str) -> Vec<String> {
-    let mut words: Vec<String> = Vec::new();
-    if let Some(parts) = segments(command) {
-        for part in parts {
-            words.extend(part);
-        }
-    }
+    let mut words = shell_words(command);
     let separators = |c: char| c.is_whitespace() || "\"'`<>|;&()=,{}[]".contains(c);
     words.extend(command.split(separators).map(str::to_owned));
     let mut seen: HashSet<String> = HashSet::new();
@@ -233,14 +304,23 @@ fn command_words(command: &str) -> Vec<String> {
     words
 }
 
-fn command_tokens(command: &str, cwd: &Path) -> Vec<PathBuf> {
+fn command_tokens(command: &str, cwd: &Path, limit: usize, deadline: Instant) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
+    let mut cache = Listings::new();
+    let mut globs = 0usize;
     for word in command_words(command) {
-        if word.len() < 2 || word.chars().all(|c| c == '.') {
+        if out.len() >= limit || Instant::now() >= deadline {
+            break;
+        }
+        let glob = word.contains(['*', '?']);
+        if word.chars().all(|c| c == '.') || (word.len() < 2 && !glob) {
             continue;
         }
-        if word.contains(['*', '?']) {
-            out.extend(expand_glob(cwd, &word));
+        if glob {
+            globs = globs.saturating_add(1);
+            if globs <= GLOB_WORDS {
+                out.extend(expand_glob(cwd, &word, &mut cache, limit.saturating_sub(out.len())));
+            }
         } else {
             let path = match (word.strip_prefix("~/"), home()) {
                 (Some(rest), Some(root)) => root.join(rest),
@@ -250,15 +330,12 @@ fn command_tokens(command: &str, cwd: &Path) -> Vec<PathBuf> {
                 out.push(path);
             }
         }
-        if out.len() >= MAX_CANDIDATES {
-            break;
-        }
     }
     out
 }
 
-fn command_paths(command: &str, cwd: &Path) -> Vec<PathBuf> {
-    command_tokens(command, cwd)
+fn command_paths(command: &str, cwd: &Path, limit: usize, deadline: Instant) -> Vec<PathBuf> {
+    command_tokens(command, cwd, limit, deadline)
         .into_iter()
         .filter(|path| path.is_file() && language_for(&path.to_string_lossy()).is_some())
         .collect()
@@ -268,7 +345,7 @@ fn modified_since(meta: &fs::Metadata, since: SystemTime) -> bool {
     meta.modified().is_ok_and(|modified| modified >= since)
 }
 
-fn walk_files(root: &Path, limit: usize, keep: &dyn Fn(&fs::Metadata) -> bool) -> Vec<PathBuf> {
+fn walk_files(root: &Path, limit: usize, deadline: Instant, keep: &dyn Fn(&fs::Metadata) -> bool) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     if root.parent().is_none() || home().as_deref() == Some(root) {
         return files;
@@ -282,7 +359,7 @@ fn walk_files(root: &Path, limit: usize, keep: &dyn Fn(&fs::Metadata) -> bool) -
         };
         for entry in entries.flatten() {
             visited = visited.saturating_add(1);
-            if visited > WALK_ENTRIES || start.elapsed() > WALK_TIME || files.len() >= limit {
+            if visited > WALK_ENTRIES || start.elapsed() > WALK_TIME || Instant::now() >= deadline || files.len() >= limit {
                 return files;
             }
             let name = entry.file_name();
@@ -308,7 +385,7 @@ fn walk_files(root: &Path, limit: usize, keep: &dyn Fn(&fs::Metadata) -> bool) -
     files
 }
 
-fn source_files(path: &Path) -> Vec<PathBuf> {
+fn source_files(path: &Path, deadline: Instant) -> Vec<PathBuf> {
     if path.is_file() {
         return if language_for(&path.to_string_lossy()).is_some() {
             vec![path.to_path_buf()]
@@ -317,20 +394,30 @@ fn source_files(path: &Path) -> Vec<PathBuf> {
         };
     }
     if path.is_dir() {
-        return walk_files(path, SOURCE_FILES, &|_| true);
+        return walk_files(path, SOURCE_FILES, deadline, &|_| true);
     }
     Vec::new()
 }
 
+fn is_copy(known: &HashMap<u64, Vec<String>>, text: &str) -> bool {
+    known
+        .get(&content_hash(text))
+        .is_some_and(|texts| texts.iter().any(|known| known == text))
+}
+
 fn drop_copies(changes: &mut Vec<Change>, command: &str, cwd: &Path, since: SystemTime, ledger: &Ledger) {
-    let mut known: HashSet<u64> = HashSet::new();
+    let deadline = Instant::now() + COPY_TIME;
+    let mut known: HashMap<u64, Vec<String>> = HashMap::new();
     let mut budget = SOURCE_BYTES;
-    let mut roots = command_tokens(command, cwd);
+    let mut roots = command_tokens(command, cwd, NAMED_PATHS, deadline);
     if command_words(command).iter().any(|word| word == ".") {
         roots.push(cwd.to_path_buf());
     }
     'roots: for token in roots {
-        for file in source_files(&token) {
+        for file in source_files(&token, deadline) {
+            if Instant::now() >= deadline {
+                break 'roots;
+            }
             if changed_since(&file, since) {
                 continue;
             }
@@ -341,12 +428,15 @@ fn drop_copies(changes: &mut Vec<Change>, command: &str, cwd: &Path, since: Syst
                 break 'roots;
             }
             budget = budget.saturating_sub(text.len());
-            known.insert(content_hash(&text));
+            let same = known.entry(content_hash(&text)).or_default();
+            if !same.contains(&text) {
+                same.push(text);
+            }
         }
     }
     let mut kept: Vec<Change> = Vec::new();
     for change in changes.drain(..) {
-        if !known.contains(&content_hash(&change.new)) {
+        if !is_copy(&known, &change.new) {
             kept.push(change);
             continue;
         }
@@ -628,8 +718,15 @@ fn imports_history(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_paths, imports_history, looks_generated, segments};
+    use super::{command_paths, command_tokens, expand_glob, imports_history, is_copy, looks_generated, segments, shell_words, wildcard_match, Listings};
+    use crate::session::content_hash;
+    use std::collections::HashMap;
     use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
 
     #[test]
     fn paths_are_taken_from_redirects_and_arguments() {
@@ -638,11 +735,11 @@ mod tests {
         let file = dir.join("out.py");
         let _ = std::fs::write(&file, "x = 1\n");
         let command = format!("printf '# a\\n' > {} && sed -i '' 1d notes.md missing.py", file.display());
-        let found = command_paths(&command, &dir);
+        let found = command_paths(&command, &dir, 100, soon());
         assert_eq!(found, vec![file.clone()]);
-        let relative = command_paths("echo hi >out.py", &dir);
+        let relative = command_paths("echo hi >out.py", &dir, 100, soon());
         assert_eq!(relative, vec![file]);
-        assert!(command_paths("ls -la", Path::new("/")).is_empty());
+        assert!(command_paths("ls -la", Path::new("/"), 100, soon()).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -708,6 +805,83 @@ mod tests {
         ] {
             assert!(!imports_history(command), "{command}");
         }
+    }
+
+    #[test]
+    fn words_survive_redirects_substitutions_and_quotes() {
+        assert_eq!(
+            shell_words("cp \"vendor/my widget.py\" 'src/my widget.py' >/dev/null 2>&1"),
+            vec!["cp", "vendor/my widget.py", "src/my widget.py", "/dev/null", "2", "1"]
+        );
+        assert_eq!(shell_words("cat `ls a.py` $(ls b.py)"), vec!["cat", "ls", "a.py", "$", "ls", "b.py"]);
+        assert_eq!(shell_words("echo a\\ b \"c\\\" d\""), vec!["echo", "a b", "c\" d"]);
+        assert_eq!(shell_words("echo 'unterminated x"), vec!["echo", "unterminated x"]);
+        assert!(shell_words("").is_empty());
+    }
+
+    #[test]
+    fn patterns_match_like_the_shell_and_never_hang() {
+        let check = |pattern: &str, name: &str| {
+            let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
+            wildcard_match(&p, &n)
+        };
+        assert!(check("*", "a.py"));
+        assert!(check("*.py", "a.py"));
+        assert!(check("a?c.py", "abc.py"));
+        assert!(check("a*b*c", "aXXbYYc"));
+        assert!(!check("*.py", "a.rs"));
+        assert!(!check("a?c", "ac"));
+        assert!(check("", ""));
+        assert!(!check("", "a"));
+        let hostile_pattern = "*a".repeat(200) + "b";
+        let hostile_name = "a".repeat(2000);
+        assert!(!check(&hostile_pattern, &hostile_name));
+    }
+
+    #[test]
+    fn a_single_star_and_a_long_directory_are_expanded_within_the_limits() {
+        let dir = std::env::temp_dir().join(format!("comment-guard-glob-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        for n in 0..30 {
+            let _ = std::fs::write(dir.join(format!("f{n}.py")), "x = 1\n");
+        }
+        let _ = std::fs::write(dir.join(".hidden.py"), "x = 1\n");
+        let all = command_tokens("cp * dest", &dir, 100, soon());
+        assert_eq!(all.len(), 30);
+        let few = command_tokens("cp * dest", &dir, 5, soon());
+        assert_eq!(few.len(), 5);
+        let mut cache = Listings::new();
+        assert_eq!(expand_glob(&dir, "f1*.py", &mut cache, 100).len(), 11);
+        assert_eq!(expand_glob(&dir, "*/x.py", &mut cache, 100).len(), 0);
+        let many: String = (0..500).map(|n| format!("zz{n}* ")).collect();
+        let started = Instant::now();
+        let _ = command_tokens(&format!("ls {many}"), &dir, 100, soon());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(command_tokens("cp * dest", &dir, 100, Instant::now()).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_is_the_same_text_not_merely_the_same_hash() {
+        let mut known: HashMap<u64, Vec<String>> = HashMap::new();
+        known.insert(content_hash("# a\nx = 1\n"), vec!["something else with the same hash".to_owned()]);
+        assert!(!is_copy(&known, "# a\nx = 1\n"));
+        known.entry(content_hash("# a\nx = 1\n")).or_default().push("# a\nx = 1\n".to_owned());
+        assert!(is_copy(&known, "# a\nx = 1\n"));
+        assert!(!is_copy(&known, "# b\nx = 1\n"));
+    }
+
+    #[test]
+    fn globs_past_the_old_limits_still_expand_and_the_word_count_is_capped() {
+        let dir = std::env::temp_dir().join(format!("comment-guard-glob2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        for n in 0..250 {
+            let _ = std::fs::write(dir.join(format!("g{n}.py")), "x = 1\n");
+        }
+        assert_eq!(command_tokens("cp * dest", &dir, 2000, soon()).len(), 250);
+        let globs: String = (0..100).map(|n| format!("g{n}.py* ")).collect();
+        assert_eq!(command_tokens(&format!("ls {globs}"), &dir, 2000, soon()).len(), 64);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

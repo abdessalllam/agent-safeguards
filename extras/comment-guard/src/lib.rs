@@ -136,6 +136,46 @@ fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) -> Has
     prepared
 }
 
+fn settle(ledger: &Ledger, prepared: &HashMap<String, Prepared>, changes: &mut [Change]) -> Option<String> {
+    let mut retry: Vec<(String, u64, u64, usize)> = Vec::new();
+    let mut committed: Vec<(String, u64, u64, usize)> = Vec::new();
+    for change in changes.iter_mut() {
+        let Some(item) = prepared.get(&change.file) else {
+            continue;
+        };
+        let net = decision::net_lines(change);
+        match ledger.commit_note(&item.id, item.before, item.after.hash, net, change.carry) {
+            Ok(()) => committed.push((item.id.clone(), item.before, item.after.hash, net)),
+            Err(current) => {
+                change.carry = current;
+                retry.push((item.id.clone(), item.before, item.after.hash, net));
+            }
+        }
+    }
+    let mut verdict = None;
+    if !retry.is_empty() {
+        verdict = evaluate(changes);
+        if verdict.is_none() {
+            for (id, before, after, net) in &retry {
+                let current = ledger.carry(id, *before, *after);
+                let _ = ledger.commit_note(id, *before, *after, *net, current);
+            }
+        }
+    }
+    if verdict.is_none() {
+        for change in changes.iter() {
+            if let Some(item) = prepared.get(&change.file) {
+                ledger.accept(&item.id, &[item.after]);
+            }
+        }
+    } else {
+        for (id, before, after, net) in &committed {
+            ledger.revoke_note(id, *before, *after, *net);
+        }
+    }
+    verdict
+}
+
 pub fn judge(input: &str, provider: Provider) -> Verdict {
     judge_in(input, provider, session::state_dir().as_deref())
 }
@@ -171,33 +211,7 @@ pub fn judge_in(input: &str, provider: Provider, state: Option<&Path>) -> Verdic
     }
     if verdict.is_none() {
         if let Some(ledger) = &ledger {
-            let mut retry: Vec<(String, u64, u64, usize)> = Vec::new();
-            for change in changes.iter_mut() {
-                let Some(item) = prepared.get(&change.file) else {
-                    continue;
-                };
-                let net = decision::net_lines(change);
-                if let Err(current) = ledger.commit_note(&item.id, item.before, item.after.hash, net, change.carry) {
-                    change.carry = current;
-                    retry.push((item.id.clone(), item.before, item.after.hash, net));
-                }
-            }
-            if !retry.is_empty() {
-                verdict = evaluate(&changes);
-                if verdict.is_none() {
-                    for (id, before, after, net) in &retry {
-                        let current = ledger.carry(id, *before, *after);
-                        let _ = ledger.commit_note(id, *before, *after, *net, current);
-                    }
-                }
-            }
-            if verdict.is_none() {
-                for change in &changes {
-                    if let Some(item) = prepared.get(&change.file) {
-                        ledger.accept(&item.id, &[item.after]);
-                    }
-                }
-            }
+            verdict = settle(ledger, &prepared, &mut changes);
         }
     }
     match verdict {
@@ -223,5 +237,41 @@ pub fn judge_after_in(input: &str, state: Option<&Path>) -> Verdict {
     match ledger_of(&payload, state) {
         Some(ledger) => post::judge_command(&payload, &ledger),
         None => Verdict::Allow,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{settle, Prepared};
+    use crate::decision::Change;
+    use crate::session::{identity, seen_of, Ledger};
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    #[test]
+    fn a_denied_call_leaves_no_note_behind_for_the_files_it_had_already_noted() {
+        let dir = std::env::temp_dir().join(format!("comment-guard-settle-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let ledger = Ledger::open(&dir, "settle").expect("ledger");
+        let mut prepared = HashMap::new();
+        let mut changes = Vec::new();
+        for (name, old, new) in [("/t/a.py", "x = 1\n", "# one\nx = 1\n"), ("/t/b.py", "y = 1\n", "# two\ny = 1\n")] {
+            let id = identity(Path::new(name));
+            let before = seen_of(old, &[]);
+            ledger.baseline_for(&id, before, Vec::new);
+            let comments = crate::decision::comment_lines(new, crate::languages::language_for(name).expect("python"));
+            let after = seen_of(new, &comments);
+            prepared.insert(name.to_string(), Prepared { id, before: before.hash, after });
+            let mut change = Change::whole(name.to_string(), old.to_string(), new.to_string());
+            change.baseline = Some(Vec::new());
+            changes.push(change);
+        }
+        let other = &prepared["/t/b.py"];
+        assert_eq!(ledger.commit_note(&other.id, other.before, 77, 2, 0), Ok(()));
+        let verdict = settle(&ledger, &prepared, &mut changes);
+        assert!(verdict.is_some());
+        let first = &prepared["/t/a.py"];
+        assert_eq!(ledger.carry(&first.id, first.before, 12345), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

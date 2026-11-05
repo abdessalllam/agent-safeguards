@@ -2,15 +2,16 @@ use std::cell::Cell;
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
 const RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const PRUNE_LIMIT: usize = 200;
 const PRUNE_VISITS: usize = 2000;
-const LOCK_TRIES: u32 = 40;
 const LOCK_STALE: Duration = Duration::from_secs(5);
+const LOCK_WAIT: Duration = Duration::from_secs(6);
 const REMEMBERED_STATES: usize = 8;
 const PENDING_SECONDS: u64 = 3;
 
@@ -47,6 +48,8 @@ fn hash(text: &str) -> u64 {
     }
     value
 }
+
+static TOKENS: AtomicU64 = AtomicU64::new(0);
 
 pub fn content_hash(text: &str) -> u64 {
     hash(text)
@@ -180,15 +183,17 @@ impl Ledger {
             .join(format!(".tmp-{}-{nanos}", std::process::id()))
     }
 
+    fn lock_token(&self) -> String {
+        let name = self.temp().file_name().map(|name| name.to_string_lossy().into_owned());
+        format!("{}-{}", name.unwrap_or_default(), TOKENS.fetch_add(1, Ordering::Relaxed))
+    }
+
     fn locked<T>(&self, identity: &str, work: impl FnOnce() -> T) -> T {
         let lock = self.named(identity, "lock");
-        let token = self
-            .temp()
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let token = self.lock_token();
         let mut held = false;
-        for _ in 0..LOCK_TRIES {
+        let started = Instant::now();
+        while started.elapsed() < LOCK_WAIT {
             match fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
                 Ok(mut file) => {
                     let _ = file.write_all(token.as_bytes());
@@ -386,20 +391,44 @@ impl Ledger {
             if net == 0 {
                 return Ok(());
             }
-            let carried = stored
-                .pending
-                .as_ref()
-                .filter(|pending| pending.from == from && now.saturating_sub(pending.at) <= PENDING_SECONDS)
-                .map_or(0, |pending| pending.net);
+            let total = match stored.pending.as_ref() {
+                Some(pending) if pending.from == from && now.saturating_sub(pending.at) <= PENDING_SECONDS => {
+                    if pending.to == to {
+                        pending.net
+                    } else {
+                        pending.net.saturating_add(net)
+                    }
+                }
+                _ => net,
+            };
             stored.pending = Some(Pending {
                 from,
                 to,
-                net: carried.saturating_add(net),
+                net: total,
                 at: now,
             });
             self.store(identity, &stored);
             Ok(())
         })
+    }
+
+    pub fn revoke_note(&self, identity: &str, from: u64, to: u64, net: usize) {
+        self.locked(identity, || {
+            let Some(mut stored) = self.load(identity) else {
+                return;
+            };
+            let Some(pending) = stored.pending.as_mut() else {
+                return;
+            };
+            if pending.from != from || pending.to != to {
+                return;
+            }
+            pending.net = pending.net.saturating_sub(net);
+            if pending.net == 0 {
+                stored.pending = None;
+            }
+            self.store(identity, &stored);
+        });
     }
 
     pub fn last_check(&self, key: &str) -> Option<SystemTime> {
@@ -467,7 +496,7 @@ impl Ledger {
 mod tests {
     use super::{hash, identity, lexical, owned, seen_of, signature, Ledger, Seen, RETENTION};
     use std::path::Path;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("comment-guard-{name}-{}", std::process::id()));
@@ -568,6 +597,48 @@ mod tests {
         assert_eq!((first_carry, second_carry), (0, 0));
         assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, first_carry, 100), Ok(()));
         assert_eq!(ledger.commit_note_at("/x/a.py", 1, 20, 2, second_carry, 100), Err(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_same_edit_noted_twice_is_counted_once_and_a_note_can_be_revoked() {
+        let dir = scratch("same-edit");
+        let ledger = Ledger::open(&dir, "session-n").expect("ledger");
+        ledger.baseline_for("/x/a.py", state(1), Vec::new);
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, 0, 100), Ok(()));
+        assert_eq!(ledger.commit_note_at("/x/a.py", 1, 10, 2, 0, 101), Ok(()));
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 11, 101), 2);
+        ledger.revoke_note("/x/a.py", 1, 99, 2);
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 11, 101), 2);
+        ledger.revoke_note("/x/a.py", 1, 10, 2);
+        assert_eq!(ledger.carry_at("/x/a.py", 1, 11, 101), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_tokens_never_repeat_even_within_one_clock_tick() {
+        let dir = scratch("tokens");
+        let ledger = Ledger::open(&dir, "session-t").expect("ledger");
+        let tokens: std::collections::HashSet<String> = (0..2000).map(|_| ledger.lock_token()).collect();
+        assert_eq!(tokens.len(), 2000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_waiter_stays_out_until_a_fresh_lock_is_released() {
+        let dir = scratch("waiter");
+        let ledger = Ledger::open(&dir, "session-v").expect("ledger");
+        let lock = ledger.named("/x/a.py", "lock");
+        std::fs::write(&lock, "holder").expect("write");
+        let release = lock.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            let _ = std::fs::remove_file(&release);
+        });
+        let started = Instant::now();
+        let ran_after = ledger.locked("/x/a.py", || started.elapsed());
+        handle.join().expect("join");
+        assert!(ran_after >= Duration::from_millis(500), "{ran_after:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

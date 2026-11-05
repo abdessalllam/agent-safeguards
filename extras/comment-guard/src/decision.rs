@@ -90,7 +90,7 @@ struct Measure<'a> {
 }
 
 fn letters(line: &str) -> usize {
-    body(line).chars().filter(|c| !c.is_whitespace()).count()
+    body(line).chars().filter(|c| c.is_alphanumeric()).count()
 }
 
 fn measure(change: &Change, lang: Language) -> Measure<'_> {
@@ -165,6 +165,7 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
     let mut removed_total = 0usize;
     let mut removed_long = 0usize;
     let mut removed_letters = 0usize;
+    let mut removed_blank = 0usize;
     let mut removed_markers: HashMap<String, usize> = HashMap::new();
     for (line, count) in &pool {
         if *count == 0 {
@@ -172,6 +173,9 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
         }
         removed_total = removed_total.saturating_add(*count);
         removed_letters = removed_letters.saturating_add(letters(line).saturating_mul(*count));
+        if letters(line) == 0 {
+            removed_blank = removed_blank.saturating_add(*count);
+        }
         if line.chars().count() > MAX_LINE_CHARS {
             removed_long = removed_long.saturating_add(*count);
         }
@@ -181,11 +185,12 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
         }
     }
     let lettered = fresh_lines.saturating_sub(fresh_blank);
-    let mut net = lettered.saturating_sub(removed_total);
-    if removed_total > 0 && fresh_letters <= removed_letters {
+    let removed_lettered = removed_total.saturating_sub(removed_blank);
+    let mut net = lettered.saturating_sub(removed_lettered);
+    if removed_lettered > 0 && fresh_letters <= removed_letters {
         net = 0;
     }
-    net = net.saturating_add(fresh_blank);
+    net = net.saturating_add(fresh_blank.saturating_sub(removed_blank));
     let mut marker = None;
     for found in fresh_markers {
         match removed_markers.get_mut(&found.to_ascii_lowercase()) {
