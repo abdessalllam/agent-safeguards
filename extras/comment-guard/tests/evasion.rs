@@ -2020,6 +2020,7 @@ fn comments_that_cannot_be_cut_safely_are_still_refused() {
     refuse("a.lua", "local s = [==[\n-- one\n-- two\n-- three\n-- four\n]==]\nlocal x = 1\n");
     refuse("b.lua", "local s = [[\n-- one\n-- two\n-- three\n-- four\n]]\nlocal x = 1\n");
     refuse("g.rs", "fn main() {\n    let s = r##\" \"\n// one\n// two\n// three\n// four\n\"##;\n    let x = 1;\n}\n");
+    refuse("h.rs", "fn main() {\n    let s = r#\"x\" ;\n// one\n// two\n// three\n// four\na\"b\"#;\n    let x = 1;\n}\n");
     refuse("a.ex", "s = ~s(\n# one\n# two\n# three\n# four\n)\nx = 1\n");
     refuse("a.tcl", "set s {\n# one\n# two\n# three\n# four\n}\nset x 1\n");
     refuse("a.jsonnet", "local s = |||\n# one\n# two\n# three\n# four\n|||;\nlocal x = 1;\n");
