@@ -189,10 +189,45 @@ fn every_tool_directive_is_ignored() {
         "+build linux,amd64",
         "@flow strict",
         "@jsx h",
+        "eslint-disable-next-line eqeqeq",
+        "eslint-disable-next-line radix, yoda",
+        "go:embed templates",
+        "go:linkname bytesHash runtime.memhash",
+        "go:build integration",
+        "go:cgo_import_dynamic puts puts \"libc.so\"",
+        "+build linux darwin windows",
+        "SPDX-License-Identifier: GPL-2.0-only WITH Classpath-exception-2.0",
+        "noqa: PLR0913, ANN101",
+        "nolint:gosec,errcheck,staticcheck",
     ];
     for directive in directives {
         let line = format!("# {directive}\n# {directive}\n# {directive}\n");
         assert!(!denied(&edit("a.py", "", &line)), "directive {directive} counted");
+    }
+}
+
+#[test]
+fn a_directive_cannot_carry_a_sentence_in_its_arguments() {
+    let sentences = [
+        "noqa: note-one",
+        "noqa: ignore next line if no cover",
+        "noqa: E501 note",
+        "SPDX-License-Identifier: THIS IS THE HIDDEN NOTE",
+        "SPDX-License-Identifier: MIT AND",
+        "nolint:note-one",
+        "nolint:one,two,three,four,five",
+        "go:cgo_note_one_explain_the_cache",
+        "go:embed one two three four five six seven",
+        "eslint-disable-next-line note one",
+        "type: ignore note two",
+        "pragma: no cover because it is hard",
+        "fmt: off until the end of the table",
+        "fmt: off on skip next line",
+        "istanbul ignore next for now",
+    ];
+    for sentence in sentences {
+        let line = format!("# {sentence}\n# {sentence}\n# {sentence}\n");
+        assert!(denied(&edit("a.py", "", &line)), "{sentence} carried a message");
     }
 }
 

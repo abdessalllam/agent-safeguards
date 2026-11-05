@@ -21,7 +21,8 @@ const NAMED_PATHS: usize = 2000;
 const GLOB_WORDS: usize = 64;
 const MAX_BASES: usize = 4;
 const NAMED_DIRS: usize = 3;
-const NAMED_RECORDS: usize = 64;
+const NAMED_RECORDS: usize = 256;
+const CD_WORDS: usize = 32;
 const LISTING_ENTRIES: usize = 20000;
 const REFRESH_TIME: Duration = Duration::from_millis(1000);
 const COPY_TIME: Duration = Duration::from_millis(1500);
@@ -96,7 +97,7 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger) -> Verdict {
     let (mut files, quiet): (Vec<PathBuf>, Vec<PathBuf>) = named.into_iter().partition(|path| changed_since(path, since));
     let room = MAX_CANDIDATES.saturating_sub(files.len());
     files.extend(walk_files(&cwd, room, deadline, &|meta| modified_since(meta, since)));
-    for folder in folders {
+    for folder in folders.into_iter().filter(|_| !quiet_command(command)) {
         let room = MAX_CANDIDATES.saturating_sub(files.len());
         files.extend(walk_files(&folder, room, deadline, &|meta| modified_since(meta, since)));
     }
@@ -150,11 +151,13 @@ pub fn refresh_named(payload: &Map<String, Value>, ledger: &Ledger) {
     let mut targets: Vec<PathBuf> = Vec::new();
     let mut listed: HashSet<PathBuf> = HashSet::new();
     let mut direct: HashSet<PathBuf> = HashSet::new();
+    let quiet = quiet_command(command_of(payload));
     for token in command_tokens(command_of(payload), &cwd, NAMED_PATHS, deadline) {
-        if token.is_file() {
-            direct.insert(token.clone());
+        let files = source_files(&token, deadline);
+        if token.is_file() || !quiet {
+            direct.extend(files.iter().cloned());
         }
-        for file in source_files(&token, deadline) {
+        for file in files {
             if listed.len() < NAMED_PATHS * 2 && listed.insert(file.clone()) {
                 targets.push(file);
             }
@@ -370,12 +373,17 @@ fn expand_vars(word: &str, vars: &HashMap<String, String>) -> Option<String> {
 
 fn search_bases(command: &str, cwd: &Path, vars: &HashMap<String, String>) -> Vec<PathBuf> {
     let mut bases = vec![cwd.to_path_buf()];
+    let mut examined = 0usize;
     for pair in shell_words(command).windows(2) {
         let (Some(first), Some(target)) = (pair.first(), pair.get(1)) else {
             continue;
         };
         if !matches!(first.as_str(), "cd" | "pushd") || target.starts_with('-') {
             continue;
+        }
+        examined = examined.saturating_add(1);
+        if examined > CD_WORDS {
+            break;
         }
         let target = expand_vars(target, vars).unwrap_or_else(|| target.clone());
         let path = match (target.strip_prefix("~/"), home()) {
@@ -792,6 +800,25 @@ fn git_segment(words: &[String]) -> Option<bool> {
         }
     }
     None
+}
+
+fn quiet_command(command: &str) -> bool {
+    let Some(parts) = segments(command) else {
+        return false;
+    };
+    let reads = ["status", "diff", "log", "show", "rev-parse", "branch", "ls-files", "remote"];
+    !parts.is_empty()
+        && parts.iter().all(|words| match words.split_first() {
+            None => true,
+            Some((first, rest)) => {
+                HARMLESS.contains(&first.as_str())
+                    || (first == "git"
+                        && rest
+                            .iter()
+                            .find(|word| !word.starts_with('-'))
+                            .is_some_and(|sub| reads.contains(&sub.as_str())))
+            }
+        })
 }
 
 fn imports_history(command: &str) -> bool {

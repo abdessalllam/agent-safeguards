@@ -10,6 +10,8 @@ pub enum LineKind<'a> {
 #[derive(Clone, Copy)]
 enum Tail {
     Words,
+    Codes,
+    Lint,
     Licence,
     Compact,
     Go,
@@ -18,7 +20,7 @@ enum Tail {
 // A tool directive is exempt only while what follows is its own arguments (codes, rule names),
 // never free text.
 const EXEMPT: &[(&str, Tail)] = &[
-    ("noqa", Tail::Words),
+    ("noqa", Tail::Codes),
     ("type:", Tail::Words),
     ("pragma", Tail::Words),
     ("pylint:", Tail::Words),
@@ -27,7 +29,7 @@ const EXEMPT: &[(&str, Tail)] = &[
     ("fmt:", Tail::Words),
     ("isort:", Tail::Words),
     ("pyright:", Tail::Words),
-    ("eslint-", Tail::Words),
+    ("eslint-", Tail::Lint),
     ("prettier-ignore", Tail::Words),
     ("@ts-", Tail::Words),
     ("istanbul ", Tail::Words),
@@ -46,65 +48,134 @@ const EXEMPT: &[(&str, Tail)] = &[
     ("+build", Tail::Words),
     ("@flow", Tail::Words),
     ("@jsx", Tail::Words),
-    ("eslint-disable", Tail::Words),
 ];
 
 const DIRECTIVE_WORDS: &[&str] = &[
     "ignore", "noqa", "env", "off", "on", "skip", "next", "line", "file", "no", "cover", "branch", "disable", "enable", "all",
-    "secret", "allowlist", "nextline", "start", "stop", "begin", "end", "if", "else", "set", "coding", "mode",
-    "encoding", "basic", "strict", "standard", "once", "node", "browser", "jest", "mocha", "jsx", "h", "check",
-    "nocheck", "expect", "and", "or", "with", "linux", "darwin", "windows", "freebsd", "netbsd", "openbsd", "solaris",
-    "plan9", "android", "ios", "js", "wasm", "aix", "illumos", "amd64", "arm", "arm64", "mips", "ppc64", "riscv64",
-    "s390x", "cgo", "race", "gc", "unix", "tag", "block", "nextblock", "generate", "build", "embed",
+    "secret", "allowlist", "nextline", "start", "stop", "begin", "end", "if", "else", "set", "coding", "mode", "encoding",
+    "basic", "strict", "standard", "once", "node", "browser", "jest", "mocha", "jsx", "h", "check", "nocheck", "expect",
+    "tag", "block", "nextblock", "generate", "build", "embed",
+];
+
+const TAG_WORDS: &[&str] = &[
+    "linux", "darwin", "windows", "freebsd", "netbsd", "openbsd", "solaris", "plan9", "android", "ios", "js", "wasm", "aix",
+    "illumos", "amd64", "arm", "arm64", "mips", "ppc64", "riscv64", "s390x", "cgo", "race", "gc", "unix",
+];
+
+const ESLINT_RULES: &[&str] = &[
+    "camelcase", "complexity", "curly", "eqeqeq", "indent", "quotes", "radix", "semi", "strict", "yoda",
 ];
 
 const GO_DIRECTIVES: &[&str] = &[
     "generate", "build", "embed", "linkname", "noinline", "nosplit", "noescape", "norace", "nocheckptr", "debug",
-    "uintptrescapes", "wasmimport",
+    "uintptrescapes", "wasmimport", "wasmexport", "cgo_import_dynamic", "cgo_import_static", "cgo_export_dynamic",
+    "cgo_export_static", "cgo_ldflag", "cgo_unsafe_args", "cgo_dynamic_linker",
 ];
+
+const MAX_DIRECTIVE_TOKENS: usize = 6;
+const MAX_DIRECTIVE_WORDS: usize = 2;
+const MAX_TOKEN_CHARS: usize = 48;
 
 fn code_like(token: &str) -> bool {
     token.chars().any(|c| c.is_ascii_digit() || "_-.[]=/@()<>|*&#$%^~+!".contains(c))
 }
 
-fn directive_words(tail: &str, upper: bool) -> bool {
+fn tokens(tail: &str) -> impl Iterator<Item = &str> {
+    tail.split(|c: char| c.is_whitespace() || matches!(c, ',' | ':' | ';')).filter(|token| !token.is_empty())
+}
+
+fn directive_words(tail: &str, free: &[&str]) -> bool {
     let mut count = 0usize;
-    for token in tail
-        .split(|c: char| c.is_whitespace() || matches!(c, ',' | ':' | ';'))
-        .filter(|token| !token.is_empty())
-    {
+    let mut words = 0usize;
+    for token in tokens(tail) {
         count = count.saturating_add(1);
-        if count > 8 || token.chars().count() > 48 {
+        if count > MAX_DIRECTIVE_TOKENS || token.chars().count() > MAX_TOKEN_CHARS {
             return false;
         }
         let word = token.to_ascii_lowercase();
-        let plain_upper = upper && token.len() <= 12 && token.chars().all(|c| c.is_ascii_uppercase());
-        if !(code_like(token) || plain_upper || DIRECTIVE_WORDS.contains(&word.as_str())) {
+        if code_like(token) || free.contains(&word.as_str()) {
+            continue;
+        }
+        words = words.saturating_add(1);
+        if words > MAX_DIRECTIVE_WORDS || !DIRECTIVE_WORDS.contains(&word.as_str()) {
             return false;
         }
     }
     true
 }
 
+fn is_code(token: &str) -> bool {
+    let letters = token.chars().take_while(char::is_ascii_alphabetic).count();
+    let digits = token.chars().skip(letters).take_while(char::is_ascii_digit).count();
+    (1..=6).contains(&letters)
+        && (1..=5).contains(&digits)
+        && token.chars().skip(letters.saturating_add(digits)).all(|c| c.is_ascii_alphanumeric())
+}
+
+fn directive_codes(tail: &str) -> bool {
+    let mut count = 0usize;
+    tokens(tail).all(|token| {
+        count = count.saturating_add(1);
+        count <= 8 && is_code(token)
+    })
+}
+
+fn license_id(token: &str) -> bool {
+    token.len() <= 40
+        && token.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+        && (token.chars().any(|c| c.is_ascii_digit() || matches!(c, '.' | '+' | '-'))
+            || (token.len() <= 12 && token.chars().all(|c| c.is_ascii_uppercase())))
+}
+
+fn directive_licence(tail: &str) -> bool {
+    let parts: Vec<&str> = tail
+        .split(|c: char| c.is_whitespace() || matches!(c, ':' | '(' | ')'))
+        .filter(|token| !token.is_empty())
+        .collect();
+    if parts.is_empty() || parts.len() > 7 {
+        return false;
+    }
+    let mut id_next = true;
+    for part in &parts {
+        let fits = if id_next { license_id(part) } else { matches!(*part, "AND" | "OR" | "WITH") };
+        if !fits {
+            return false;
+        }
+        id_next = !id_next;
+    }
+    !id_next
+}
+
+fn directive_compact(tail: &str) -> bool {
+    let rest = tail.trim_end();
+    rest.is_empty()
+        || rest.strip_prefix(':').is_some_and(|names| {
+            let parts: Vec<&str> = names.split(',').collect();
+            parts.len() <= 4
+                && parts.iter().all(|name| {
+                    !name.is_empty() && name.len() <= 32 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+        })
+}
+
+fn directive_go(tail: &str) -> bool {
+    let rest = tail.trim_start();
+    let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+    if !GO_DIRECTIVES.contains(&name.as_str()) {
+        return false;
+    }
+    let args = rest.get(name.len()..).unwrap_or("");
+    name == "generate" || (args.split_whitespace().count() <= 6 && args.split_whitespace().all(|word| word.chars().count() <= MAX_TOKEN_CHARS))
+}
+
 fn directive_tail(kind: Tail, tail: &str) -> bool {
     match kind {
-        Tail::Words => directive_words(tail, false),
-        Tail::Licence => directive_words(tail, true),
-        Tail::Compact => {
-            let rest = tail.trim_end();
-            rest.is_empty()
-                || (rest.starts_with(':')
-                    && rest.len() > 1
-                    && rest.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | ',' | '_' | '-' | '.')))
-        }
-        Tail::Go => {
-            let rest = tail.trim_start();
-            let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
-            if !GO_DIRECTIVES.contains(&name.as_str()) && !name.starts_with("cgo_") {
-                return false;
-            }
-            name == "generate" || directive_words(rest.get(name.len()..).unwrap_or(""), false)
-        }
+        Tail::Words => directive_words(tail, TAG_WORDS),
+        Tail::Codes => directive_codes(tail),
+        Tail::Lint => directive_words(tail, ESLINT_RULES),
+        Tail::Licence => directive_licence(tail),
+        Tail::Compact => directive_compact(tail),
+        Tail::Go => directive_go(tail),
     }
 }
 
@@ -140,6 +211,21 @@ fn starts_ignore_case(text: &str, prefix: &str) -> bool {
         Some(head) => head.eq_ignore_ascii_case(prefix.as_bytes()),
         None => false,
     }
+}
+
+fn is_remark(text: &str) -> bool {
+    let word = text.trim_start_matches('@');
+    let rem = word.get(..3).is_some_and(|head| head.eq_ignore_ascii_case("rem"))
+        && word.get(3..).is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
+    rem || text.starts_with("::")
+}
+
+fn is_sentinel(text: &str) -> bool {
+    let Some(rest) = text.trim_start().strip_prefix('!') else {
+        return false;
+    };
+    let name = rest.chars().take_while(char::is_ascii_alphanumeric).count();
+    name <= 5 && rest.get(name..).is_some_and(|tail| tail.starts_with('$'))
 }
 
 fn is_exempt(text: &str) -> bool {
@@ -234,7 +320,15 @@ fn regex_length(rest: &str) -> Option<usize> {
     None
 }
 
-fn block_scan(text: &str, open: &str, close: &str, nested: bool, start: u32) -> (u32, usize) {
+fn block_scan(
+    text: &str,
+    open: &str,
+    close: &str,
+    nested: bool,
+    start: u32,
+    tracked: bool,
+    in_string: &mut bool,
+) -> (u32, usize) {
     let mut depth = start;
     let mut at = 0usize;
     while at < text.len() {
@@ -242,6 +336,24 @@ fn block_scan(text: &str, open: &str, close: &str, nested: bool, start: u32) -> 
             at = at.saturating_add(1);
             continue;
         };
+        if tracked {
+            if *in_string {
+                if rest.starts_with('\\') {
+                    at = at.saturating_add(2);
+                    continue;
+                }
+                if rest.starts_with('"') {
+                    *in_string = false;
+                }
+                at = at.saturating_add(1);
+                continue;
+            }
+            if rest.starts_with('"') {
+                *in_string = true;
+                at = at.saturating_add(1);
+                continue;
+            }
+        }
         if rest.starts_with(close) {
             depth = depth.saturating_sub(1);
             at = at.saturating_add(close.len());
@@ -267,7 +379,9 @@ enum State {
         open: &'static str,
         close: &'static str,
         depth: u32,
+        string: bool,
     },
+    Indent(usize),
     ColumnZero(&'static str),
     Pod,
     Triple { delim: &'static str, doc: bool },
@@ -297,14 +411,16 @@ impl<'a> Iterator for Scan<'a> {
     fn next(&mut self) -> Option<LineKind<'a>> {
         loop {
             if let Some(text) = self.extra.pop_front() {
-                if is_exempt(body(text)) {
+                if is_exempt(body(text)) || (self.lang.sentinel && is_sentinel(text)) {
                     continue;
                 }
                 return Some(LineKind::Also(text));
             }
             let line = self.lines.next()?;
             return Some(match self.classify(line) {
-                LineKind::Comment(text) if is_exempt(body(text)) => LineKind::Other,
+                LineKind::Comment(text) if is_exempt(body(text)) || (self.lang.sentinel && is_sentinel(text)) => {
+                    LineKind::Other
+                }
                 other => other,
             });
         }
@@ -318,15 +434,28 @@ impl<'a> Scan<'a> {
             return LineKind::Other;
         }
         match self.state {
-            State::Block { open, close, depth } => {
-                let (left, end) = block_scan(trimmed, open, close, self.lang.nested, depth);
+            State::Block { open, close, depth, string } => {
+                let mut in_string = string;
+                let (left, end) =
+                    block_scan(trimmed, open, close, self.lang.nested, depth, self.lang.comment_strings, &mut in_string);
                 if left == 0 {
                     self.state = State::Code;
                     self.trailing_after(trimmed.get(end..), close);
                     return LineKind::Comment(trimmed.get(..end).unwrap_or(trimmed));
                 }
-                self.state = State::Block { open, close, depth: left };
+                self.state = State::Block { open, close, depth: left, string: in_string };
                 LineKind::Comment(trimmed)
+            }
+            State::Indent(base) => {
+                let indent = line.len().saturating_sub(line.trim_start().len());
+                if indent > base {
+                    return LineKind::Comment(trimmed);
+                }
+                self.state = State::Code;
+                match self.leading(line, trimmed) {
+                    Some(kind) => kind,
+                    None => self.code(trimmed, None),
+                }
             }
             State::ColumnZero(close) => {
                 if line.starts_with(close) {
@@ -404,9 +533,13 @@ impl<'a> Scan<'a> {
         }
         for &(open, close) in lang.block {
             if let Some(rest) = trimmed.strip_prefix(open) {
-                let (left, end) = block_scan(rest, open, close, lang.nested, 1);
+                if lang.dollar_directive && open == "{" && rest.starts_with('$') {
+                    continue;
+                }
+                let mut in_string = false;
+                let (left, end) = block_scan(rest, open, close, lang.nested, 1, lang.comment_strings, &mut in_string);
                 if left > 0 {
-                    self.state = State::Block { open, close, depth: left };
+                    self.state = State::Block { open, close, depth: left, string: in_string };
                     return Some(LineKind::Comment(trimmed));
                 }
                 let upto = open.len().saturating_add(end);
@@ -414,13 +547,8 @@ impl<'a> Scan<'a> {
                 return Some(LineKind::Comment(trimmed.get(..upto).unwrap_or(trimmed)));
             }
         }
-        if lang.rem {
-            let word = trimmed.trim_start_matches('@');
-            let remark = word.get(..3).is_some_and(|head| head.eq_ignore_ascii_case("rem"))
-                && word.get(3..).is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
-            if remark || trimmed.starts_with("::") {
-                return Some(LineKind::Comment(trimmed));
-            }
+        if lang.rem && is_remark(trimmed) {
+            return Some(LineKind::Comment(trimmed));
         }
         for &marker in lang.line {
             if trimmed.starts_with(marker) {
@@ -428,6 +556,9 @@ impl<'a> Scan<'a> {
                 let attribute = lang.php && marker == "#" && trimmed.starts_with("#[");
                 if shebang || attribute {
                     return Some(LineKind::Other);
+                }
+                if lang.indent_block {
+                    self.state = State::Indent(line.len().saturating_sub(line.trim_start().len()));
                 }
                 return Some(LineKind::Comment(trimmed));
             }
@@ -561,11 +692,22 @@ impl<'a> Scan<'a> {
                 previous = None;
                 continue;
             }
+            if lang.rem && first == '&' {
+                let after = rest.get(1..).unwrap_or("").trim_start();
+                if is_remark(after) {
+                    found.push(after);
+                    return;
+                }
+            }
             for &(open, close) in lang.block {
                 if let Some(tail) = rest.strip_prefix(open) {
-                    let (left, end) = block_scan(tail, open, close, lang.nested, 1);
+                    if lang.dollar_directive && open == "{" && tail.starts_with('$') {
+                        continue;
+                    }
+                    let mut in_string = false;
+                    let (left, end) = block_scan(tail, open, close, lang.nested, 1, lang.comment_strings, &mut in_string);
                     if left > 0 {
-                        self.state = State::Block { open, close, depth: left };
+                        self.state = State::Block { open, close, depth: left, string: in_string };
                         found.push(rest);
                         return;
                     }

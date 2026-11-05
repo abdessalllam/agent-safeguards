@@ -110,8 +110,11 @@ fn find_cell(cells: &[Value], id: &str) -> Option<usize> {
     if let Some(found) = cells.iter().position(|cell| cell.get("id").and_then(Value::as_str) == Some(id)) {
         return Some(found);
     }
-    let digits: String = id.chars().filter(char::is_ascii_digit).collect();
-    digits.parse::<usize>().ok().filter(|index| *index < cells.len())
+    let number = id.strip_prefix("cell-").or_else(|| id.strip_prefix("cell_")).unwrap_or(id);
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    number.parse::<usize>().ok().filter(|index| *index < cells.len())
 }
 
 fn notebook_edit(input: &Map<String, Value>, base: &Path) -> Option<Change> {

@@ -16,6 +16,10 @@ pub struct Language {
     pub nested: bool,
     pub regex: bool,
     pub rem: bool,
+    pub comment_strings: bool,
+    pub indent_block: bool,
+    pub dollar_directive: bool,
+    pub sentinel: bool,
 }
 
 const C_BLOCKS: &[(&str, &str)] = &[("/*", "*/")];
@@ -39,6 +43,10 @@ const BASE: Language = Language {
     nested: false,
     regex: false,
     rem: false,
+    comment_strings: false,
+    indent_block: false,
+    dollar_directive: false,
+    sentinel: false,
 };
 
 pub const HASH: Language = Language { line: &["#"], ..BASE };
@@ -99,27 +107,38 @@ pub const COMPONENT: Language = Language {
 pub const CSS: Language = Language { block: &[("/*", "*/")], ..BASE };
 pub const SCSS: Language = Language { line: &["//"], block: &[("/*", "*/")], ..BASE };
 
-pub const POWERSHELL: Language = Language { line: &["#"], block: &[("<#", "#>")], hash_after_space: true, ..BASE };
+pub const POWERSHELL: Language = Language { line: &["#"], block: &[("<#", "#>")], ..BASE };
+pub const MAKE: Language = Language { line: &["#"], ..BASE };
 pub const HCL: Language = Language { line: &["#", "//"], block: C_BLOCKS, quotes: "\"", ..BASE };
-pub const CMAKE: Language =
-    Language { line: &["#"], block: &[("#[[", "]]"), ("#[=[", "]=]")], hash_after_space: true, ..BASE };
+pub const CMAKE: Language = Language {
+    line: &["#"],
+    block: &[("#[[", "]]"), ("#[=[", "]=]"), ("#[==[", "]==]"), ("#[===[", "]===]"), ("#[====[", "]====]")],
+    hash_after_space: true,
+    ..BASE
+};
 pub const BATCH: Language = Language { rem: true, ..BASE };
 pub const BASIC: Language = Language { line: &["'"], quotes: "\"", rem: true, ..BASE };
 pub const LISP: Language = Language { line: &[";"], block: &[("#|", "|#")], quotes: "\"", nested: true, ..BASE };
 pub const SEMICOLON: Language = Language { line: &[";"], ..BASE };
-pub const PERCENT: Language = Language { line: &["%"], quotes: "\"", ..BASE };
-pub const OCAML: Language = Language { block: &[("(*", "*)")], quotes: "\"", nested: true, ..BASE };
-pub const FSHARP: Language = Language { line: &["//"], block: &[("(*", "*)")], quotes: "\"", nested: true, ..BASE };
-pub const PASCAL: Language = Language { line: &["//"], block: &[("(*", "*)"), ("{", "}")], quotes: "'", ..BASE };
+pub const PERCENT: Language = Language { line: &["%"], quotes: "\"'", ..BASE };
+pub const OCAML: Language = Language { block: &[("(*", "*)")], quotes: "\"", nested: true, comment_strings: true, ..BASE };
+pub const FSHARP: Language =
+    Language { line: &["//"], block: &[("(*", "*)")], quotes: "\"", nested: true, comment_strings: true, ..BASE };
+pub const PASCAL: Language =
+    Language { line: &["//"], block: &[("(*", "*)"), ("{", "}")], quotes: "'", dollar_directive: true, ..BASE };
 pub const DASHES: Language = Language { line: &["--"], quotes: "\"", ..BASE };
-pub const FORTRAN: Language = Language { line: &["!"], ..BASE };
+pub const FORTRAN: Language = Language { line: &["!"], sentinel: true, ..BASE };
 pub const NIX: Language = Language { line: &["#"], block: C_BLOCKS, quotes: "\"", ..BASE };
 pub const JULIA: Language = Language { line: &["#"], block: &[("#=", "=#")], nested: true, ..BASE };
 pub const ERB: Language = Language { block: &[("<!--", "-->"), ("<%#", "%>"), ("/*", "*/")], ..BASE };
 pub const JINJA: Language = Language { block: &[("<!--", "-->"), ("{#", "#}"), ("/*", "*/")], ..BASE };
 pub const HANDLEBARS: Language = Language { block: &[("<!--", "-->"), ("{{!--", "--}}"), ("{{!", "}}")], ..BASE };
 pub const RAZOR: Language = Language { block: &[("<!--", "-->"), ("@*", "*@"), ("/*", "*/")], ..BASE };
-pub const PUG: Language = Language { line: &["//"], ..BASE };
+pub const PUG: Language = Language { line: &["//"], indent_block: true, ..BASE };
+pub const LEAN: Language = Language { line: &["--"], block: &[("/-", "-/")], quotes: "\"", nested: true, ..BASE };
+pub const IDRIS: Language = Language { line: &["--", "|||"], block: &[("{-", "-}")], quotes: "\"", nested: true, ..BASE };
+pub const DLANG: Language = Language { line: &["//"], block: &[("/*", "*/"), ("/+", "+/")], nested: true, ..BASE };
+pub const JSONNET: Language = Language { line: &["#", "//"], block: C_BLOCKS, quotes: "\"'", ..BASE };
 
 const TABLE: &[(&str, Language)] = &[
     ("sh", SHELL),
@@ -189,12 +208,12 @@ const TABLE: &[(&str, Language)] = &[
     ("tfvars", HCL),
     ("hcl", HCL),
     ("nomad", HCL),
-    ("thrift", HCL),
-    ("jsonnet", HCL),
-    ("libsonnet", HCL),
-    ("mk", SHELL),
-    ("mak", SHELL),
-    ("make", SHELL),
+    ("thrift", JSONNET),
+    ("jsonnet", JSONNET),
+    ("libsonnet", JSONNET),
+    ("mk", MAKE),
+    ("mak", MAKE),
+    ("make", MAKE),
     ("dockerfile", SHELL),
     ("containerfile", SHELL),
     ("just", SHELL),
@@ -243,9 +262,9 @@ const TABLE: &[(&str, Language)] = &[
     ("vhd", DASHES),
     ("vhdl", DASHES),
     ("purs", HASKELL),
-    ("idr", HASKELL),
+    ("idr", IDRIS),
     ("agda", HASKELL),
-    ("lean", HASKELL),
+    ("lean", LEAN),
     ("dhall", HASKELL),
     ("f90", FORTRAN),
     ("f95", FORTRAN),
@@ -275,7 +294,7 @@ const TABLE: &[(&str, Language)] = &[
     ("v", SLASH),
     ("sv", SLASH),
     ("svh", SLASH),
-    ("d", SLASH),
+    ("d", DLANG),
     ("cu", SLASH),
     ("cuh", SLASH),
     ("cl", SLASH),
@@ -303,9 +322,9 @@ const TABLE: &[(&str, Language)] = &[
 ];
 
 const NAMES: &[(&str, Language)] = &[
-    ("makefile", SHELL),
-    ("gnumakefile", SHELL),
-    ("bsdmakefile", SHELL),
+    ("makefile", MAKE),
+    ("gnumakefile", MAKE),
+    ("bsdmakefile", MAKE),
     ("dockerfile", SHELL),
     ("containerfile", SHELL),
     ("justfile", SHELL),

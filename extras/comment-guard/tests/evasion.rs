@@ -1687,6 +1687,83 @@ fn build_scripting_and_markup_files_are_checked() {
 }
 
 #[test]
+fn a_formatter_run_over_a_folder_does_not_blame_comments_that_were_already_there() {
+    let rig = Rig::new("shape-format");
+    init_repo(&rig.cwd);
+    std::fs::create_dir_all(rig.cwd.join("src")).expect("folder");
+    let file = commit_file(&rig.cwd, "src/a.py", "x = 1\n");
+    let text = "# mine 1\n# mine 2\n# mine 3\n# mine 4\nx = 1\n";
+    std::fs::write(&file, text).expect("write");
+    let out = wrote_four_after(&rig, "f1", "black src", &file, text);
+    assert!(out.is_empty(), "{out}");
+}
+
+#[test]
+fn a_command_that_only_looks_at_another_folder_does_not_report_a_file_saved_there() {
+    let rig = Rig::new("shape-look");
+    let other = temp_dir("shape-look-other");
+    let file = other.join("a.py");
+    let text = "x = 1\n# note 1\n# note 2\n# note 3\n# note 4\n";
+    let out = wrote_four_after(&rig, "l1", &format!("ls {}", other.display()), &file, text);
+    assert!(out.is_empty(), "{out}");
+    let written = other.join("b.py");
+    let more = "y = 1\n# memo 1\n# memo 2\n# memo 3\n# memo 4\n";
+    let out = wrote_four_after(&rig, "l2", &format!("printf x > {}/b.py; ls {}", other.display(), other.display()), &written, more);
+    assert!(out.contains("\"decision\":\"block\""), "{out}");
+    let _ = std::fs::remove_dir_all(&other);
+}
+
+#[test]
+fn a_script_without_an_extension_is_found_by_the_bash_check() {
+    let rig = Rig::new("shape-shebang");
+    let file = rig.cwd.join("tool");
+    let text = "#!/bin/sh\n# note 1\n# note 2\n# note 3\n# note 4\necho hi\n";
+    let out = wrote_four_after(&rig, "s1", &format!("printf x > {}", file.display()), &file, text);
+    assert!(out.contains("\"decision\":\"block\""), "{out}");
+    let notes = rig.cwd.join("notes");
+    let plain = "# note 1\n# note 2\n# note 3\n# note 4\nx\n";
+    let quiet = wrote_four_after(&rig, "s2", &format!("printf x > {}", notes.display()), &notes, plain);
+    assert!(quiet.is_empty(), "{quiet}");
+}
+
+#[test]
+fn comment_forms_of_the_less_common_languages_are_all_seen() {
+    let dir = temp_dir("exotic");
+    let hidden = [
+        ("a.cmake", "#[==[\nnote one\nnote two\nnote three\nnote four\n]==]\nset(A 1)\n"),
+        ("b.cmake", "#[====[\nnote one\nnote two\nnote three\nnote four\n]====]\nset(A 1)\n"),
+        ("a.pug", "//\n  note one\n  note two\n  note three\n  note four\np hi\n"),
+        ("a.lean", "/-\nnote one\nnote two\nnote three\nnote four\n-/\ndef a := 1\n"),
+        ("a.d", "/+\nnote one\nnote two\nnote three\nnote four\n+/\nvoid main() {}\n"),
+        ("a.ml", "(*\n\"*)\nnote one\nnote two\nnote three\nnote four\n\"\n*)\nlet x = 1\n"),
+        ("a.fs", "(*\n\"*)\nnote one\nnote two\nnote three\nnote four\n\"\n*)\nlet x = 1\n"),
+        ("a.ps1", "$a++# note one\n$b++# note two\n$c++# note three\n$d++# note four\n"),
+        ("Makefile", "A:=1# note one\nB:=2# note two\nC:=3# note three\nD:=4# note four\n"),
+        ("a.bat", "echo 1 & rem note one\necho 2 & rem note two\necho 3 & :: note three\necho 4 & REM note four\n"),
+        ("a.idr", "||| note one\n||| note two\n||| note three\n||| note four\n"),
+        ("a.f90", "! note one\n! note two\n! note three\n! note four\nend\n"),
+        ("a.pas", "{ note one }\n{ note two }\n{ note three }\n{ note four }\nbegin end.\n"),
+    ];
+    for (name, text) in hidden {
+        let path = dir.join(name);
+        assert!(denied(&write_file(None, None, &path, text)), "{name} hid its comments");
+    }
+    let plain = [
+        ("a.f90", "!$OMP PARALLEL\n!$OMP DO\n!$OMP END DO\n!$OMP END PARALLEL\nend\n"),
+        ("a.erl", "a() -> '100% one'.\nb() -> '100% two'.\nc() -> '100% three'.\nd() -> '100% four'.\n"),
+        ("a.jsonnet", "local a = '# note one';\nlocal b = '# note two';\nlocal c = '# note three';\nlocal d = '# note four';\n"),
+        ("a.pas", "{$MODE OBJFPC}\n{$H+}\n{$IFDEF UNIX}\n{$ENDIF}\nbegin end.\n"),
+        ("a.pug", "p one\np two\n  span three\np four\n"),
+        ("a.ml", "let a = \"(* one *)\"\nlet b = \"(* two *)\"\nlet c = \"(* three *)\"\n"),
+    ];
+    for (name, text) in plain {
+        let path = dir.join(name);
+        assert!(!denied(&write_file(None, None, &path, text)), "{name} was refused");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_script_without_an_extension_is_judged_by_its_first_line() {
     let dir = temp_dir("shebang");
     let four = "# note 1\n# note 2\n# note 3\n# note 4\n";
@@ -1814,6 +1891,10 @@ fn a_notebook_edit_is_judged_by_the_code_it_leaves() {
     assert!(!denied(&notebook_edit(None, None, &path, two)));
     let replaced = json!({ "new_source": four, "cell_id": "c0" });
     assert!(denied(&notebook_edit(None, None, &path, replaced)));
+    let numbered = json!({ "new_source": four, "cell_id": "cell-0" });
+    assert!(denied(&notebook_edit(None, None, &path, numbered)));
+    let unknown = json!({ "new_source": four, "cell_id": "missing-0" });
+    assert!(!denied(&notebook_edit(None, None, &path, unknown)));
     let prose = json!({ "new_source": "# a\n# b\n# c\n# d", "cell_type": "markdown", "edit_mode": "insert" });
     assert!(!denied(&notebook_edit(None, None, &path, prose)));
     let removed = json!({ "edit_mode": "delete", "cell_id": "c0" });
