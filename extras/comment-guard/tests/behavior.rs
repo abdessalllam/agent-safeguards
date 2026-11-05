@@ -533,6 +533,7 @@ fn feed(arguments: &[&str], input: &[u8]) -> std::process::Output {
     let mut child = Command::new(binary())
         .args(arguments)
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
+        .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -697,6 +698,7 @@ fn switch_env_var_turns_the_guard_on() {
     let output = Command::new(binary())
         .arg("check")
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "YeS")
+        .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "0")
         .env("XDG_CONFIG_HOME", &dir)
         .output();
     let _ = std::fs::remove_dir_all(&dir);

@@ -22,6 +22,7 @@ pub struct Language {
     pub sentinel: bool,
     pub long_bracket: Option<&'static str>,
     pub escape: char,
+    pub markup: bool,
 }
 
 const C_BLOCKS: &[(&str, &str)] = &[("/*", "*/")];
@@ -51,6 +52,7 @@ const BASE: Language = Language {
     sentinel: false,
     long_bracket: None,
     escape: '\\',
+    markup: false,
 };
 
 pub const HASH: Language = Language { line: &["#"], ..BASE };
@@ -96,12 +98,13 @@ pub const HASKELL: Language = Language {
 };
 
 const HTML_BLOCKS: &[(&str, &str)] = &[("<!--", "-->"), ("/*", "*/")];
-pub const HTML: Language = Language { line: &["//"], block: HTML_BLOCKS, ..BASE };
+pub const HTML: Language = Language { line: &["//"], block: HTML_BLOCKS, markup: true, ..BASE };
 pub const COMPONENT: Language = Language {
     line: &["//"],
     block: HTML_BLOCKS,
     backtick: true,
     regex: true,
+    markup: true,
     ..BASE
 };
 pub const CSS: Language = Language { block: &[("/*", "*/")], ..BASE };
@@ -125,11 +128,12 @@ pub const DASHES: Language = Language { line: &["--"], quotes: "\"", ..BASE };
 pub const FORTRAN: Language = Language { line: &["!"], sentinel: true, ..BASE };
 pub const NIX: Language = Language { line: &["#"], block: C_BLOCKS, quotes: "\"", ..BASE };
 pub const JULIA: Language = Language { line: &["#"], block: &[("#=", "=#")], nested: true, ..BASE };
-pub const ERB: Language = Language { block: &[("<!--", "-->"), ("<%#", "%>"), ("/*", "*/")], ..BASE };
-pub const JINJA: Language = Language { block: &[("<!--", "-->"), ("{#", "#}"), ("/*", "*/")], ..BASE };
-pub const HANDLEBARS: Language = Language { block: &[("<!--", "-->"), ("{{!--", "--}}"), ("{{!", "}}")], ..BASE };
-pub const RAZOR: Language = Language { block: &[("<!--", "-->"), ("@*", "*@"), ("/*", "*/")], ..BASE };
-pub const PUG: Language = Language { line: &["//"], indent_block: true, ..BASE };
+pub const ERB: Language = Language { block: &[("<!--", "-->"), ("<%#", "%>"), ("/*", "*/")], markup: true, ..BASE };
+pub const JINJA: Language = Language { block: &[("<!--", "-->"), ("{#", "#}"), ("/*", "*/")], markup: true, ..BASE };
+pub const HANDLEBARS: Language =
+    Language { block: &[("<!--", "-->"), ("{{!--", "--}}"), ("{{!", "}}")], markup: true, ..BASE };
+pub const RAZOR: Language = Language { block: &[("<!--", "-->"), ("@*", "*@"), ("/*", "*/")], markup: true, ..BASE };
+pub const PUG: Language = Language { line: &["//"], indent_block: true, markup: true, ..BASE };
 pub const LEAN: Language = Language { line: &["--"], block: &[("/-", "-/")], quotes: "\"", nested: true, ..BASE };
 pub const IDRIS: Language = Language { line: &["--", "|||"], block: &[("{-", "-}")], quotes: "\"", nested: true, ..BASE };
 pub const DLANG: Language = Language { line: &["//"], block: &[("/*", "*/"), ("/+", "+/")], nested: true, ..BASE };

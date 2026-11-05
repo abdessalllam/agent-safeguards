@@ -470,6 +470,9 @@ pub struct Scan<'a> {
     lang: Language,
     state: State,
     extra: std::collections::VecDeque<&'a str>,
+    consumed: usize,
+    standalone: bool,
+    uncertain: bool,
 }
 
 pub fn scan(text: &str, lang: Language) -> Scan<'_> {
@@ -479,6 +482,9 @@ pub fn scan(text: &str, lang: Language) -> Scan<'_> {
         lang,
         state: State::Code,
         extra: std::collections::VecDeque::new(),
+        consumed: 0,
+        standalone: false,
+        uncertain: false,
     }
 }
 
@@ -488,12 +494,15 @@ impl<'a> Iterator for Scan<'a> {
     fn next(&mut self) -> Option<LineKind<'a>> {
         loop {
             if let Some(text) = self.extra.pop_front() {
+                self.standalone = false;
                 if is_exempt(body(text)) || (self.lang.sentinel && is_sentinel(text)) {
                     continue;
                 }
                 return Some(LineKind::Also(text));
             }
             let line = self.lines.next()?;
+            self.consumed = self.consumed.saturating_add(1);
+            self.standalone = false;
             return Some(match self.classify(line) {
                 LineKind::Comment(text) if is_exempt(body(text)) || (self.lang.sentinel && is_sentinel(text)) => {
                     LineKind::Other
@@ -505,6 +514,18 @@ impl<'a> Iterator for Scan<'a> {
 }
 
 impl<'a> Scan<'a> {
+    pub fn line_index(&self) -> usize {
+        self.consumed.saturating_sub(1)
+    }
+
+    pub fn standalone(&self) -> bool {
+        self.standalone
+    }
+
+    pub fn uncertain(&self) -> bool {
+        self.uncertain
+    }
+
     fn classify(&mut self, line: &'a str) -> LineKind<'a> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -620,11 +641,14 @@ impl<'a> Scan<'a> {
                     return Some(LineKind::Comment(trimmed));
                 }
                 let upto = open.len().saturating_add(end);
+                let special = (open == "/*" && rest.starts_with(['+', '!'])) || (open == "<!--" && rest.starts_with(['[', '#']));
+                self.standalone = !special && trimmed.get(upto..).is_some_and(|tail| tail.trim().is_empty());
                 self.trailing_after(trimmed.get(upto..), close);
                 return Some(LineKind::Comment(trimmed.get(..upto).unwrap_or(trimmed)));
             }
         }
         if lang.rem && is_remark(trimmed) {
+            self.standalone = !lang.indent_block;
             return Some(LineKind::Comment(trimmed));
         }
         for &marker in lang.line {
@@ -637,6 +661,7 @@ impl<'a> Scan<'a> {
                 if lang.indent_block {
                     self.state = State::Indent(line.len().saturating_sub(line.trim_start().len()));
                 }
+                self.standalone = !lang.markup && !lang.indent_block && !trimmed.ends_with('\\');
                 return Some(LineKind::Comment(trimmed));
             }
         }
@@ -744,7 +769,10 @@ impl<'a> Scan<'a> {
             if lang.quotes.contains(first) {
                 match string_length(rest, first, lang.escape) {
                     Some(length) => at = at.saturating_add(length),
-                    None => return,
+                    None => {
+                        self.uncertain = true;
+                        return;
+                    }
                 }
                 previous = Some(first as u8);
                 significant = previous;

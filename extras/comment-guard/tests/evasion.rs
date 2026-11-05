@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
 
-use comment_guard::{judge_in, Provider, Verdict};
+use comment_guard::{judge_in, judge_trimming_in, Provider, Verdict};
 
 fn temp_dir(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -276,6 +276,7 @@ impl Rig {
         command
             .args(["hook", host, event])
             .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
+            .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "0")
             .env("XDG_STATE_HOME", &self.state)
             .env("HOME", &self.home);
         if let Some(folder) = path {
@@ -1421,6 +1422,7 @@ fn the_post_command_hook_accepts_the_codex_form_too() {
     let output = Command::new(binary())
         .args(["hook", "codex", "PostToolUse"])
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
+        .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "0")
         .env("XDG_STATE_HOME", &rig.state)
         .env("HOME", &rig.home)
         .stdin(Stdio::null())
@@ -1928,6 +1930,156 @@ fn a_notebook_written_or_edited_as_a_file_is_judged_by_its_code_cells() {
     let new = "\"source\":\"# note 1\\n# note 2\\n# note 3\\n# note 4\\ny = 2\"";
     assert!(denied(&edit_file(None, None, &path, old, new)));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn trimming(state: Option<&Path>, session: Option<&str>, tool: &str, input: Value, provider: Provider) -> Verdict {
+    let mut payload = json!({ "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": input });
+    if let (Some(id), Some(map)) = (session, payload.as_object_mut()) {
+        map.insert("session_id".to_owned(), json!(id));
+    }
+    judge_trimming_in(&payload.to_string(), provider, state)
+}
+
+fn cut(verdict: Verdict) -> (Value, String) {
+    match verdict {
+        Verdict::Trimmed { input, note } => (input, note),
+        Verdict::Allow => panic!("allowed unchanged"),
+        Verdict::Deny(reason) => panic!("denied: {reason}"),
+        Verdict::BadInput => panic!("bad input"),
+    }
+}
+
+fn written(path: &Path, content: &str) -> Value {
+    json!({ "file_path": path.to_string_lossy(), "content": content })
+}
+
+#[test]
+fn a_write_with_too_many_comments_is_written_without_the_extra_ones() {
+    let dir = temp_dir("trim-write");
+    let path = dir.join("a.py");
+    let text = "# a1\n# a2\n# a3\n# a4\n# a5\nx = 1\ny = 2\n";
+    let (input, note) = cut(trimming(None, None, "Write", written(&path, text), Provider::Claude));
+    assert_eq!(input["content"], "# a1\n# a2\nx = 1\ny = 2\n");
+    assert_eq!(input["file_path"], path.to_string_lossy().as_ref());
+    assert!(note.contains("3 new comment line(s)") && note.contains("# a3") && note.contains("# a5"), "{note}");
+    let apart = "# a1\nx = 1\n# a2\ny = 2\n# a3\nz = 3\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&path, apart), Provider::Claude));
+    assert_eq!(input["content"], "# a1\nx = 1\ny = 2\nz = 3\n");
+    let noisy = "# added on 2024-01-01 for the cache\n# ok one\n# ok two\n# ok three\nx = 1\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&path, noisy), Provider::Claude));
+    assert_eq!(input["content"], "# ok one\n# ok two\nx = 1\n");
+    let allowed = "# a1\n# a2\nx = 1\n";
+    assert!(matches!(trimming(None, None, "Write", written(&path, allowed), Provider::Claude), Verdict::Allow));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_edit_with_too_many_comments_is_trimmed_inside_its_replacement() {
+    let dir = temp_dir("trim-edit");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "x = 1\ny = 2\nz = 3\n").expect("write");
+    let at_end = json!({ "file_path": path.to_string_lossy(), "old_string": "y = 2", "new_string": "y = 2\n# n1\n# n2\n# n3\n# n4" });
+    let (input, _) = cut(trimming(None, None, "Edit", at_end, Provider::Claude));
+    assert_eq!(input["new_string"], "y = 2\n# n1\n# n2");
+    let at_start = json!({ "file_path": path.to_string_lossy(), "old_string": "x = 1", "new_string": "# n1\n# n2\n# n3\n# n4\nx = 2" });
+    let (input, _) = cut(trimming(None, None, "Edit", at_start, Provider::Claude));
+    assert_eq!(input["new_string"], "# n1\n# n2\nx = 2");
+    let middle = json!({ "file_path": path.to_string_lossy(), "old_string": "y = 2\n", "new_string": "# n1\ny = 3\n# n2\n# n3\n" });
+    let (input, _) = cut(trimming(None, None, "Edit", middle, Provider::Claude));
+    assert_eq!(input["new_string"], "# n1\ny = 3\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn comments_that_cannot_be_cut_safely_are_still_refused() {
+    let dir = temp_dir("trim-refuse");
+    let refuse = |name: &str, text: &str| {
+        let verdict = trimming(None, None, "Write", written(&dir.join(name), text), Provider::Claude);
+        assert!(matches!(verdict, Verdict::Deny(_)), "{name} was trimmed or allowed");
+    };
+    refuse("a.py", "def f():\n    \"\"\"\n    one\n    two\n    three\n    four\n    \"\"\"\n    return 1\n");
+    refuse("b.py", "a = 1  # one\nb = 2  # two\nc = 3  # three\nd = 4  # four\n");
+    refuse("c.c", "/*\none\ntwo\nthree\nfour\n*/\nint a;\n");
+    refuse("d.html", "// one\n// two\n// three\n// four\n<p>hi</p>\n");
+    refuse("e.sh", "cat <<EOF\n# one\n# two\n# three\n# four\nEOF\n");
+    refuse("f.rs", "let s = r#\"\n// one\n// two\n// three\n// four\n\"#;\n");
+    refuse("g.sh", "echo 'a\n# one\n# two\n# three\n# four\n'\n");
+    refuse("h.c", "// one \\\n// two\n// three\n// four\nint a;\n");
+    refuse("i.py", "x = 1  # a\ny = 2  # b\nz = 3  # c\n# one\n# two\n# three\n# four\n");
+    refuse("j.go", "// #include <stdio.h>\n// one\n// two\n// three\nimport \"C\"\n");
+    refuse("k.pug", "//\n  one\n  two\n  three\n  four\np hi\n");
+    refuse("l.sql", "/*+ one */\n/*+ two */\n/*+ three */\n/*+ four */\nselect 1;\n");
+    refuse("m.html", "<!--[if IE]>\n<!--[if gt IE 8]>\n<!--[if lt IE 7]>\n<!--[if IE 9]>\n<p>hi</p>\n");
+    let css = "/* one */\n/* two */\n/* three */\n/* four */\na { b: c }\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("n.css"), css), Provider::Claude));
+    assert_eq!(input["content"], "/* one */\n/* two */\na { b: c }\n");
+    let html = "<!-- one -->\n<!-- two -->\n<!-- three -->\n<p>hi</p>\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("o.html"), html), Provider::Claude));
+    assert_eq!(input["content"], "<!-- one -->\n<!-- two -->\n<p>hi</p>\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_codex_patch_and_a_partial_edit_are_refused_not_trimmed() {
+    let dir = temp_dir("trim-other");
+    let patch = format!("*** Begin Patch\n*** Add File: {}\n+x = 1\n+# a\n+# b\n+# c\n+# d\n*** End Patch\n", dir.join("p.py").display());
+    let verdict = trimming(None, None, "apply_patch", json!({ "command": patch }), Provider::Codex);
+    assert!(matches!(verdict, Verdict::Deny(_)));
+    let all = dir.join("a.py");
+    std::fs::write(&all, "x = 1\nx = 1\n").expect("write");
+    let every = json!({ "file_path": all.to_string_lossy(), "old_string": "x = 1", "new_string": "x = 1\n# a\n# b\n# c\n# d", "replace_all": true });
+    assert!(matches!(trimming(None, None, "Edit", every, Provider::Claude), Verdict::Deny(_)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn what_a_trimmed_call_keeps_counts_against_the_session_allowance() {
+    let dir = temp_dir("trim-session");
+    let state = temp_dir("trim-session-state");
+    let path = dir.join("a.py");
+    let (input, _) = cut(trimming(Some(&state), Some("ts"), "Write", written(&path, "# a1\n# a2\n# a3\n# a4\nx = 1\ny = 2\n"), Provider::Claude));
+    let content = input["content"].as_str().expect("content").to_owned();
+    assert_eq!(content, "# a1\n# a2\nx = 1\ny = 2\n");
+    std::fs::write(&path, &content).expect("write");
+    let again = json!({ "file_path": path.to_string_lossy(), "old_string": "y = 2", "new_string": "y = 2\n# b1\n# b2" });
+    let (input, _) = cut(trimming(Some(&state), Some("ts"), "Edit", again, Provider::Claude));
+    assert_eq!(input["new_string"], "y = 2");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn the_installed_hook_answers_with_an_allow_that_carries_the_trimmed_input() {
+    let rig = Rig::new("trim-hook");
+    let file = rig.cwd.join("a.py");
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "th",
+        "cwd": rig.cwd.to_string_lossy(),
+        "tool_name": "Write",
+        "tool_input": { "file_path": file.to_string_lossy(), "content": "# a1\n# a2\n# a3\n# a4\nx = 1\n" },
+    });
+    let run = |trim: &str| {
+        let mut command = Command::new(binary());
+        command
+            .args(["hook", "claude", "PreToolUse"])
+            .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
+            .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", trim)
+            .env("XDG_STATE_HOME", &rig.state)
+            .env("HOME", &rig.home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut child = command.spawn().expect("start");
+        let _ = child.stdin.take().expect("stdin").write_all(payload.to_string().as_bytes());
+        String::from_utf8_lossy(&child.wait_with_output().expect("wait").stdout).into_owned()
+    };
+    let out: Value = serde_json::from_str(run("1").trim()).expect("json");
+    let inner = &out["hookSpecificOutput"];
+    assert_eq!(inner["permissionDecision"], "allow");
+    assert_eq!(inner["updatedInput"]["content"], "# a1\n# a2\nx = 1\n");
+    assert!(inner["additionalContext"].as_str().is_some_and(|text| text.contains("# a3")));
+    let refused: Value = serde_json::from_str(run("0").trim()).expect("json");
+    assert_eq!(refused["hookSpecificOutput"]["permissionDecision"], "deny");
 }
 
 #[test]

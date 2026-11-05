@@ -20,6 +20,7 @@ const HISTORY_PHRASES: [&str; 8] = [
     "as requested",
 ];
 
+#[derive(Clone)]
 pub struct Change {
     pub file: String,
     pub old: String,
@@ -234,6 +235,98 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
         too_long: fresh_long > removed_long,
         marker,
     }
+}
+
+pub struct Trimmed {
+    pub text: String,
+    pub dropped: Vec<usize>,
+    pub removed: Vec<String>,
+}
+
+const RISKY: [&str; 6] = ["<<", "R\"", "@\"", "import \"C\"", "\n__END__", "__DATA__"];
+
+fn risky(text: &str, lang: Language) -> bool {
+    RISKY.iter().any(|mark| text.contains(mark))
+        || text.contains("\\\n")
+        || (lang.lifetimes && (text.contains("r#\"") || text.contains("r\"")))
+        || (lang.long_bracket == Some("--") && text.contains("[["))
+        || (!lang.column_zero.is_empty() && (text.contains("%q") || text.contains("%Q")))
+}
+
+pub fn trimmed(change: &Change) -> Option<Trimmed> {
+    if change.partial {
+        return None;
+    }
+    let lang = language_for_text(&change.file, &change.new)?;
+    if risky(&change.new, lang) {
+        return None;
+    }
+    let mut pool: HashMap<&str, usize> = HashMap::new();
+    match &change.baseline {
+        Some(lines) => {
+            for line in lines {
+                *pool.entry(line.as_str()).or_insert(0) += 1;
+            }
+        }
+        None => {
+            for kind in scan(&change.old, lang) {
+                if let LineKind::Comment(line) | LineKind::Also(line) = kind {
+                    *pool.entry(line).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let mut scanner = scan(&change.new, lang);
+    let mut fresh: Vec<(usize, &str)> = Vec::new();
+    while let Some(kind) = scanner.next() {
+        let (line, same_line) = match kind {
+            LineKind::Comment(line) => (line, false),
+            LineKind::Also(line) => (line, true),
+            LineKind::Other => continue,
+        };
+        let kept = match pool.get_mut(line) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                true
+            }
+            _ => false,
+        };
+        if !kept && !same_line && scanner.standalone() {
+            fresh.push((scanner.line_index(), line));
+        }
+    }
+    if scanner.uncertain() || fresh.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = change.new.split('\n').collect();
+    for keep in [MAX_LINES, 1, 0] {
+        let mut kept = 0usize;
+        let mut dropped: Vec<usize> = Vec::new();
+        for (index, line) in &fresh {
+            let fine = history_marker(body(line)).is_none() && line.chars().count() <= MAX_LINE_CHARS;
+            if kept < keep && fine {
+                kept = kept.saturating_add(1);
+            } else {
+                dropped.push(*index);
+            }
+        }
+        if dropped.is_empty() {
+            continue;
+        }
+        let text = lines
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !dropped.contains(index))
+            .map(|(_, line)| *line)
+            .collect::<Vec<&str>>()
+            .join("\n");
+        let trial = Change { new: text.clone(), ..change.clone() };
+        if evaluate(std::slice::from_ref(&trial)).is_none() {
+            let removed = dropped.iter().filter_map(|index| lines.get(*index)).map(|line| line.trim().to_owned()).collect();
+            return Some(Trimmed { text, dropped, removed });
+        }
+    }
+    None
 }
 
 pub fn net_lines(change: &Change) -> usize {

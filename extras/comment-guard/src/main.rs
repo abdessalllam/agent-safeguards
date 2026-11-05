@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use serde_json::Value;
 
 use comment_guard::locale::message;
-use comment_guard::{judge, judge_after, Provider, Verdict, MAX_INPUT};
+use comment_guard::{judge, judge_after, judge_trimming, Provider, Verdict, MAX_INPUT};
 
 fn main() -> ExitCode {
     std::panic::set_hook(Box::new(|_| {}));
@@ -77,6 +77,16 @@ fn switch_file() -> Option<PathBuf> {
     Some(config.join("agent-safeguards").join("comment-guard"))
 }
 
+fn trimming_enabled() -> bool {
+    if let Ok(value) = std::env::var("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM") {
+        let value = value.trim();
+        if value == "0" || ["false", "no", "off", "refuse"].iter().any(|word| value.eq_ignore_ascii_case(word)) {
+            return false;
+        }
+    }
+    !switch_file().is_some_and(|path| path.with_file_name("comment-guard-refuse").exists())
+}
+
 fn guard_enabled() -> bool {
     if let Ok(value) = std::env::var("AGENT_SAFEGUARDS_COMMENT_GUARD") {
         let value = value.trim();
@@ -110,6 +120,8 @@ fn hook(provider: Provider, event: Option<&str>) -> ExitCode {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if after {
             judge_after(&input)
+        } else if trimming_enabled() {
+            judge_trimming(&input, provider)
         } else {
             judge(&input, provider)
         }
@@ -118,6 +130,10 @@ fn hook(provider: Provider, event: Option<&str>) -> ExitCode {
         Ok(Verdict::Allow) => ExitCode::SUCCESS,
         Ok(Verdict::BadInput) => {
             complain(&message("comment_guard.error.input", &[]));
+            ExitCode::SUCCESS
+        }
+        Ok(Verdict::Trimmed { input, note }) => {
+            print_trimmed(&input, &note);
             ExitCode::SUCCESS
         }
         Ok(Verdict::Deny(reason)) => {
@@ -139,6 +155,20 @@ fn print_block(reason: &str) {
     let mut outer = serde_json::Map::new();
     outer.insert("decision".to_owned(), Value::String("block".to_owned()));
     outer.insert("reason".to_owned(), Value::String(reason.to_owned()));
+    if let Ok(text) = serde_json::to_string(&Value::Object(outer)) {
+        say(&text);
+    }
+}
+
+fn print_trimmed(input: &Value, note: &str) {
+    let mut inner = serde_json::Map::new();
+    inner.insert("hookEventName".to_owned(), Value::String("PreToolUse".to_owned()));
+    inner.insert("permissionDecision".to_owned(), Value::String("allow".to_owned()));
+    inner.insert("permissionDecisionReason".to_owned(), Value::String(note.to_owned()));
+    inner.insert("updatedInput".to_owned(), input.clone());
+    inner.insert("additionalContext".to_owned(), Value::String(note.to_owned()));
+    let mut outer = serde_json::Map::new();
+    outer.insert("hookSpecificOutput".to_owned(), Value::Object(inner));
     if let Ok(text) = serde_json::to_string(&Value::Object(outer)) {
         say(&text);
     }

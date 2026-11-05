@@ -19,6 +19,7 @@ pub use decision::{evaluate, Change};
 
 use decision::comment_lines;
 use languages::{language_for, language_for_text, Language};
+use locale::message;
 use session::Ledger;
 
 pub const MAX_INPUT: usize = 8 * 1024 * 1024;
@@ -32,6 +33,7 @@ pub enum Provider {
 pub enum Verdict {
     Allow,
     Deny(String),
+    Trimmed { input: Value, note: String },
     BadInput,
 }
 
@@ -181,10 +183,116 @@ pub fn judge(input: &str, provider: Provider) -> Verdict {
     judge_in(input, provider, session::state_dir().as_deref())
 }
 
+pub fn judge_trimming(input: &str, provider: Provider) -> Verdict {
+    judge_trimming_in(input, provider, session::state_dir().as_deref())
+}
+
+pub fn judge_trimming_in(input: &str, provider: Provider, state: Option<&Path>) -> Verdict {
+    let Some(payload) = parse(input) else {
+        return Verdict::BadInput;
+    };
+    judge_payload(&payload, provider, state, true)
+}
+
 pub fn judge_in(input: &str, provider: Provider, state: Option<&Path>) -> Verdict {
     let Some(payload) = parse(input) else {
         return Verdict::BadInput;
     };
+    judge_payload(&payload, provider, state, false)
+}
+
+fn trimmed_note(file: &str, removed: &[String]) -> String {
+    let shown: Vec<String> = removed.iter().take(6).map(|line| line.chars().take(70).collect()).collect();
+    let mut lines = shown.join(" | ");
+    if removed.len() > shown.len() {
+        lines.push_str(" ...");
+    }
+    let count = removed.len().to_string();
+    message("comment_guard.trimmed", &[("count", count.as_str()), ("file", file), ("lines", lines.as_str())])
+}
+
+fn edit_region(input: &Map<String, Value>, change: &Change, cut: &decision::Trimmed) -> Option<String> {
+    if input.get("replace_all").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let old_string = input.get("old_string")?.as_str()?;
+    let new_string = input.get("new_string")?.as_str()?;
+    let start = change.old.find(old_string)?;
+    let end = start.checked_add(new_string.len())?;
+    if change.new.get(start..end) != Some(new_string) {
+        return None;
+    }
+    let total = change.new.len();
+    let count = change.new.split('\n').count();
+    let mut inside = 0usize;
+    let mut offset = 0usize;
+    for (index, line) in change.new.split('\n').enumerate() {
+        let from = offset;
+        let to = from.saturating_add(line.len()).saturating_add(1).min(total);
+        offset = from.saturating_add(line.len()).saturating_add(1);
+        if !cut.dropped.contains(&index) {
+            continue;
+        }
+        let last = index.saturating_add(1) == count;
+        let (a, b) = if last && from > 0 { (from.saturating_sub(1), to) } else { (from, to) };
+        if a >= start && b <= end {
+            inside = inside.saturating_add(b.saturating_sub(a));
+        } else if !last && to == end.saturating_add(1) && from > start {
+            inside = inside.saturating_add(to.saturating_sub(from));
+        } else {
+            return None;
+        }
+    }
+    cut.text.get(start..end.checked_sub(inside)?).map(str::to_owned)
+}
+
+fn rewritten_input(tool: &str, input: &Map<String, Value>, change: &Change, cut: &decision::Trimmed) -> Option<Map<String, Value>> {
+    let mut out = input.clone();
+    match tool {
+        "Write" => {
+            out.insert("content".to_owned(), Value::String(cut.text.clone()));
+        }
+        "Edit" => {
+            out.insert("new_string".to_owned(), Value::String(edit_region(input, change, cut)?));
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+fn try_trim(
+    payload: &Map<String, Value>,
+    tool: &str,
+    input: &Map<String, Value>,
+    changes: &[Change],
+    base: &Path,
+    state: Option<&Path>,
+) -> Option<Verdict> {
+    let [change] = changes else {
+        return None;
+    };
+    let cut = decision::trimmed(change)?;
+    let new_input = rewritten_input(tool, input, change, &cut)?;
+    let after = collect(tool, &new_input, Provider::Claude, base);
+    let [rewritten] = after.as_slice() else {
+        return None;
+    };
+    if rewritten.new != cut.text {
+        return None;
+    }
+    let mut again = payload.clone();
+    again.insert("tool_input".to_owned(), Value::Object(new_input.clone()));
+    if !matches!(judge_payload(&again, Provider::Claude, state, false), Verdict::Allow) {
+        return None;
+    }
+    Some(Verdict::Trimmed {
+        input: Value::Object(new_input),
+        note: trimmed_note(&change.file, &cut.removed),
+    })
+}
+
+fn judge_payload(payload: &Map<String, Value>, provider: Provider, state: Option<&Path>, trim: bool) -> Verdict {
+    let payload = payload.clone();
     if !event_is(&payload, "PreToolUse") {
         return Verdict::Allow;
     }
@@ -216,7 +324,14 @@ pub fn judge_in(input: &str, provider: Provider, state: Option<&Path>) -> Verdic
         }
     }
     match verdict {
-        Some(reason) => Verdict::Deny(reason),
+        Some(reason) => {
+            if trim && provider == Provider::Claude {
+                if let Some(trimmed) = try_trim(&payload, tool, tool_input, &changes, &base, state) {
+                    return trimmed;
+                }
+            }
+            Verdict::Deny(reason)
+        }
         None => Verdict::Allow,
     }
 }
