@@ -3,9 +3,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::changes::MAX_OLD_FILE;
+use crate::changes::{resolve, MAX_OLD_FILE};
+use crate::decision::Change;
 
 const GIT_TIME: Duration = Duration::from_millis(1000);
+const MAX_ATTRIBUTE_CALLS: usize = 50;
 
 pub struct Ran {
     pub success: bool,
@@ -65,6 +67,10 @@ pub fn run_git(dir: &Path, args: &[&str], deadline: Instant) -> Option<Ran> {
     })
 }
 
+pub fn inside_repository(dir: &Path) -> bool {
+    dir.ancestors().any(|folder| folder.join(".git").exists())
+}
+
 fn is_marked(raw: &[u8]) -> bool {
     let parts: Vec<&[u8]> = raw.split(|byte| *byte == 0).collect();
     parts.chunks(3).any(|chunk| match chunk {
@@ -78,12 +84,18 @@ fn is_marked(raw: &[u8]) -> bool {
 }
 
 pub fn marked_upstream(path: &Path, deadline: Instant) -> bool {
+    let Ok(path) = std::path::absolute(path) else {
+        return false;
+    };
     let Some(name) = path.to_str() else {
         return false;
     };
     let Some(dir) = path.ancestors().skip(1).find(|folder| folder.is_dir()) else {
         return false;
     };
+    if !inside_repository(dir) {
+        return false;
+    }
     let args = [
         "check-attr",
         "-z",
@@ -97,6 +109,18 @@ pub fn marked_upstream(path: &Path, deadline: Instant) -> bool {
         Some(ran) if ran.success => is_marked(&ran.stdout),
         _ => false,
     }
+}
+
+pub fn drop_marked(changes: &mut Vec<Change>, base: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut calls = 0usize;
+    changes.retain(|change| {
+        if calls >= MAX_ATTRIBUTE_CALLS || Instant::now() >= deadline {
+            return true;
+        }
+        calls = calls.saturating_add(1);
+        !marked_upstream(&resolve(base, &change.file), deadline)
+    });
 }
 
 #[cfg(test)]

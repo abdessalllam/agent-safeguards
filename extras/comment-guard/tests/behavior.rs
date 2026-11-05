@@ -203,7 +203,8 @@ fn write_into_an_existing_file_compares_with_its_content() {
     std::fs::write(&path, "# a\n# b\n# c\n").ok();
     let text = "# a\n# b\n# c\n";
     assert!(!denied(&write(&path.to_string_lossy(), text)));
-    assert!(denied(&write(&path.to_string_lossy(), "# x\n# y\n# z\n")));
+    assert!(!denied(&write(&path.to_string_lossy(), "# x\n# y\n# z\n")));
+    assert!(denied(&write(&path.to_string_lossy(), "# x\n# y\n# z\n# w\n# v\n# u\n")));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

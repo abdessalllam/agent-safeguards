@@ -122,6 +122,10 @@ fn evaluate_detail(changes: &[Change]) -> Option<String> {
         }
         let mut running = false;
         let mut counted = false;
+        let mut fresh_lines = 0usize;
+        let mut fresh_blocks = 0usize;
+        let mut fresh_long = 0usize;
+        let mut fresh_markers: Vec<&str> = Vec::new();
         for kind in scan(&change.new, lang) {
             let (line, same_line) = match kind {
                 LineKind::Comment(line) => (line, false),
@@ -150,17 +154,50 @@ fn evaluate_detail(changes: &[Change]) -> Option<String> {
             }
             if !counted {
                 if !running {
-                    slot.blocks = slot.blocks.saturating_add(1);
+                    fresh_blocks = fresh_blocks.saturating_add(1);
                     running = true;
                 }
-                slot.lines = slot.lines.saturating_add(1);
+                fresh_lines = fresh_lines.saturating_add(1);
                 counted = true;
             }
             if line.chars().count() > MAX_LINE_CHARS {
-                slot.too_long = true;
+                fresh_long = fresh_long.saturating_add(1);
             }
-            if slot.marker.is_none() {
-                slot.marker = history_marker(body(line));
+            if let Some(marker) = history_marker(body(line)) {
+                fresh_markers.push(marker);
+            }
+        }
+        let mut removed_total = 0usize;
+        let mut removed_long = 0usize;
+        let mut removed_markers: HashMap<String, usize> = HashMap::new();
+        for (line, count) in &pool {
+            if *count == 0 {
+                continue;
+            }
+            removed_total = removed_total.saturating_add(*count);
+            if line.chars().count() > MAX_LINE_CHARS {
+                removed_long = removed_long.saturating_add(*count);
+            }
+            if let Some(marker) = history_marker(body(line)) {
+                let entry = removed_markers.entry(marker.to_ascii_lowercase()).or_insert(0);
+                *entry = entry.saturating_add(*count);
+            }
+        }
+        let net_lines = fresh_lines.saturating_sub(removed_total);
+        slot.lines = slot.lines.saturating_add(net_lines);
+        slot.blocks = slot.blocks.saturating_add(fresh_blocks.min(net_lines));
+        if fresh_long > removed_long {
+            slot.too_long = true;
+        }
+        if slot.marker.is_none() {
+            for marker in fresh_markers {
+                match removed_markers.get_mut(&marker.to_ascii_lowercase()) {
+                    Some(count) if *count > 0 => *count -= 1,
+                    _ => {
+                        slot.marker = Some(marker);
+                        break;
+                    }
+                }
             }
         }
     }

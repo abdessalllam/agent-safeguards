@@ -131,6 +131,44 @@ fn char_literal_length(rest: &str) -> Option<usize> {
     None
 }
 
+fn regex_allowed(significant: Option<u8>) -> bool {
+    match significant {
+        None => true,
+        Some(byte) => b"(,=:[!&|?{;+-*%>~^".contains(&byte),
+    }
+}
+
+fn regex_length(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    if matches!(bytes.get(1), None | Some(b'/') | Some(b'*')) {
+        return None;
+    }
+    let mut at = 1usize;
+    let mut in_class = false;
+    while let Some(byte) = bytes.get(at) {
+        match *byte {
+            b'\\' => at = at.saturating_add(2),
+            b'[' => {
+                in_class = true;
+                at = at.saturating_add(1);
+            }
+            b']' => {
+                in_class = false;
+                at = at.saturating_add(1);
+            }
+            b'/' if !in_class => {
+                let mut end = at.saturating_add(1);
+                while bytes.get(end).is_some_and(|flag| flag.is_ascii_alphabetic()) {
+                    end = end.saturating_add(1);
+                }
+                return Some(end);
+            }
+            _ => at = at.saturating_add(1),
+        }
+    }
+    None
+}
+
 fn block_scan(text: &str, open: &str, close: &str, nested: bool, start: u32) -> (u32, usize) {
     let mut depth = start;
     let mut at = 0usize;
@@ -392,6 +430,7 @@ impl<'a> Scan<'a> {
         let bytes = text.as_bytes();
         let mut at = 0usize;
         let mut previous = start;
+        let mut significant = start;
         'scan: while at < bytes.len() {
             let Some(rest) = text.get(at..) else {
                 at = at.saturating_add(1);
@@ -406,6 +445,7 @@ impl<'a> Scan<'a> {
                         let consumed = end.saturating_add(delim.len().saturating_mul(2));
                         at = at.saturating_add(consumed);
                         previous = Some(b'"');
+                        significant = previous;
                         continue;
                     }
                     None => {
@@ -417,6 +457,7 @@ impl<'a> Scan<'a> {
             if lang.lifetimes && first == '\'' {
                 at = at.saturating_add(char_literal_length(rest).unwrap_or(1));
                 previous = Some(b'\'');
+                significant = previous;
                 continue;
             }
             if lang.quotes.contains(first) {
@@ -425,6 +466,7 @@ impl<'a> Scan<'a> {
                     None => return,
                 }
                 previous = Some(first as u8);
+                significant = previous;
                 continue;
             }
             if lang.backtick && first == '`' {
@@ -432,6 +474,7 @@ impl<'a> Scan<'a> {
                     Some(end) => {
                         at = at.saturating_add(end.saturating_add(2));
                         previous = Some(b'`');
+                        significant = previous;
                         continue;
                     }
                     None => {
@@ -466,7 +509,18 @@ impl<'a> Scan<'a> {
                     return;
                 }
             }
+            if lang.regex && first == '/' && regex_allowed(significant) {
+                if let Some(length) = regex_length(rest) {
+                    at = at.saturating_add(length);
+                    previous = Some(b')');
+                    significant = previous;
+                    continue;
+                }
+            }
             previous = rest.as_bytes().first().copied();
+            if !first.is_whitespace() {
+                significant = previous;
+            }
             at = at.saturating_add(first.len_utf8());
         }
     }
@@ -502,7 +556,7 @@ fn marker_fits(lang: Language, marker: &str, previous: Option<u8>, rest: &str) -
 mod tests {
     use super::{body, scan, LineKind};
     use crate::languages::{
-        Language, COMPONENT, CSS, ELIXIR, HASH, HASKELL, HTML, LUA, PERL, PHP, PYTHON, RUBY, RUST, SCRIPT,
+        Language, COMPONENT, CSS, ELIXIR, GO, HASH, HASKELL, HTML, LUA, PERL, PHP, PYTHON, RUBY, RUST, SCRIPT,
         SHELL, SLASH, SQL,
     };
 
@@ -654,6 +708,23 @@ mod tests {
     fn backtick_strings_hide_their_lines_and_the_tail_is_scanned() {
         let text = "const t = `\n// inside\n` // after\n";
         assert_eq!(comments(text, SCRIPT), vec!["// after"]);
+    }
+
+    #[test]
+    fn regex_literals_do_not_open_strings_or_hide_comments() {
+        assert_eq!(comments("const a = /`\\n/;\n// one\n// two\n// three\n", SCRIPT).len(), 3);
+        assert_eq!(comments("x = a / b; // one\n", SCRIPT), vec!["// one"]);
+        assert_eq!(comments("s.replace(/\"/g, 'x'); // c\n", SCRIPT), vec!["// c"]);
+        assert_eq!(comments("p.split(/[/\\\\]/); // c\n", SCRIPT), vec!["// c"]);
+        assert_eq!(comments("y = (a + b) / 2; // c\n", SCRIPT), vec!["// c"]);
+        assert_eq!(comments("const u = 'http://x'; // c\n", SCRIPT), vec!["// c"]);
+        assert!(comments("let r = /ab+c/i.test(s);\n", SCRIPT).is_empty());
+    }
+
+    #[test]
+    fn go_keeps_backtick_strings_and_has_no_regex_literals() {
+        assert_eq!(comments("x := `a\n// inside\n` // after\n", GO), vec!["// after"]);
+        assert_eq!(comments("n := (a) / 2 // c\n", GO), vec!["// c"]);
     }
 
     #[test]

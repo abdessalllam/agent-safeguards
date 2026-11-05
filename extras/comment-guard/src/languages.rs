@@ -14,6 +14,7 @@ pub struct Language {
     pub hash_after_space: bool,
     pub dash_symbols: bool,
     pub nested: bool,
+    pub regex: bool,
 }
 
 const C_BLOCKS: &[(&str, &str)] = &[("/*", "*/")];
@@ -35,6 +36,7 @@ const BASE: Language = Language {
     hash_after_space: false,
     dash_symbols: false,
     nested: false,
+    regex: false,
 };
 
 pub const HASH: Language = Language { line: &["#"], ..BASE };
@@ -46,7 +48,8 @@ pub const ELIXIR: Language = Language { line: &["#"], triple: BOTH_BLOCKS, doc_a
 pub const NIM: Language = Language { line: &["#"], block: &[("#[", "]#")], quotes: "\"", ..BASE };
 
 pub const SLASH: Language = Language { line: &["//"], block: C_BLOCKS, ..BASE };
-pub const SCRIPT: Language = Language { line: &["//"], block: C_BLOCKS, backtick: true, ..BASE };
+pub const SCRIPT: Language = Language { line: &["//"], block: C_BLOCKS, backtick: true, regex: true, ..BASE };
+pub const GO: Language = Language { line: &["//"], block: C_BLOCKS, backtick: true, ..BASE };
 pub const RUST: Language = Language {
     line: &["//"],
     block: C_BLOCKS,
@@ -84,7 +87,13 @@ pub const HASKELL: Language = Language {
 
 const HTML_BLOCKS: &[(&str, &str)] = &[("<!--", "-->"), ("/*", "*/")];
 pub const HTML: Language = Language { line: &["//"], block: HTML_BLOCKS, ..BASE };
-pub const COMPONENT: Language = Language { line: &["//"], block: HTML_BLOCKS, backtick: true, ..BASE };
+pub const COMPONENT: Language = Language {
+    line: &["//"],
+    block: HTML_BLOCKS,
+    backtick: true,
+    regex: true,
+    ..BASE
+};
 pub const CSS: Language = Language { block: &[("/*", "*/")], ..BASE };
 pub const SCSS: Language = Language { line: &["//"], block: &[("/*", "*/")], ..BASE };
 
@@ -104,7 +113,7 @@ const TABLE: &[(&str, Language)] = &[
     ("exs", ELIXIR),
     ("nim", NIM),
     ("rs", RUST),
-    ("go", SCRIPT),
+    ("go", GO),
     ("js", SCRIPT),
     ("jsx", SCRIPT),
     ("mjs", SCRIPT),

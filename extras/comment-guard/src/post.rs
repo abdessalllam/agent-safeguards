@@ -7,9 +7,9 @@ use serde_json::{Map, Value};
 
 use crate::changes::{read_old, resolve, MAX_OLD_FILE};
 use crate::decision::{comment_lines, evaluate_after, Change};
-use crate::git::{marked_upstream, run_git};
+use crate::git::{drop_marked, inside_repository, run_git};
 use crate::languages::language_for;
-use crate::session::{identity, Ledger};
+use crate::session::{content_hash, identity, Ledger};
 use crate::Verdict;
 
 const WALK_ENTRIES: usize = 4000;
@@ -39,14 +39,13 @@ enum Head {
 
 pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger) -> Verdict {
     let deadline = Instant::now() + TOTAL_TIME;
-    let Some(cwd) = payload
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .filter(|path| path.is_dir())
-    else {
+    if payload.get("cwd").and_then(Value::as_str).is_none() {
         return Verdict::Allow;
-    };
+    }
+    let cwd = crate::base_of(payload);
+    if !cwd.is_dir() {
+        return Verdict::Allow;
+    }
     let command = payload
         .get("tool_input")
         .and_then(|input| input.get("command"))
@@ -61,6 +60,7 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger) -> Verdict {
         .or_else(|| SystemTime::now().checked_sub(FIRST_WINDOW))
         .unwrap_or(SystemTime::UNIX_EPOCH);
     ledger.mark_check(&key);
+    let git_only = only_git(command);
     let mut files = command_paths(command, &cwd);
     walk(&cwd, since, &mut files);
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -72,13 +72,17 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger) -> Verdict {
         if !seen.insert(file.clone()) {
             continue;
         }
+        if git_only {
+            rebaseline(&file, since, ledger);
+            continue;
+        }
         if let Some(change) = change_for(&file, since, ledger, deadline) {
             changes.push(change);
         }
     }
     let mut verdict = evaluate_after(&changes);
     if verdict.is_some() {
-        changes.retain(|change| !marked_upstream(Path::new(&change.file), deadline));
+        drop_marked(&mut changes, &cwd);
         verdict = evaluate_after(&changes);
     }
     match verdict {
@@ -165,6 +169,9 @@ fn head_text(path: &Path, deadline: Instant) -> Head {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|name| name.to_str())) else {
         return Head::Unavailable;
     };
+    if !inside_repository(dir) {
+        return Head::Missing;
+    }
     let spec = format!("HEAD:./{name}");
     let Some(ran) = run_git(dir, &["show", &spec], deadline) else {
         return Head::Unavailable;
@@ -215,6 +222,19 @@ fn looks_generated(text: &str) -> bool {
     GENERATED.iter().any(|marker| head.contains(marker))
 }
 
+fn rebaseline(path: &Path, since: SystemTime, ledger: &Ledger) {
+    let name = path.to_string_lossy();
+    let Some(lang) = language_for(&name) else {
+        return;
+    };
+    let Some(current) = read_old(path) else {
+        return;
+    };
+    if changed_since(path, since) {
+        ledger.rebaseline(&identity(path), comment_lines(&current, lang), content_hash(&current));
+    }
+}
+
 fn change_for(path: &Path, since: SystemTime, ledger: &Ledger, deadline: Instant) -> Option<Change> {
     let name = path.to_string_lossy().into_owned();
     let lang = language_for(&name)?;
@@ -223,31 +243,34 @@ fn change_for(path: &Path, since: SystemTime, ledger: &Ledger, deadline: Instant
         return None;
     }
     let id = identity(path);
+    let hash = content_hash(&current);
     let recorded = ledger.read(&id);
     if !changed_since(path, since) {
         if recorded.is_none() {
-            ledger.baseline(&id, || comment_lines(&current, lang));
+            ledger.baseline_for(&id, hash, || comment_lines(&current, lang));
         }
         return None;
     }
-    if let Some(baseline) = recorded {
-        return Some(judged(name, current, baseline));
-    }
-    match head_text(path, deadline) {
-        Head::Found(text) => {
-            let baseline = ledger.baseline(&id, || comment_lines(&text, lang));
-            Some(judged(name, current, baseline))
-        }
-        Head::Unavailable => None,
-        Head::Missing if born_since(path, since) => {
-            ledger.baseline(&id, Vec::new);
-            Some(Change::whole(name, String::new(), current))
-        }
-        Head::Missing => {
-            ledger.baseline(&id, || comment_lines(&current, lang));
-            None
-        }
-    }
+    let change = match recorded {
+        Some(baseline) => Some(judged(name, current, baseline)),
+        None => match head_text(path, deadline) {
+            Head::Found(text) => {
+                let baseline = ledger.baseline_for(&id, hash, || comment_lines(&text, lang));
+                Some(judged(name, current, baseline))
+            }
+            Head::Unavailable => None,
+            Head::Missing if born_since(path, since) => {
+                ledger.baseline_for(&id, hash, Vec::new);
+                Some(Change::whole(name, String::new(), current))
+            }
+            Head::Missing => {
+                ledger.baseline_for(&id, hash, || comment_lines(&current, lang));
+                None
+            }
+        },
+    };
+    ledger.accept(&id, &[hash]);
+    change
 }
 
 fn judged(name: String, current: String, baseline: Vec<String>) -> Change {
@@ -261,9 +284,63 @@ fn judged(name: String, current: String, baseline: Vec<String>) -> Change {
     }
 }
 
+const GIT_COMMANDS: [&str; 34] = [
+    "merge", "pull", "checkout", "switch", "restore", "reset", "rebase", "cherry-pick", "revert", "stash", "fetch",
+    "clone", "worktree", "submodule", "add", "commit", "status", "diff", "log", "show", "branch", "tag", "remote",
+    "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file", "mv", "rm", "read-tree", "checkout-index",
+    "merge-base", "describe",
+];
+const HARMLESS: [&str; 16] = [
+    "cd", "pwd", "true", "echo", "ls", "head", "tail", "wc", "grep", "rg", "cut", "uniq", "cat", "test", "[", "sleep",
+];
+
+fn git_subcommand_allowed(words: &[&str]) -> bool {
+    if words.iter().any(|word| matches!(*word, "--exec" | "-x") || word.starts_with("--exec=")) {
+        return false;
+    }
+    let mut at = 0usize;
+    while let Some(word) = words.get(at) {
+        match *word {
+            "-C" | "-c" => at = at.saturating_add(2),
+            option if option.starts_with('-') => at = at.saturating_add(1),
+            subcommand => return GIT_COMMANDS.contains(&subcommand),
+        }
+    }
+    false
+}
+
+fn only_git(command: &str) -> bool {
+    if command.contains(['>', '<', '`']) || command.contains("$(") {
+        return false;
+    }
+    let flattened = command.replace("&&", "\n").replace("||", "\n").replace([';', '|', '&'], "\n");
+    let mut saw_git = false;
+    for segment in flattened.lines() {
+        let mut words: Vec<&str> = segment.split_whitespace().collect();
+        while words
+            .first()
+            .is_some_and(|word| word.contains('=') && !word.starts_with('=') && !word.contains('/'))
+        {
+            words.remove(0);
+        }
+        let Some((first, rest)) = words.split_first() else {
+            continue;
+        };
+        if *first == "git" {
+            if !git_subcommand_allowed(rest) {
+                return false;
+            }
+            saw_git = true;
+        } else if !HARMLESS.contains(first) {
+            return false;
+        }
+    }
+    saw_git
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{command_paths, looks_generated};
+    use super::{command_paths, looks_generated, only_git};
     use std::path::Path;
 
     #[test]
@@ -279,6 +356,44 @@ mod tests {
         assert_eq!(relative, vec![file]);
         assert!(command_paths("ls -la", Path::new("/")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commands_that_only_run_git_history_operations_are_recognised() {
+        for command in [
+            "git merge upstream/main",
+            "git -C /x/y pull --ff-only",
+            "cd /x && git checkout -- a.py",
+            "git fetch && git merge FETCH_HEAD",
+            "GIT_EDITOR=true git merge --no-edit x",
+            "git stash pop",
+            "git status --short | head -5",
+            "git log --oneline | wc -l",
+            "git diff --stat; git add -A",
+            "git rebase main",
+        ] {
+            assert!(only_git(command), "{command}");
+        }
+        for command in [
+            "git merge x && sed -i 1d a.py",
+            "git merge x && printf a > b.py",
+            "git apply fix.patch",
+            "git am mail.patch",
+            "git rebase -x 'sed -i 1d a.py' main",
+            "git rebase --exec 'make' main",
+            "git log > out.txt",
+            "git merge $(cat ref)",
+            "git commit -m 'a; touch b.py'",
+            "cat <<EOF | git apply",
+            "python3 gen.py",
+            "git filter-branch --tree-filter x",
+            "git bisect run ./t.sh",
+            "ls",
+            "",
+            "cd /x",
+        ] {
+            assert!(!only_git(command), "{command}");
+        }
     }
 
     #[test]

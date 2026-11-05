@@ -48,12 +48,13 @@ fn event_is(payload: &Map<String, Value>, wanted: &str) -> bool {
     }
 }
 
-fn base_of(payload: &Map<String, Value>) -> PathBuf {
-    payload
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+pub(crate) fn base_of(payload: &Map<String, Value>) -> PathBuf {
+    let current = std::env::current_dir().unwrap_or_default();
+    match payload.get("cwd").and_then(Value::as_str).map(PathBuf::from) {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => current.join(path),
+        None => current,
+    }
 }
 
 fn ledger_of(payload: &Map<String, Value>, state: Option<&Path>) -> Option<Ledger> {
@@ -90,7 +91,8 @@ fn translated(old: &str, from: Language, record: &[String], to: Language) -> Vec
     out
 }
 
-fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) {
+fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) -> Vec<(String, u64)> {
+    let mut accepted = Vec::new();
     for change in changes.iter_mut() {
         if change.partial {
             continue;
@@ -104,13 +106,16 @@ fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) {
             let record = ledger.read(&session::identity(&changes::resolve(base, source)))?;
             Some((from, record))
         });
-        let baseline = ledger.baseline(&id, || match origin {
+        let before = session::content_hash(&change.old);
+        let baseline = ledger.baseline_for(&id, before, || match origin {
             Some((from, record)) if from == lang => record,
             Some((from, record)) => translated(&change.old, from, &record, lang),
             None => comment_lines(&change.old, lang),
         });
         change.baseline = Some(baseline);
+        accepted.push((id, session::content_hash(&change.new)));
     }
+    accepted
 }
 
 pub fn judge(input: &str, provider: Provider) -> Verdict {
@@ -136,16 +141,22 @@ pub fn judge_in(input: &str, provider: Provider, state: Option<&Path>) -> Verdic
     };
     let base = base_of(&payload);
     let mut changes = collect(tool, tool_input, provider, &base);
-    if !changes.is_empty() {
-        if let Some(ledger) = ledger_of(&payload, state) {
-            attach_baselines(&ledger, &mut changes, &base);
-        }
-    }
+    let ledger = if changes.is_empty() { None } else { ledger_of(&payload, state) };
+    let accepted = match &ledger {
+        Some(ledger) => attach_baselines(ledger, &mut changes, &base),
+        None => Vec::new(),
+    };
     let mut verdict = evaluate(&changes);
     if verdict.is_some() {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        changes.retain(|change| !git::marked_upstream(&changes::resolve(&base, &change.file), deadline));
+        git::drop_marked(&mut changes, &base);
         verdict = evaluate(&changes);
+    }
+    if verdict.is_none() {
+        if let Some(ledger) = &ledger {
+            for (id, after) in &accepted {
+                ledger.accept(id, &[*after]);
+            }
+        }
     }
     match verdict {
         Some(reason) => Verdict::Deny(reason),

@@ -439,6 +439,7 @@ fn a_patch_anchor_picks_the_place_the_patch_tool_would_edit() {
 #[test]
 fn an_unreachable_git_is_not_taken_for_a_missing_file() {
     let rig = Rig::new("no-git");
+    std::fs::create_dir(rig.cwd.join(".git")).expect("marker");
     let file = rig.cwd.join("a.py");
     std::fs::write(&file, lines("#", "", 10)).expect("write");
     if !creation_time_is_known(&file) {
@@ -526,6 +527,7 @@ fn fake_git(dir: &Path, body: &str) {
 #[test]
 fn a_git_that_never_answers_is_cut_off() {
     let rig = Rig::new("slow-git");
+    std::fs::create_dir(rig.cwd.join(".git")).expect("marker");
     let bin = temp_dir("slow-git-bin");
     fake_git(&bin, "/bin/sleep 8");
     let file = rig.cwd.join("a.py");
@@ -541,6 +543,7 @@ fn a_git_that_never_answers_is_cut_off() {
 #[test]
 fn a_git_helper_that_keeps_the_pipe_open_does_not_hold_the_hook() {
     let rig = Rig::new("pipe-git");
+    std::fs::create_dir(rig.cwd.join(".git")).expect("marker");
     let bin = temp_dir("pipe-git-bin");
     fake_git(&bin, "/bin/sleep 8 &\nexit 0");
     let file = rig.cwd.join("a.py");
@@ -556,6 +559,7 @@ fn a_git_helper_that_keeps_the_pipe_open_does_not_hold_the_hook() {
 #[test]
 fn a_git_error_is_not_taken_for_a_missing_file() {
     let rig = Rig::new("git-error");
+    std::fs::create_dir(rig.cwd.join(".git")).expect("marker");
     let bin = temp_dir("git-error-bin");
     fake_git(&bin, "echo 'fatal: detected dubious ownership in repository' >&2\nexit 128");
     let file = rig.cwd.join("a.py");
@@ -825,6 +829,148 @@ fn files_a_command_wrote_under_a_marked_path_are_not_reported() {
     let loud = rig.bash(Some("m1"), &format!("printf x > {}", own.display()));
     assert!(blocked(&loud), "{loud}");
     assert!(loud.contains("own.py"), "{loud}");
+}
+
+#[test]
+fn rewording_existing_comments_is_not_adding_comments() {
+    let dir = temp_dir("reword");
+    let path = dir.join("a.ts");
+    let old = lines("//", "t3code namespace", 10);
+    std::fs::write(&path, &old).expect("write");
+    let renamed = old.replace("t3code", "melara");
+    assert!(!denied(&write_file(None, None, &path, &renamed)));
+    let with_more = format!("{renamed}{}", lines("//", "extra", 9));
+    assert!(denied(&write_file(None, None, &path, &with_more)));
+    let edit = edit_file(None, None, &path, "// line 3 t3code namespace", "// line 3 melara namespace");
+    assert!(!denied(&edit));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_existing_long_comment_may_be_reworded_but_a_short_one_may_not_grow_long() {
+    let dir = temp_dir("reword-long");
+    let path = dir.join("a.ts");
+    let long = format!("// {}\n", "word ".repeat(30));
+    std::fs::write(&path, format!("{long}const a = 1;\n")).expect("write");
+    let reworded = long.replacen("word", "term", 1);
+    assert!(!denied(&write_file(None, None, &path, &format!("{reworded}const a = 1;\n"))));
+    std::fs::write(&path, "// short\nconst a = 1;\n").expect("write");
+    let grown = write_file(None, None, &path, &format!("{long}const a = 1;\n"));
+    assert!(denied(&grown));
+    assert!(reason(&grown).contains("100"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_date_that_was_already_in_a_comment_is_not_new() {
+    let dir = temp_dir("reword-date");
+    let path = dir.join("a.ts");
+    std::fs::write(&path, "// fixed on 2024-01-02 by hand\nconst a = 1;\n").expect("write");
+    let reworded = write_file(None, None, &path, "// fixed on 2024-01-02 by tool\nconst a = 1;\n");
+    assert!(!denied(&reworded));
+    let other_date = write_file(None, None, &path, "// fixed on 2025-02-03 by hand\nconst a = 1;\n");
+    assert!(denied(&other_date));
+    std::fs::write(&path, "// plain\nconst a = 1;\n").expect("write");
+    assert!(denied(&write_file(None, None, &path, "// plain 2024-01-02\nconst a = 1;\n")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn one_comment_becoming_several_lines_counts_the_extra_lines() {
+    let dir = temp_dir("grow");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "# one\nx = 1\n").expect("write");
+    assert!(denied(&write_file(None, None, &path, "# a\n# b\n# c\n# d\n# e\nx = 1\n")));
+    assert!(!denied(&write_file(None, None, &path, "# a\n# b\nx = 1\n")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rewording_what_the_session_added_stays_within_its_allowance() {
+    let dir = temp_dir("reword-session");
+    let state = temp_dir("reword-session-state");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "x = 1\n").expect("write");
+    let first = edit_file(Some(&state), Some("rw"), &path, "x = 1", "# one\n# two\nx = 1");
+    assert!(!denied(&first));
+    apply_edit(&path, "x = 1", "# one\n# two\nx = 1");
+    let reworded = edit_file(Some(&state), Some("rw"), &path, "# one\n# two", "# uno\n# dos");
+    assert!(!denied(&reworded));
+    apply_edit(&path, "# one\n# two", "# uno\n# dos");
+    let more = edit_file(Some(&state), Some("rw"), &path, "x = 1", "# three\n# four\nx = 1");
+    assert!(denied(&more));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn comments_added_by_someone_else_between_edits_are_not_counted_against_the_agent() {
+    let dir = temp_dir("outside-edit");
+    let state = temp_dir("outside-edit-state");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "x = 1\ny = 2\n").expect("write");
+    let first = edit_file(Some(&state), Some("oe"), &path, "x = 1", "# one\n# two\nx = 1");
+    assert!(!denied(&first));
+    apply_edit(&path, "x = 1", "# one\n# two\nx = 1");
+    let outside = format!("{}# one\n# two\nx = 1\ny = 2\n", lines("#", "by hand", 5));
+    std::fs::write(&path, outside).expect("write");
+    let second = edit_file(Some(&state), Some("oe"), &path, "y = 2", "# three\n# four\ny = 2");
+    assert!(!denied(&second));
+    apply_edit(&path, "y = 2", "# three\n# four\ny = 2");
+    let third = edit_file(Some(&state), Some("oe"), &path, "y = 2", "# five\n# six\ny = 2");
+    assert!(denied(&third));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn an_edit_that_never_landed_does_not_forget_what_the_session_added() {
+    let dir = temp_dir("not-landed");
+    let state = temp_dir("not-landed-state");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "x = 1\ny = 2\n").expect("write");
+    assert!(!denied(&edit_file(Some(&state), Some("nl"), &path, "x = 1", "# one\n# two\nx = 1")));
+    apply_edit(&path, "x = 1", "# one\n# two\nx = 1");
+    assert!(!denied(&edit_file(Some(&state), Some("nl"), &path, "y = 2", "y = 3")));
+    let again = edit_file(Some(&state), Some("nl"), &path, "y = 2", "# three\n# four\ny = 2");
+    assert!(denied(&again));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn commands_that_only_run_git_do_not_blame_the_agent_for_the_comments_they_bring_in() {
+    let rig = Rig::new("git-only");
+    init_repo(&rig.cwd);
+    let file = commit_file(&rig.cwd, "a.py", "x = 1\n");
+    rig.pre_bash("go1", "t1");
+    std::fs::write(&file, format!("{}x = 1\n", lines("#", "upstream", 9))).expect("write");
+    let merged = rig.bash_with_id("go1", "t1", "git checkout feature -- a.py");
+    assert!(merged.is_empty(), "{merged}");
+    rig.pre_bash("go1", "t2");
+    std::fs::write(&file, format!("{}# mine\nx = 1\n", lines("#", "upstream", 9))).expect("write");
+    let later = rig.bash_with_id("go1", "t2", &format!("sed -i x {}", file.display()));
+    assert!(later.is_empty(), "{later}");
+    rig.pre_bash("go2", "t3");
+    std::fs::write(&file, format!("{}x = 1\n", lines("#", "agent", 9))).expect("write");
+    let written = rig.bash_with_id("go2", "t3", &format!("printf x > {}", file.display()));
+    assert!(blocked(&written), "{written}");
+}
+
+#[test]
+fn edits_and_commands_in_turn_keep_counting_from_the_original_file() {
+    let rig = Rig::new("turns");
+    let file = rig.cwd.join("a.py");
+    std::fs::write(&file, "x = 1\ny = 2\n").expect("write");
+    let first = rig.pre_edit("tn", &file, "x = 1", "# one\n# two\nx = 1");
+    assert!(first.is_empty(), "{first}");
+    std::fs::write(&file, "# one\n# two\nx = 1\ny = 2\n").expect("write");
+    rig.pre_bash("tn", "t1");
+    std::fs::write(&file, "# one\n# two\nx = 1\n# three\n# four\ny = 2\n").expect("write");
+    let ran = rig.bash_with_id("tn", "t1", &format!("sed -i x {}", file.display()));
+    assert!(blocked(&ran), "{ran}");
+    let again = rig.pre_edit("tn", &file, "y = 2", "# five\ny = 2");
+    assert!(again.contains("\"permissionDecision\":\"deny\""), "{again}");
 }
 
 fn creation_time_is_known(path: &Path) -> bool {

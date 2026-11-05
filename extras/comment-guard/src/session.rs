@@ -1,6 +1,5 @@
 use std::cell::Cell;
 use std::fs;
-use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -9,6 +8,15 @@ use serde_json::{json, Value};
 const RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const PRUNE_LIMIT: usize = 200;
 const PRUNE_VISITS: usize = 2000;
+
+struct Stored {
+    comments: Vec<String>,
+    seen: Vec<u64>,
+}
+
+pub fn content_hash(text: &str) -> u64 {
+    hash(text)
+}
 
 pub struct Ledger {
     dir: PathBuf,
@@ -126,46 +134,84 @@ impl Ledger {
             .join(format!(".tmp-{}-{nanos}", std::process::id()))
     }
 
-    pub fn read(&self, identity: &str) -> Option<Vec<String>> {
+    fn load(&self, identity: &str) -> Option<Stored> {
         let raw = fs::read_to_string(self.entry(identity)).ok()?;
         let value: Value = serde_json::from_str(&raw).ok()?;
         if value.get("path")?.as_str()? != identity {
             return None;
         }
-        value
+        let comments = value
             .get("comments")?
             .as_array()?
             .iter()
             .map(|item| item.as_str().map(str::to_owned))
-            .collect()
+            .collect::<Option<Vec<String>>>()?;
+        let seen = value
+            .get("seen")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().and_then(|text| u64::from_str_radix(text, 16).ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Stored { comments, seen })
     }
 
-    pub fn baseline(&self, identity: &str, current: impl FnOnce() -> Vec<String>) -> Vec<String> {
-        if let Some(found) = self.read(identity) {
-            return found;
-        }
-        let comments = current();
-        let body = json!({ "path": identity, "comments": comments }).to_string();
+    fn store(&self, identity: &str, stored: &Stored) {
+        let seen: Vec<String> = stored.seen.iter().map(|value| format!("{value:016x}")).collect();
+        let body = json!({ "path": identity, "comments": stored.comments, "seen": seen }).to_string();
         let temp = self.temp();
-        let written = fs::File::create(&temp)
-            .and_then(|mut file| file.write_all(body.as_bytes()))
-            .is_ok();
-        let outcome = if written {
-            fs::hard_link(&temp, self.entry(identity))
-        } else {
-            Err(std::io::Error::from(ErrorKind::Other))
-        };
-        let _ = fs::remove_file(&temp);
-        match outcome {
-            Ok(()) => {
-                self.prune();
-                comments
-            }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                self.read(identity).unwrap_or(comments)
-            }
-            Err(_) => comments,
+        if fs::write(&temp, body).is_err() {
+            return;
         }
+        if fs::rename(&temp, self.entry(identity)).is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+    }
+
+    pub fn read(&self, identity: &str) -> Option<Vec<String>> {
+        self.load(identity).map(|stored| stored.comments)
+    }
+
+    pub fn baseline_for(&self, identity: &str, current: u64, make: impl FnOnce() -> Vec<String>) -> Vec<String> {
+        if let Some(stored) = self.load(identity) {
+            if stored.seen.contains(&current) {
+                return stored.comments;
+            }
+        }
+        self.rebaseline(identity, make(), current)
+    }
+
+    pub fn rebaseline(&self, identity: &str, comments: Vec<String>, current: u64) -> Vec<String> {
+        let first = !self.entry(identity).exists();
+        self.store(
+            identity,
+            &Stored {
+                comments: comments.clone(),
+                seen: vec![current],
+            },
+        );
+        if first {
+            self.prune();
+        }
+        comments
+    }
+
+    pub fn accept(&self, identity: &str, hashes: &[u64]) {
+        let Some(mut stored) = self.load(identity) else {
+            return;
+        };
+        for value in hashes {
+            if !stored.seen.contains(value) {
+                stored.seen.push(*value);
+            }
+        }
+        while stored.seen.len() > 8 {
+            stored.seen.remove(0);
+        }
+        self.store(identity, &stored);
     }
 
     pub fn last_check(&self, key: &str) -> Option<SystemTime> {
@@ -249,16 +295,36 @@ mod tests {
     }
 
     #[test]
-    fn the_first_baseline_wins() {
+    fn a_baseline_holds_while_the_file_is_in_a_known_state_and_resets_when_it_is_not() {
         let dir = scratch("first");
         let ledger = Ledger::open(&dir, "session-a").expect("ledger");
-        let first = ledger.baseline("/x/a.py", || vec!["# one".to_owned()]);
-        let second = ledger.baseline("/x/a.py", || vec!["# one".to_owned(), "# two".to_owned()]);
+        let first = ledger.baseline_for("/x/a.py", 1, || vec!["# one".to_owned()]);
+        let again = ledger.baseline_for("/x/a.py", 1, || vec!["# one".to_owned(), "# two".to_owned()]);
         assert_eq!(first, vec!["# one".to_owned()]);
-        assert_eq!(second, first);
+        assert_eq!(again, first);
+        ledger.accept("/x/a.py", &[2]);
+        assert_eq!(ledger.baseline_for("/x/a.py", 2, || vec!["# other".to_owned()]), first);
+        let changed = ledger.baseline_for("/x/a.py", 3, || vec!["# fresh".to_owned()]);
+        assert_eq!(changed, vec!["# fresh".to_owned()]);
+        assert!(ledger.baseline_for("/x/a.py", 1, Vec::new).is_empty());
         assert!(ledger.read("/x/b.py").is_none());
+        ledger.accept("/x/missing.py", &[1]);
+        assert!(ledger.read("/x/missing.py").is_none());
         let other = Ledger::open(&dir, "session-b").expect("ledger");
         assert!(other.read("/x/a.py").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_most_recent_states_are_remembered() {
+        let dir = scratch("seen");
+        let ledger = Ledger::open(&dir, "session-g").expect("ledger");
+        ledger.baseline_for("/x/a.py", 100, || vec!["# keep".to_owned()]);
+        for value in 1..=20u64 {
+            ledger.accept("/x/a.py", &[value]);
+        }
+        assert_eq!(ledger.baseline_for("/x/a.py", 20, Vec::new), vec!["# keep".to_owned()]);
+        assert!(ledger.baseline_for("/x/a.py", 100, Vec::new).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -354,7 +420,7 @@ mod tests {
         age(&foreign_old, 30);
         age(&stamp_like, 30);
         let ledger = Ledger::open(&dir, "session-e").expect("ledger");
-        ledger.baseline("/x/a.py", Vec::new);
+        ledger.baseline_for("/x/a.py", 1, Vec::new);
         assert!(!owned_old.exists());
         assert!(owned_new.exists());
         assert!(foreign_old.exists());
@@ -363,7 +429,7 @@ mod tests {
         let second_old = dir.join("2123456789abcdef-fedcba9876543210.json");
         std::fs::write(&second_old, "{}").expect("write");
         age(&second_old, 1);
-        ledger.baseline("/x/b.py", Vec::new);
+        ledger.baseline_for("/x/b.py", 1, Vec::new);
         assert!(second_old.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
