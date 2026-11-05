@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::comments::{body, scan, LineKind};
-use crate::languages::{language_for_text, Language, GO, HCL, LUA, MAKE, PHP, POWERSHELL, RUBY, RUST, SHELL, SLASH, SQL};
+use crate::languages::{language_for_text, Language, CLIKE, GO, RUST, SCRIPT, SHELL};
 use crate::locale::message;
 
 pub const MAX_LINES: usize = 2;
@@ -254,7 +254,7 @@ fn raw_string_open(line: &str) -> bool {
         }
         let start = at.saturating_sub(1);
         let mut before = start.checked_sub(1).and_then(|index| bytes.get(index)).copied();
-        if before == Some(b'b') {
+        if matches!(before, Some(b'b' | b'c')) {
             before = start.checked_sub(2).and_then(|index| bytes.get(index)).copied();
         }
         if before.is_some_and(ident) {
@@ -274,39 +274,58 @@ fn raw_string_open(line: &str) -> bool {
     false
 }
 
-fn percent_literal(text: &str) -> bool {
+fn nested_template(text: &str) -> bool {
     let bytes = text.as_bytes();
-    bytes.iter().enumerate().any(|(at, byte)| {
-        if *byte != b'%' {
-            return false;
+    let mut at = 0usize;
+    while let Some(found) = text.get(at..).and_then(|rest| rest.find("${")) {
+        let start = at.saturating_add(found).saturating_add(2);
+        let mut depth = 1usize;
+        let mut closed = false;
+        for byte in bytes.iter().skip(start).take(4096) {
+            match byte {
+                b'{' => depth = depth.saturating_add(1),
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        closed = true;
+                        break;
+                    }
+                }
+                b'`' => return true,
+                _ => {}
+            }
         }
-        let first = bytes.get(at.saturating_add(1)).copied().unwrap_or(b' ');
-        let delimiter = if b"qQwWiIrRxs".contains(&first) { bytes.get(at.saturating_add(2)).copied().unwrap_or(b' ') } else { first };
-        b"([{<|!/".contains(&delimiter)
-    })
+        if !closed {
+            return true;
+        }
+        at = start;
+    }
+    false
 }
 
-fn long_bracket(text: &str) -> bool {
-    text.match_indices('[').any(|(at, _)| {
-        let rest = text.get(at.saturating_add(1)..).unwrap_or("");
-        rest.trim_start_matches('=').starts_with('[')
-    })
+fn directive_shaped(line: &str) -> bool {
+    let text = body(line);
+    let word: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@' | '<' | '>' | '/'))
+        .collect();
+    !word.is_empty() && text.get(word.len()..).is_some_and(|rest| rest.trim_start().starts_with([':', '=']))
 }
 
 fn risky(text: &str, lang: Language) -> bool {
-    if !lang.trim || text.contains("\\\n") || text.contains("\n__END__") || text.contains("__DATA__") {
+    if !lang.trim
+        || text.contains("\\\n")
+        || text.starts_with("__END__")
+        || text.contains("\n__END__")
+        || text.contains("__DATA__")
+    {
         return true;
     }
-    let heredocs = [SHELL, RUBY, PHP, HCL, MAKE];
-    (heredocs.contains(&lang) && text.contains("<<"))
-        || (lang == RUBY && percent_literal(text))
+    (lang == SHELL && text.contains("<<"))
         || (lang == RUST && text.lines().any(raw_string_open))
-        || (lang == SLASH && (text.contains("R\"") || text.contains("@\"") || text.contains("import \"C\"")))
+        || (lang == CLIKE && (text.contains("R\"") || text.contains("@\"")))
         || (lang == GO && text.contains("import \"C\""))
-        || (lang == LUA && long_bracket(text))
-        || (lang == POWERSHELL && (text.contains("@\"") || text.contains("@'")))
-        || (lang == SQL && text.matches('$').count() >= 2)
-        || (lang == MAKE && text.contains("endef"))
+        || (lang == SCRIPT && nested_template(text))
 }
 
 pub fn trimmed(change: &Change) -> Option<Trimmed> {
@@ -347,7 +366,8 @@ pub fn trimmed(change: &Change) -> Option<Trimmed> {
             }
             _ => false,
         };
-        if !kept && !same_line && scanner.standalone() {
+        let guarded = scanner.line_index() < 3 && directive_shaped(line);
+        if !kept && !same_line && scanner.standalone() && !guarded {
             fresh.push((scanner.line_index(), line));
         }
     }

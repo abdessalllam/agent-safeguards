@@ -2013,6 +2013,21 @@ fn comments_that_cannot_be_cut_safely_are_still_refused() {
     refuse("i.py", "x = 1  # a\ny = 2  # b\nz = 3  # c\n# one\n# two\n# three\n# four\n");
     refuse("j.go", "// #include <stdio.h>\n// one\n// two\n// three\nimport \"C\"\n");
     refuse("k.pug", "//\n  one\n  two\n  three\n  four\np hi\n");
+    refuse("e1.js", "const s = `outer ${`inner\n// one\n// two\n// three\n// four\n`} tail`\nconst x = 1\n");
+    refuse("e2.jsx", "export function F() {\n  return (\n    <pre>\n// one\n// two\n// three\n// four\n    </pre>\n  );\n}\n");
+    refuse("e2.tsx", "export const F = () => (\n  <pre>\n// one\n// two\n// three\n// four\n  </pre>\n);\n");
+    refuse("e3.cs", "var s = @$\"hello \\\"\"\n// one\n// two\n// three\n// four\n\\\"\";\nint x = 1;\n");
+    refuse("e4.rs", "fn main() {\n    let s = cr##\" \"\n// one\n// two\n// three\n// four\n\"\"##;\n    let x = 1;\n}\n");
+    refuse("e5.rb", "r = /\n# one\n# two\n# three\n# four\n/\nx = 1\n");
+    refuse("e6.rb", "s = %q@\n# one\n# two\n# three\n# four\n@\nx = 1\n");
+    refuse("e7.groovy", "def s = $/\n// one\n// two\n// three\n// four\n/$\ndef x = 1\n");
+    refuse("e8.php", "<?php\necho 1;\n?>\n// one\n// two\n// three\n// four\n<?php\n$x = 1;\n");
+    refuse("Dockerfile", "# syntax=docker/dockerfile:1\nFROM alpine # one\nRUN echo x # two\n");
+    refuse("e10.rb", "# frozen_string_literal: true\nx = 1 # one\ny = 2 # two\n");
+    refuse("e11.ps1", "#requires -Version 7\nGet-Date # one\nGet-Date # two\n");
+    refuse("e12.scala", "val page = <pre>\n// one\n// two\n// three\n// four\n</pre>\nval x = 1\n");
+    refuse("e13.rb", "__END__\n# one\n# two\n# three\n# four\n");
+    refuse("first.py", "# mode: strict\nx = 1  # one\ny = 2  # two\n");
     refuse("x.nix", "s = ''\n# one\n# two\n# three\n# four\n'';\nx = 1\n");
     refuse("a.rb", "list = %w(\n# one\n# two\n# three\n# four\n)\nx = 1\n");
     refuse("b.rb", "text = %q{\n# one\n# two\n# three\n# four\n}\nx = 1\n");
@@ -2029,10 +2044,52 @@ fn comments_that_cannot_be_cut_safely_are_still_refused() {
     refuse("a.ps1", "$s = @\"\n# one\n# two\n# three\n# four\n\"@\n$x = 1\n");
     refuse("l.sql", "/*+ one */\n/*+ two */\n/*+ three */\n/*+ four */\nselect 1;\n");
     refuse("m.html", "<!--[if IE]>\n<!--[if gt IE 8]>\n<!--[if lt IE 7]>\n<!--[if IE 9]>\n<p>hi</p>\n");
+    refuse("r.cpp", "const char* s = R\"(\n// one\n// two\n// three\n// four\n)\";\nint x = 1;\n");
+    refuse("r.h", "NSString *s = @\"x\";\n// one\n// two\n// three\n// four\nint x = 1;\n");
+    refuse("Containerfile", "FROM alpine\n# one\n# two\n# three\n# four\nRUN echo x\n");
+    refuse("justfile", "build:\n  echo hi\n# one\n# two\n# three\n# four\n");
+    refuse("p.css", "/*! one */\n/*! two */\n/*! three */\n/*! four */\na { b: c }\n");
+    refuse("q.css", "/*# one */\n/*# two */\n/*# three */\n/*# four */\na { b: c }\n");
     let css = "/* one */\n/* two */\n/* three */\n/* four */\na { b: c }\n";
     let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("n.css"), css), Provider::Claude));
     assert_eq!(input["content"], "/* one */\n/* two */\na { b: c }\n");
     refuse("o.html", "<!-- one -->\n<!-- two -->\n<!-- three -->\n<p>hi</p>\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_languages_on_the_list_are_trimmed_and_their_directives_are_kept() {
+    let dir = temp_dir("trim-list");
+    let lines = |marker: &str| -> String { (1..=4).map(|n| format!("{marker} note {n}\n")).collect() };
+    let cases = [
+        ("a.kt", "//", "fun f() {}\n"),
+        ("a.swift", "//", "func f() {}\n"),
+        ("a.ts", "//", "export const x = 1;\n"),
+        ("a.go", "//", "package a\n"),
+        ("a.c", "//", "int a;\n"),
+        ("a.java", "//", "class A {}\n"),
+        ("a.sh", "#", "echo hi\n"),
+        ("a.scss", "//", "a { b: c }\n"),
+        ("a.rs", "//", "fn f() {}\n"),
+    ];
+    for (name, marker, code) in cases {
+        let text = format!("{}{}", lines(marker), code);
+        let (input, _) = cut(trimming(None, None, "Write", written(&dir.join(name), &text), Provider::Claude));
+        let expected = format!("{marker} note 1\n{marker} note 2\n{code}");
+        assert_eq!(input["content"], expected.as_str(), "{name}");
+    }
+    let python = "# coding: utf-8\nx = 1  # one\ny = 2  # two\nz = 3  # three\n";
+    assert!(matches!(trimming(None, None, "Write", written(&dir.join("c.py"), python), Provider::Claude), Verdict::Deny(_)));
+    let cookie = "# coding: utf-8\n# one\n# two\nx = 1\n";
+    assert!(matches!(trimming(None, None, "Write", written(&dir.join("d.py"), cookie), Provider::Claude), Verdict::Allow));
+    let source_map = "x = 1;\n//# sourceMappingURL=a.js.map\n// one\n// two\n";
+    assert!(matches!(trimming(None, None, "Write", written(&dir.join("d.js"), source_map), Provider::Claude), Verdict::Allow));
+    let reference = "/// <reference types=\"node\" />\n// a\n// b\n// c\n// d\nexport {};\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("r.ts"), reference), Provider::Claude));
+    assert_eq!(input["content"], "/// <reference types=\"node\" />\n// a\n// b\nexport {};\n");
+    let map = "a { b: c }\n/*# sourceMappingURL=a.css.map */\n/* one */\n/* two */\n/* three */\n/* four */\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("m.css"), map), Provider::Claude));
+    assert_eq!(input["content"], "a { b: c }\n/*# sourceMappingURL=a.css.map */\n/* one */\n/* two */\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -50,6 +50,13 @@ const EXEMPT: &[(&str, Tail)] = &[
     ("+build", Tail::Words),
     ("@flow", Tail::Words),
     ("@jsx", Tail::Words),
+    ("coding:", Tail::Words),
+    ("coding=", Tail::Words),
+    ("encoding:", Tail::Words),
+    ("<reference", Tail::Words),
+    ("<amd-", Tail::Words),
+    ("# sourcemappingurl=", Tail::Words),
+    ("@ sourcemappingurl=", Tail::Words),
 ];
 
 const DIRECTIVE_WORDS: &[&str] = &[
@@ -663,7 +670,7 @@ impl<'a> Scan<'a> {
                     return Some(LineKind::Comment(trimmed));
                 }
                 let upto = open.len().saturating_add(end);
-                let special = (open == "/*" && rest.starts_with(['+', '!'])) || (open == "<!--" && rest.starts_with(['[', '#']));
+                let special = (open == "/*" && rest.starts_with(['+', '!', '#'])) || (open == "<!--" && rest.starts_with(['[', '#']));
                 self.standalone = !special && trimmed.get(upto..).is_some_and(|tail| tail.trim().is_empty());
                 self.trailing_after(trimmed.get(upto..), close);
                 return Some(LineKind::Comment(trimmed.get(..upto).unwrap_or(trimmed)));

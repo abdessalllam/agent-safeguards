@@ -58,15 +58,18 @@ const BASE: Language = Language {
 };
 
 pub const HASH: Language = Language { line: &["#"], ..BASE };
+pub const SHELL_PLAIN: Language = Language { trim: false, ..SHELL };
 pub const SHELL: Language = Language { line: &["#"], hash_after_space: true, trim: true, ..BASE };
 pub const PYTHON: Language = Language { line: &["#"], triple: BOTH_BLOCKS, docstring: true, trim: true, ..BASE };
-pub const RUBY: Language = Language { line: &["#"], column_zero: &[("=begin", "=end")], trim: true, ..BASE };
+pub const RUBY: Language = Language { line: &["#"], column_zero: &[("=begin", "=end")], ..BASE };
 pub const PERL: Language = Language { line: &["#"], pod: true, hash_after_space: true, ..BASE };
 pub const ELIXIR: Language = Language { line: &["#"], triple: BOTH_BLOCKS, doc_attributes: true, ..BASE };
 pub const NIM: Language = Language { line: &["#"], block: &[("#[", "]#")], quotes: "\"", ..BASE };
 
-pub const SLASH: Language = Language { line: &["//"], block: C_BLOCKS, trim: true, ..BASE };
+pub const SLASH: Language = Language { line: &["//"], block: C_BLOCKS, ..BASE };
+pub const CLIKE: Language = Language { trim: true, ..SLASH };
 pub const SCRIPT: Language = Language { line: &["//"], block: C_BLOCKS, backtick: true, regex: true, trim: true, ..BASE };
+pub const JSX: Language = Language { trim: false, ..SCRIPT };
 pub const GO: Language = Language { line: &["//"], block: C_BLOCKS, backtick: true, trim: true, ..BASE };
 pub const RUST: Language = Language {
     line: &["//"],
@@ -77,6 +80,7 @@ pub const RUST: Language = Language {
     trim: true, ..BASE
 };
 pub const TEXT: Language = Language { line: &["//"], block: C_BLOCKS, triple: TEXT_BLOCKS, trim: true, ..BASE };
+pub const SCALA: Language = Language { trim: false, ..TEXT };
 pub const SWIFT: Language = Language {
     line: &["//"],
     block: C_BLOCKS,
@@ -85,11 +89,11 @@ pub const SWIFT: Language = Language {
     nested: true,
     trim: true, ..BASE
 };
-pub const GROOVY: Language = Language { line: &["//"], block: C_BLOCKS, triple: BOTH_BLOCKS, trim: true, ..BASE };
-pub const PHP: Language = Language { line: &["#", "//"], block: C_BLOCKS, php: true, trim: true, ..BASE };
+pub const GROOVY: Language = Language { line: &["//"], block: C_BLOCKS, triple: BOTH_BLOCKS, ..BASE };
+pub const PHP: Language = Language { line: &["#", "//"], block: C_BLOCKS, php: true, ..BASE };
 
-pub const LUA: Language = Language { line: &["--"], long_bracket: Some("--"), trim: true, ..BASE };
-pub const SQL: Language = Language { line: &["--"], block: &[("/*", "*/")], quotes: "\"'`", trim: true, ..BASE };
+pub const LUA: Language = Language { line: &["--"], long_bracket: Some("--"), ..BASE };
+pub const SQL: Language = Language { line: &["--"], block: &[("/*", "*/")], quotes: "\"'`", ..BASE };
 pub const HASKELL: Language = Language {
     line: &["--"],
     block: &[("{-", "-}")],
@@ -112,9 +116,9 @@ pub const COMPONENT: Language = Language {
 pub const CSS: Language = Language { block: &[("/*", "*/")], trim: true, ..BASE };
 pub const SCSS: Language = Language { line: &["//"], block: &[("/*", "*/")], trim: true, ..BASE };
 
-pub const POWERSHELL: Language = Language { line: &["#"], block: &[("<#", "#>")], escape: '`', trim: true, ..BASE };
-pub const MAKE: Language = Language { line: &["#"], trim: true, ..BASE };
-pub const HCL: Language = Language { line: &["#", "//"], block: C_BLOCKS, quotes: "\"", trim: true, ..BASE };
+pub const POWERSHELL: Language = Language { line: &["#"], block: &[("<#", "#>")], escape: '`', ..BASE };
+pub const MAKE: Language = Language { line: &["#"], ..BASE };
+pub const HCL: Language = Language { line: &["#", "//"], block: C_BLOCKS, quotes: "\"", ..BASE };
 pub const CMAKE: Language = Language { line: &["#"], long_bracket: Some("#"), hash_after_space: true, ..BASE };
 pub const BATCH: Language = Language { rem: true, ..BASE };
 pub const BASIC: Language = Language { line: &["'"], quotes: "\"", rem: true, ..BASE };
@@ -159,26 +163,26 @@ const TABLE: &[(&str, Language)] = &[
     ("rs", RUST),
     ("go", GO),
     ("js", SCRIPT),
-    ("jsx", SCRIPT),
+    ("jsx", JSX),
     ("mjs", SCRIPT),
     ("cjs", SCRIPT),
     ("ts", SCRIPT),
-    ("tsx", SCRIPT),
+    ("tsx", JSX),
     ("java", TEXT),
     ("kt", TEXT),
     ("kts", TEXT),
-    ("scala", TEXT),
+    ("scala", SCALA),
     ("swift", SWIFT),
     ("dart", GROOVY),
     ("groovy", GROOVY),
     ("gradle", GROOVY),
-    ("c", SLASH),
-    ("h", SLASH),
-    ("cc", SLASH),
-    ("cpp", SLASH),
-    ("cxx", SLASH),
-    ("hpp", SLASH),
-    ("hh", SLASH),
+    ("c", CLIKE),
+    ("h", CLIKE),
+    ("cc", CLIKE),
+    ("cpp", CLIKE),
+    ("cxx", CLIKE),
+    ("hpp", CLIKE),
+    ("hh", CLIKE),
     ("cs", SLASH),
     ("m", SLASH),
     ("mm", SLASH),
@@ -215,9 +219,9 @@ const TABLE: &[(&str, Language)] = &[
     ("mk", MAKE),
     ("mak", MAKE),
     ("make", MAKE),
-    ("dockerfile", SHELL),
-    ("containerfile", SHELL),
-    ("just", SHELL),
+    ("dockerfile", SHELL_PLAIN),
+    ("containerfile", SHELL_PLAIN),
+    ("just", SHELL_PLAIN),
     ("bats", SHELL),
     ("ksh", SHELL),
     ("csh", SHELL),
@@ -326,9 +330,9 @@ const NAMES: &[(&str, Language)] = &[
     ("makefile", MAKE),
     ("gnumakefile", MAKE),
     ("bsdmakefile", MAKE),
-    ("dockerfile", SHELL),
-    ("containerfile", SHELL),
-    ("justfile", SHELL),
+    ("dockerfile", SHELL_PLAIN),
+    ("containerfile", SHELL_PLAIN),
+    ("justfile", SHELL_PLAIN),
     ("earthfile", SHELL),
     ("pkgbuild", SHELL),
     ("apkbuild", SHELL),
@@ -428,7 +432,7 @@ pub fn language_for(path: &str) -> Option<Language> {
         return Some(*language);
     }
     if lower.starts_with("dockerfile.") || lower.starts_with("containerfile.") {
-        return Some(SHELL);
+        return Some(SHELL_PLAIN);
     }
     let (_, ext) = name.rsplit_once('.')?;
     if ext.is_empty() {
@@ -481,11 +485,11 @@ pub fn language_for_file(path: &str) -> Option<Language> {
 
 #[cfg(test)]
 mod tests {
-    use super::{language_for, language_for_text, PHP, SLASH};
+    use super::{language_for, language_for_text, CLIKE, PHP};
 
     #[test]
     fn picks_by_extension_ignoring_case_and_folders() {
-        assert_eq!(language_for("a/b/C.c"), Some(SLASH));
+        assert_eq!(language_for("a/b/C.c"), Some(CLIKE));
         assert_eq!(language_for("x.php"), Some(PHP));
         assert!(language_for("README").is_none());
         assert!(language_for("notes.md").is_none());
