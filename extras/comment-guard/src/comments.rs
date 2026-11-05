@@ -7,43 +7,106 @@ pub enum LineKind<'a> {
     Other,
 }
 
-const EXEMPT: [&str; 35] = [
-    "noqa",
-    "type:",
-    "pragma",
-    "pylint:",
-    "mypy:",
-    "ruff:",
-    "fmt:",
-    "isort:",
-    "pyright:",
-    "eslint-",
-    "prettier-ignore",
-    "@ts-",
-    "istanbul ",
-    "c8 ",
-    "go:",
-    "nolint",
-    "swiftlint:",
-    "mark:",
-    "region",
-    "endregion",
-    "spdx-license-identifier",
-    "copyright",
-    "license",
-    "shellcheck",
-    "vim:",
-    "nosec",
-    "cspell:",
-    "-*-",
-    "eslint-disable",
-    "lint:",
-    "clippy::",
-    "rustfmt::",
-    "+build",
-    "@flow",
-    "@jsx",
+#[derive(Clone, Copy)]
+enum Tail {
+    Words,
+    Licence,
+    Compact,
+    Go,
+}
+
+// A tool directive is exempt only while what follows is its own arguments (codes, rule names),
+// never free text.
+const EXEMPT: &[(&str, Tail)] = &[
+    ("noqa", Tail::Words),
+    ("type:", Tail::Words),
+    ("pragma", Tail::Words),
+    ("pylint:", Tail::Words),
+    ("mypy:", Tail::Words),
+    ("ruff:", Tail::Words),
+    ("fmt:", Tail::Words),
+    ("isort:", Tail::Words),
+    ("pyright:", Tail::Words),
+    ("eslint-", Tail::Words),
+    ("prettier-ignore", Tail::Words),
+    ("@ts-", Tail::Words),
+    ("istanbul ", Tail::Words),
+    ("c8 ", Tail::Words),
+    ("go:", Tail::Go),
+    ("nolint", Tail::Compact),
+    ("swiftlint:", Tail::Words),
+    ("spdx-license-identifier", Tail::Licence),
+    ("shellcheck", Tail::Words),
+    ("nosec", Tail::Words),
+    ("cspell:", Tail::Words),
+    ("-*-", Tail::Words),
+    ("lint:", Tail::Words),
+    ("clippy::", Tail::Words),
+    ("rustfmt::", Tail::Words),
+    ("+build", Tail::Words),
+    ("@flow", Tail::Words),
+    ("@jsx", Tail::Words),
+    ("eslint-disable", Tail::Words),
 ];
+
+const DIRECTIVE_WORDS: &[&str] = &[
+    "ignore", "noqa", "env", "off", "on", "skip", "next", "line", "file", "no", "cover", "branch", "disable", "enable", "all",
+    "secret", "allowlist", "nextline", "start", "stop", "begin", "end", "if", "else", "set", "coding", "mode",
+    "encoding", "basic", "strict", "standard", "once", "node", "browser", "jest", "mocha", "jsx", "h", "check",
+    "nocheck", "expect", "and", "or", "with", "linux", "darwin", "windows", "freebsd", "netbsd", "openbsd", "solaris",
+    "plan9", "android", "ios", "js", "wasm", "aix", "illumos", "amd64", "arm", "arm64", "mips", "ppc64", "riscv64",
+    "s390x", "cgo", "race", "gc", "unix", "tag", "block", "nextblock", "generate", "build", "embed",
+];
+
+const GO_DIRECTIVES: &[&str] = &[
+    "generate", "build", "embed", "linkname", "noinline", "nosplit", "noescape", "norace", "nocheckptr", "debug",
+    "uintptrescapes", "wasmimport",
+];
+
+fn code_like(token: &str) -> bool {
+    token.chars().any(|c| c.is_ascii_digit() || "_-.[]=/@()<>|*&#$%^~+!".contains(c))
+}
+
+fn directive_words(tail: &str, upper: bool) -> bool {
+    let mut count = 0usize;
+    for token in tail
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | ':' | ';'))
+        .filter(|token| !token.is_empty())
+    {
+        count = count.saturating_add(1);
+        if count > 8 || token.chars().count() > 48 {
+            return false;
+        }
+        let word = token.to_ascii_lowercase();
+        let plain_upper = upper && token.len() <= 12 && token.chars().all(|c| c.is_ascii_uppercase());
+        if !(code_like(token) || plain_upper || DIRECTIVE_WORDS.contains(&word.as_str())) {
+            return false;
+        }
+    }
+    true
+}
+
+fn directive_tail(kind: Tail, tail: &str) -> bool {
+    match kind {
+        Tail::Words => directive_words(tail, false),
+        Tail::Licence => directive_words(tail, true),
+        Tail::Compact => {
+            let rest = tail.trim_end();
+            rest.is_empty()
+                || (rest.starts_with(':')
+                    && rest.len() > 1
+                    && rest.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | ',' | '_' | '-' | '.')))
+        }
+        Tail::Go => {
+            let rest = tail.trim_start();
+            let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            if !GO_DIRECTIVES.contains(&name.as_str()) && !name.starts_with("cgo_") {
+                return false;
+            }
+            name == "generate" || directive_words(rest.get(name.len()..).unwrap_or(""), false)
+        }
+    }
+}
 
 const DOC_ATTRIBUTES: [&str; 3] = ["@doc", "@moduledoc", "@typedoc"];
 
@@ -80,7 +143,9 @@ fn starts_ignore_case(text: &str, prefix: &str) -> bool {
 }
 
 fn is_exempt(text: &str) -> bool {
-    EXEMPT.iter().any(|prefix| starts_ignore_case(text, prefix))
+    EXEMPT.iter().any(|(prefix, kind)| {
+        starts_ignore_case(text, prefix) && text.get(prefix.len()..).is_some_and(|tail| directive_tail(*kind, tail))
+    })
 }
 
 fn find_unescaped(text: &str, needle: &str) -> Option<usize> {
@@ -349,6 +414,14 @@ impl<'a> Scan<'a> {
                 return Some(LineKind::Comment(trimmed.get(..upto).unwrap_or(trimmed)));
             }
         }
+        if lang.rem {
+            let word = trimmed.trim_start_matches('@');
+            let remark = word.get(..3).is_some_and(|head| head.eq_ignore_ascii_case("rem"))
+                && word.get(3..).is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
+            if remark || trimmed.starts_with("::") {
+                return Some(LineKind::Comment(trimmed));
+            }
+        }
         for &marker in lang.line {
             if trimmed.starts_with(marker) {
                 let shebang = marker == "#" && trimmed.starts_with("#!");
@@ -556,9 +629,24 @@ fn marker_fits(lang: Language, marker: &str, previous: Option<u8>, rest: &str) -
 mod tests {
     use super::{body, scan, LineKind};
     use crate::languages::{
-        Language, COMPONENT, CSS, ELIXIR, GO, HASH, HASKELL, HTML, LUA, PERL, PHP, PYTHON, RUBY, RUST, SCRIPT,
-        SHELL, SLASH, SQL,
+        Language, BASIC, BATCH, COMPONENT, CSS, ELIXIR, GO, HASH, HASKELL, HTML, LISP, LUA, OCAML, PERL, PHP,
+        POWERSHELL, PYTHON, RUBY, RUST, SCRIPT, SHELL, SLASH, SQL,
     };
+
+    #[test]
+    fn rem_and_double_colon_lines_are_batch_comments() {
+        assert_eq!(comments("REM one\n@rem two\n:: three\nrem\necho hi\n", BATCH).len(), 4);
+        assert!(comments("remember to save\necho rem\nset a=rem\n", BATCH).is_empty());
+        assert_eq!(comments("x = 1\nREM note\n' other\n", BASIC), vec!["REM note", "' other"]);
+    }
+
+    #[test]
+    fn lisp_ocaml_and_powershell_comment_forms_are_read() {
+        assert_eq!(comments("(a)\n; one\n#| two\nthree |#\n", LISP).len(), 3);
+        assert_eq!(comments("let a = 1 (* one *)\n(* two\nthree *)\n", OCAML).len(), 3);
+        assert_eq!(comments("$a = 1\n<#\none\n#>\n# two\n", POWERSHELL).len(), 4);
+        assert!(comments("$a = '# not'\n", POWERSHELL).is_empty());
+    }
 
     fn comments(text: &str, lang: Language) -> Vec<&str> {
         scan(text, lang)

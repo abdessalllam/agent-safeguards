@@ -1631,6 +1631,212 @@ fn identical_removed_lines_each_lend_their_words() {
 }
 
 #[test]
+fn build_scripting_and_markup_files_are_checked() {
+    let dir = temp_dir("kinds");
+    let kinds = [
+        ("s6.ps1", "# ", "", "$a = 1\n"),
+        ("m.psm1", "# ", "", "$a = 1\n"),
+        ("main.tf", "# ", "", "variable \"a\" {}\n"),
+        ("x.hcl", "// ", "", "a = 1\n"),
+        ("Makefile", "# ", "", "all:\n\techo hi\n"),
+        ("sub.mk", "# ", "", "all:\n\techo hi\n"),
+        ("Dockerfile", "# ", "", "FROM scratch\n"),
+        ("Dockerfile.dev", "# ", "", "FROM scratch\n"),
+        ("a.dockerfile", "# ", "", "FROM scratch\n"),
+        ("s14.bat", "REM ", "", "echo hi\n"),
+        ("s15.cmd", ":: ", "", "echo hi\n"),
+        ("s16.vbs", "' ", "", "x = 1\n"),
+        ("a.vb", "REM ", "", "x = 1\n"),
+        ("a.clj", "; ", "", "(def a 1)\n"),
+        ("a.el", ";; ", "", "(setq a 1)\n"),
+        ("a.asm", "; ", "", "nop\n"),
+        ("a.erl", "% ", "", "a() -> ok.\n"),
+        ("a.ml", "(* ", " *)", "let a = 1\n"),
+        ("a.fs", "// ", "", "let a = 1\n"),
+        ("a.adb", "-- ", "", "null;\n"),
+        ("a.f90", "! ", "", "end\n"),
+        ("a.nix", "# ", "", "{ }\n"),
+        ("a.jl", "# ", "", "a = 1\n"),
+        ("a.cmake", "# ", "", "set(A 1)\n"),
+        ("a.bzl", "# ", "", "A = 1\n"),
+        ("BUILD", "# ", "", "A = 1\n"),
+        ("Jenkinsfile", "// ", "", "pipeline {}\n"),
+        ("Gemfile", "# ", "", "source 'x'\n"),
+        ("a.rake", "# ", "", "task :a\n"),
+        ("a.svg", "<!-- ", " -->", "<svg></svg>\n"),
+        ("a.erb", "<%# ", " %>", "<p></p>\n"),
+        ("a.j2", "{# ", " #}", "<p></p>\n"),
+        ("a.hbs", "{{! ", " }}", "<p></p>\n"),
+        ("a.cshtml", "@* ", " *@", "<p></p>\n"),
+        ("a.pug", "// ", "", "p hi\n"),
+        ("a.thrift", "# ", "", "struct A {}\n"),
+        ("a.v", "// ", "", "module a; endmodule\n"),
+        ("a.glsl", "// ", "", "void main() {}\n"),
+        ("a.mts", "// ", "", "export const a = 1;\n"),
+        (".zshrc", "# ", "", "alias a=b\n"),
+    ];
+    for (name, open, close, code) in kinds {
+        let path = dir.join(name);
+        let four: String = (1..=4).map(|n| format!("{open}note {n}{close}\n")).collect();
+        let two: String = (1..=2).map(|n| format!("{open}note {n}{close}\n")).collect();
+        assert!(denied(&write_file(None, None, &path, &format!("{four}{code}"))), "four lines in {name}");
+        assert!(!denied(&write_file(None, None, &path, &format!("{two}{code}"))), "two lines in {name}");
+        assert!(!denied(&write_file(None, None, &path, code)), "code only in {name}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_script_without_an_extension_is_judged_by_its_first_line() {
+    let dir = temp_dir("shebang");
+    let four = "# note 1\n# note 2\n# note 3\n# note 4\n";
+    for line in ["#!/usr/bin/env bash", "#!/bin/sh", "#!/usr/bin/env python3", "#!/usr/bin/perl"] {
+        let path = dir.join("tool");
+        assert!(denied(&write_file(None, None, &path, &format!("{line}\n{four}echo hi\n"))), "{line}");
+        assert!(!denied(&write_file(None, None, &path, &format!("{line}\necho hi\n"))), "{line}");
+    }
+    let slashes = "// note 1\n// note 2\n// note 3\n// note 4\n";
+    let node = dir.join("serve");
+    assert!(denied(&write_file(None, None, &node, &format!("#!/usr/bin/env -S node\n{slashes}run();\n"))));
+    let notes = dir.join("notes");
+    assert!(!denied(&write_file(None, None, &notes, &format!("{four}x\n"))));
+    let config = dir.join("settings.ini");
+    assert!(!denied(&write_file(None, None, &config, &format!("{four}[a]\nb = 1\n"))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_powershell_block_comment_counts_every_line() {
+    let dir = temp_dir("ps-block");
+    let path = dir.join("a.ps1");
+    let block = "<#\nnote one\nnote two\nnote three\n#>\n$a = 1\n";
+    assert!(denied(&write_file(None, None, &path, block)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn wrote_four_after(rig: &Rig, id: &str, command: &str, file: &Path, text: &str) -> String {
+    rig.pre_bash_with("shape", id, command);
+    std::fs::write(file, text).expect("write");
+    rig.bash_with_id("shape", id, command)
+}
+
+#[test]
+fn a_command_that_writes_outside_the_project_through_a_variable_is_reported() {
+    let rig = Rig::new("shape-var");
+    let scratch = temp_dir("shape-var-scratch");
+    let four = "x = 1\n# note 1\n# note 2\n# note 3\n# note 4\n";
+    let file = scratch.join("b.py");
+    let command = format!("S={}; printf x > \"$S/b.py\"", scratch.display());
+    let out = wrote_four_after(&rig, "v1", &command, &file, four);
+    assert!(out.contains("\"decision\":\"block\""), "{out}");
+    let braces = scratch.join("c.py");
+    let command = format!("D={}\nprintf x > ${{D}}/c.py", scratch.display());
+    let other = "y = 1\n# memo 1\n# memo 2\n# memo 3\n# memo 4\n";
+    let out = wrote_four_after(&rig, "v2", &command, &braces, other);
+    assert!(out.contains("\"decision\":\"block\""), "{out}");
+    let hidden = scratch.join("q.py");
+    let command = format!("D={}\nprintf x > \"$(dirname $D/z)/q.py\"", scratch.display());
+    let third = "z = 1\n# memo 5\n# memo 6\n# memo 7\n# memo 8\n";
+    let out = wrote_four_after(&rig, "v3", &command, &hidden, third);
+    assert!(out.contains("\"decision\":\"block\""), "{out}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn a_command_that_changes_folder_first_is_reported() {
+    let rig = Rig::new("shape-cd");
+    let scratch = temp_dir("shape-cd-scratch");
+    let four = "x = 1\n# note 1\n# note 2\n# note 3\n# note 4\n";
+    let file = scratch.join("e.py");
+    let command = format!("cd {} && printf x > e.py", scratch.display());
+    let out = wrote_four_after(&rig, "c1", &command, &file, four);
+    assert!(out.contains("\"decision\":\"block\""), "{out}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn an_existing_file_that_a_command_edits_is_judged_from_what_it_held_before() {
+    let rig = Rig::new("shape-existing");
+    let scratch = temp_dir("shape-existing-scratch");
+    let file = scratch.join("g.py");
+    std::fs::write(&file, "x = 1\n# old 1\n# old 2\n# old 3\ny = 2\n").expect("write");
+    let command = format!("sed -i '' '1i x' {}", file.display());
+    let four = "x = 1\n# old 1\n# old 2\n# old 3\n# note 1\n# note 2\n# note 3\ny = 2\n";
+    let out = wrote_four_after(&rig, "e1", &command, &file, four);
+    assert!(out.contains("\"decision\":\"block\""), "{out}");
+    let same = scratch.join("h.py");
+    std::fs::write(&same, "x = 1\n# old 1\n# old 2\n# old 3\ny = 2\n").expect("write");
+    let command = format!("sed -i '' 's/x = 1/x = 2/' {}", same.display());
+    let swapped = "x = 2\n# old 1\n# old 2\n# old 3\ny = 2\n";
+    let quiet = wrote_four_after(&rig, "e2", &command, &same, swapped);
+    assert!(quiet.is_empty(), "{quiet}");
+    let moved = scratch.join("m.py");
+    std::fs::write(&moved, "x = 1\n# old 1\ny = 2\n").expect("write");
+    let command = format!("cd {} && sed -i '' '1i x' m.py", scratch.display());
+    let text = "x = 1\n# old 1\n# new 1\n# new 2\n# new 3\ny = 2\n";
+    let out = wrote_four_after(&rig, "e3", &command, &moved, text);
+    assert!(out.contains("\"decision\":\"block\""), "{out}");
+    let named = scratch.join("n.py");
+    std::fs::write(&named, "x = 1\n# old 1\ny = 2\n").expect("write");
+    let command = format!("S={}; sed -i '' '1i x' \"$S/n.py\"", scratch.display());
+    let text = "x = 1\n# old 1\n# new 4\n# new 5\n# new 6\ny = 2\n";
+    let out = wrote_four_after(&rig, "e4", &command, &named, text);
+    assert!(out.contains("\"decision\":\"block\""), "{out}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+fn notebook_of(cells: &[(&str, &str)]) -> String {
+    let items: Vec<Value> = cells
+        .iter()
+        .enumerate()
+        .map(|(n, (kind, source))| json!({ "cell_type": kind, "metadata": {}, "source": source, "id": format!("c{n}") }))
+        .collect();
+    json!({ "cells": items, "metadata": {}, "nbformat": 4, "nbformat_minor": 5 }).to_string()
+}
+
+fn notebook_edit(state: Option<&Path>, session: Option<&str>, path: &Path, input: Value) -> Verdict {
+    let mut input = input;
+    if let Some(map) = input.as_object_mut() {
+        map.insert("notebook_path".to_owned(), json!(path.to_string_lossy()));
+    }
+    pre(state, session, "NotebookEdit", input, Provider::Claude)
+}
+
+#[test]
+fn a_notebook_edit_is_judged_by_the_code_it_leaves() {
+    let dir = temp_dir("notebook");
+    let path = dir.join("nb.ipynb");
+    std::fs::write(&path, notebook_of(&[("code", "x = 1"), ("markdown", "# title")])).expect("write");
+    let four = "# note 1\n# note 2\n# note 3\n# note 4\ny = 2";
+    let inserted = json!({ "new_source": four, "cell_type": "code", "edit_mode": "insert", "cell_id": "c0" });
+    assert!(denied(&notebook_edit(None, None, &path, inserted)));
+    let two = json!({ "new_source": "# note 1\n# note 2\ny = 2", "cell_type": "code", "edit_mode": "insert" });
+    assert!(!denied(&notebook_edit(None, None, &path, two)));
+    let replaced = json!({ "new_source": four, "cell_id": "c0" });
+    assert!(denied(&notebook_edit(None, None, &path, replaced)));
+    let prose = json!({ "new_source": "# a\n# b\n# c\n# d", "cell_type": "markdown", "edit_mode": "insert" });
+    assert!(!denied(&notebook_edit(None, None, &path, prose)));
+    let removed = json!({ "edit_mode": "delete", "cell_id": "c0" });
+    assert!(!denied(&notebook_edit(None, None, &path, removed)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_notebook_written_or_edited_as_a_file_is_judged_by_its_code_cells() {
+    let dir = temp_dir("notebook-file");
+    let path = dir.join("nb.ipynb");
+    let commented = notebook_of(&[("code", "# note 1\n# note 2\n# note 3\n# note 4\ny = 2")]);
+    assert!(denied(&write_file(None, None, &path, &commented)));
+    let markdown = notebook_of(&[("markdown", "# a\n# b\n# c\n# d"), ("code", "y = 2")]);
+    assert!(!denied(&write_file(None, None, &path, &markdown)));
+    std::fs::write(&path, notebook_of(&[("code", "y = 2")])).expect("write");
+    let old = "\"source\":\"y = 2\"";
+    let new = "\"source\":\"# note 1\\n# note 2\\n# note 3\\n# note 4\\ny = 2\"";
+    assert!(denied(&edit_file(None, None, &path, old, new)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_rewrap_ignores_case_and_punctuation() {
     let dir = temp_dir("word-case");
     let path = dir.join("a.py");

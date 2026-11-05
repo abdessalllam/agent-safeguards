@@ -5,10 +5,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Map, Value};
 
-use crate::changes::{read_old, resolve, MAX_OLD_FILE};
+use crate::changes::{read_source, resolve, MAX_OLD_FILE};
 use crate::decision::{comment_lines, evaluate_after, Change};
 use crate::git::{drop_marked, inside_repository, run_git};
-use crate::languages::language_for;
+use crate::languages::language_for_file;
 use crate::session::{content_hash, identity, seen_of, Ledger};
 use crate::Verdict;
 
@@ -19,6 +19,9 @@ const MAX_CANDIDATES: usize = 40;
 const SOURCE_FILES: usize = 400;
 const NAMED_PATHS: usize = 2000;
 const GLOB_WORDS: usize = 64;
+const MAX_BASES: usize = 4;
+const NAMED_DIRS: usize = 3;
+const NAMED_RECORDS: usize = 64;
 const LISTING_ENTRIES: usize = 20000;
 const REFRESH_TIME: Duration = Duration::from_millis(1000);
 const COPY_TIME: Duration = Duration::from_millis(1500);
@@ -89,11 +92,14 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger) -> Verdict {
         .unwrap_or(SystemTime::UNIX_EPOCH);
     ledger.mark_check(&key);
     let importing = imports_history(command);
-    let (mut files, quiet): (Vec<PathBuf>, Vec<PathBuf>) = command_paths(command, &cwd, NAMED_PATHS, deadline)
-        .into_iter()
-        .partition(|path| changed_since(path, since));
+    let (named, folders) = command_targets(command, &cwd, NAMED_PATHS, deadline);
+    let (mut files, quiet): (Vec<PathBuf>, Vec<PathBuf>) = named.into_iter().partition(|path| changed_since(path, since));
     let room = MAX_CANDIDATES.saturating_sub(files.len());
     files.extend(walk_files(&cwd, room, deadline, &|meta| modified_since(meta, since)));
+    for folder in folders {
+        let room = MAX_CANDIDATES.saturating_sub(files.len());
+        files.extend(walk_files(&folder, room, deadline, &|meta| modified_since(meta, since)));
+    }
     files.extend(quiet.into_iter().take(MAX_CANDIDATES));
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut changes: Vec<Change> = Vec::new();
@@ -143,30 +149,41 @@ pub fn refresh_named(payload: &Map<String, Value>, ledger: &Ledger) {
     let deadline = Instant::now() + REFRESH_TIME;
     let mut targets: Vec<PathBuf> = Vec::new();
     let mut listed: HashSet<PathBuf> = HashSet::new();
+    let mut direct: HashSet<PathBuf> = HashSet::new();
     for token in command_tokens(command_of(payload), &cwd, NAMED_PATHS, deadline) {
+        if token.is_file() {
+            direct.insert(token.clone());
+        }
         for file in source_files(&token, deadline) {
             if listed.len() < NAMED_PATHS * 2 && listed.insert(file.clone()) {
                 targets.push(file);
             }
         }
     }
+    let mut recorded = 0usize;
     for path in targets {
         if Instant::now() >= deadline {
             break;
         }
         let name = path.to_string_lossy().into_owned();
-        let Some(lang) = language_for(&name) else {
+        let Some(lang) = language_for_file(&name) else {
             continue;
         };
         let id = identity(&path);
-        if ledger.read(&id).is_none() {
+        let known = ledger.read(&id).is_some();
+        if !known && (!direct.contains(&path) || recorded >= NAMED_RECORDS) {
             continue;
         }
-        let Some(current) = read_old(&path) else {
+        let Some(current) = read_source(&path) else {
             continue;
         };
         let comments = comment_lines(&current, lang);
         let state = seen_of(&current, &comments);
+        if !known {
+            recorded = recorded.saturating_add(1);
+            ledger.baseline_for(&id, state, || comments);
+            continue;
+        }
         if !ledger.knows(&id, state) {
             ledger.rebaseline_soon(&id, comments, state);
         }
@@ -304,11 +321,85 @@ fn command_words(command: &str) -> Vec<String> {
     words
 }
 
+fn assignments(command: &str) -> HashMap<String, String> {
+    let mut vars: HashMap<String, String> = HashMap::new();
+    for word in shell_words(command) {
+        let Some((name, value)) = word.split_once('=') else {
+            continue;
+        };
+        let plain = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if name.is_empty() || !plain || name.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
+        let value = expand_vars(value, &vars).unwrap_or_else(|| value.to_owned());
+        vars.insert(name.to_owned(), value);
+    }
+    vars
+}
+
+fn expand_vars(word: &str, vars: &HashMap<String, String>) -> Option<String> {
+    if !word.contains('$') {
+        return None;
+    }
+    let chars: Vec<char> = word.chars().collect();
+    let mut out = String::new();
+    let mut at = 0usize;
+    while let Some(&c) = chars.get(at) {
+        if c != '$' {
+            out.push(c);
+            at = at.saturating_add(1);
+            continue;
+        }
+        let braced = chars.get(at.saturating_add(1)) == Some(&'{');
+        let from = at.saturating_add(if braced { 2 } else { 1 });
+        let name: String = chars
+            .iter()
+            .skip(from)
+            .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+            .collect();
+        let end = from.saturating_add(name.chars().count());
+        if name.is_empty() || (braced && chars.get(end) != Some(&'}')) {
+            return None;
+        }
+        let value = vars.get(&name).cloned().or_else(|| std::env::var(&name).ok())?;
+        out.push_str(&value);
+        at = end.saturating_add(usize::from(braced));
+    }
+    Some(out)
+}
+
+fn search_bases(command: &str, cwd: &Path, vars: &HashMap<String, String>) -> Vec<PathBuf> {
+    let mut bases = vec![cwd.to_path_buf()];
+    for pair in shell_words(command).windows(2) {
+        let (Some(first), Some(target)) = (pair.first(), pair.get(1)) else {
+            continue;
+        };
+        if !matches!(first.as_str(), "cd" | "pushd") || target.starts_with('-') {
+            continue;
+        }
+        let target = expand_vars(target, vars).unwrap_or_else(|| target.clone());
+        let path = match (target.strip_prefix("~/"), home()) {
+            (Some(rest), Some(root)) => root.join(rest),
+            _ => resolve(cwd, &target),
+        };
+        if path.is_dir() && !bases.contains(&path) && bases.len() < MAX_BASES {
+            bases.push(path);
+        }
+    }
+    bases
+}
+
 fn command_tokens(command: &str, cwd: &Path, limit: usize, deadline: Instant) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut cache = Listings::new();
     let mut globs = 0usize;
-    for word in command_words(command) {
+    let vars = assignments(command);
+    let bases = search_bases(command, cwd, &vars);
+    out.extend(bases.iter().skip(1).cloned());
+    let mut words = command_words(command);
+    let expanded: Vec<String> = words.iter().filter_map(|word| expand_vars(word, &vars)).collect();
+    words.extend(expanded);
+    for word in words {
         if out.len() >= limit || Instant::now() >= deadline {
             break;
         }
@@ -319,26 +410,41 @@ fn command_tokens(command: &str, cwd: &Path, limit: usize, deadline: Instant) ->
         if glob {
             globs = globs.saturating_add(1);
             if globs <= GLOB_WORDS {
-                out.extend(expand_glob(cwd, &word, &mut cache, limit.saturating_sub(out.len())));
+                for base in &bases {
+                    out.extend(expand_glob(base, &word, &mut cache, limit.saturating_sub(out.len())));
+                }
             }
         } else {
-            let path = match (word.strip_prefix("~/"), home()) {
-                (Some(rest), Some(root)) => root.join(rest),
-                _ => resolve(cwd, &word),
-            };
-            if path.exists() {
-                out.push(path);
+            for base in &bases {
+                let path = match (word.strip_prefix("~/"), home()) {
+                    (Some(rest), Some(root)) => root.join(rest),
+                    _ => resolve(base, &word),
+                };
+                if path.exists() {
+                    out.push(path);
+                }
+                if word.starts_with('/') || word.starts_with("~/") {
+                    break;
+                }
             }
         }
     }
     out
 }
 
-fn command_paths(command: &str, cwd: &Path, limit: usize, deadline: Instant) -> Vec<PathBuf> {
-    command_tokens(command, cwd, limit, deadline)
+fn command_targets(command: &str, cwd: &Path, limit: usize, deadline: Instant) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let tokens = command_tokens(command, cwd, limit, deadline);
+    let folders: Vec<PathBuf> = tokens
+        .iter()
+        .filter(|path| path.is_dir() && !cwd.starts_with(path) && !path.starts_with(cwd))
+        .take(NAMED_DIRS)
+        .cloned()
+        .collect();
+    let files = tokens
         .into_iter()
-        .filter(|path| path.is_file() && language_for(&path.to_string_lossy()).is_some())
-        .collect()
+        .filter(|path| path.is_file() && language_for_file(&path.to_string_lossy()).is_some())
+        .collect();
+    (files, folders)
 }
 
 fn modified_since(meta: &fs::Metadata, since: SystemTime) -> bool {
@@ -375,8 +481,8 @@ fn walk_files(root: &Path, limit: usize, deadline: Instant, keep: &dyn Fn(&fs::M
                     stack.push(entry.path());
                 }
             } else if kind.is_file()
-                && language_for(&name).is_some()
                 && entry.metadata().is_ok_and(|meta| keep(&meta))
+                && language_for_file(&entry.path().to_string_lossy()).is_some()
             {
                 files.push(entry.path());
             }
@@ -387,7 +493,7 @@ fn walk_files(root: &Path, limit: usize, deadline: Instant, keep: &dyn Fn(&fs::M
 
 fn source_files(path: &Path, deadline: Instant) -> Vec<PathBuf> {
     if path.is_file() {
-        return if language_for(&path.to_string_lossy()).is_some() {
+        return if language_for_file(&path.to_string_lossy()).is_some() {
             vec![path.to_path_buf()]
         } else {
             Vec::new()
@@ -421,7 +527,7 @@ fn drop_copies(changes: &mut Vec<Change>, command: &str, cwd: &Path, since: Syst
             if changed_since(&file, since) {
                 continue;
             }
-            let Some(text) = read_old(&file) else {
+            let Some(text) = read_source(&file) else {
                 continue;
             };
             if text.len() > budget {
@@ -440,7 +546,7 @@ fn drop_copies(changes: &mut Vec<Change>, command: &str, cwd: &Path, since: Syst
             kept.push(change);
             continue;
         }
-        if let Some(lang) = language_for(&change.file) {
+        if let Some(lang) = language_for_file(&change.file) {
             let comments = comment_lines(&change.new, lang);
             let state = seen_of(&change.new, &comments);
             ledger.rebaseline(&identity(Path::new(&change.file)), comments, state);
@@ -515,10 +621,10 @@ fn looks_generated(text: &str) -> bool {
 
 fn rebaseline(path: &Path, since: SystemTime, ledger: &Ledger) {
     let name = path.to_string_lossy();
-    let Some(lang) = language_for(&name) else {
+    let Some(lang) = language_for_file(&name) else {
         return;
     };
-    let Some(current) = read_old(path) else {
+    let Some(current) = read_source(path) else {
         return;
     };
     let comments = comment_lines(&current, lang);
@@ -531,8 +637,8 @@ fn rebaseline(path: &Path, since: SystemTime, ledger: &Ledger) {
 
 fn change_for(path: &Path, since: SystemTime, ledger: &Ledger, deadline: Instant) -> Option<Change> {
     let name = path.to_string_lossy().into_owned();
-    let lang = language_for(&name)?;
-    let current = read_old(path)?;
+    let lang = language_for_file(&name)?;
+    let current = read_source(path)?;
     if looks_generated(&current) {
         return None;
     }
@@ -718,7 +824,7 @@ fn imports_history(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_paths, command_tokens, expand_glob, imports_history, is_copy, looks_generated, segments, shell_words, wildcard_match, Listings};
+    use super::{command_targets, command_tokens, expand_glob, imports_history, is_copy, looks_generated, segments, shell_words, wildcard_match, Listings};
     use crate::session::content_hash;
     use std::collections::HashMap;
     use std::path::Path;
@@ -735,11 +841,11 @@ mod tests {
         let file = dir.join("out.py");
         let _ = std::fs::write(&file, "x = 1\n");
         let command = format!("printf '# a\\n' > {} && sed -i '' 1d notes.md missing.py", file.display());
-        let found = command_paths(&command, &dir, 100, soon());
+        let found = command_targets(&command, &dir, 100, soon()).0;
         assert_eq!(found, vec![file.clone()]);
-        let relative = command_paths("echo hi >out.py", &dir, 100, soon());
+        let relative = command_targets("echo hi >out.py", &dir, 100, soon()).0;
         assert_eq!(relative, vec![file]);
-        assert!(command_paths("ls -la", Path::new("/"), 100, soon()).is_empty());
+        assert!(command_targets("ls -la", Path::new("/"), 100, soon()).0.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

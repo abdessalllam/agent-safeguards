@@ -52,13 +52,102 @@ pub fn collect(
     provider: Provider,
     base: &Path,
 ) -> Vec<Change> {
-    match (provider, tool) {
+    let mut out = match (provider, tool) {
         (Provider::Claude, "Edit") => one(edit(input, base)),
         (Provider::Claude, "Write") => one(write(input, base)),
         (Provider::Claude, "MultiEdit") => multi_edit(input, base),
+        (Provider::Claude, "NotebookEdit") => one(notebook_edit(input, base)),
         (Provider::Codex, "apply_patch") => patch(input, base),
         _ => Vec::new(),
+    };
+    for change in out.iter_mut() {
+        if change.partial || !is_notebook(&change.file) {
+            continue;
+        }
+        let old = if change.old.trim().is_empty() { Some(String::new()) } else { notebook_text(&change.old) };
+        if let (Some(old), Some(new)) = (old, notebook_text(&change.new)) {
+            change.old = old;
+            change.new = new;
+        }
     }
+    out
+}
+
+fn is_notebook(file: &str) -> bool {
+    file.to_ascii_lowercase().ends_with(".ipynb")
+}
+
+fn cell_source(source: Option<&Value>) -> String {
+    match source {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts.iter().filter_map(Value::as_str).collect(),
+        _ => String::new(),
+    }
+}
+
+pub fn notebook_text(raw: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(raw).ok()?;
+    let mut out = String::new();
+    for cell in value.get("cells")?.as_array()? {
+        if cell.get("cell_type").and_then(Value::as_str) != Some("code") {
+            continue;
+        }
+        out.push_str(&cell_source(cell.get("source")));
+        out.push_str("\n\n");
+    }
+    Some(out)
+}
+
+pub fn read_source(path: &Path) -> Option<String> {
+    let raw = read_old(path)?;
+    if is_notebook(&path.to_string_lossy()) {
+        return notebook_text(&raw);
+    }
+    Some(raw)
+}
+
+fn find_cell(cells: &[Value], id: &str) -> Option<usize> {
+    if let Some(found) = cells.iter().position(|cell| cell.get("id").and_then(Value::as_str) == Some(id)) {
+        return Some(found);
+    }
+    let digits: String = id.chars().filter(char::is_ascii_digit).collect();
+    digits.parse::<usize>().ok().filter(|index| *index < cells.len())
+}
+
+fn notebook_edit(input: &Map<String, Value>, base: &Path) -> Option<Change> {
+    let file = text(input, "notebook_path").or_else(|| text(input, "file_path"))?;
+    let raw = current_text(&resolve(base, file))?;
+    let mut document: Value = serde_json::from_str(&raw).ok()?;
+    let old = notebook_text(&raw)?;
+    let source = text(input, "new_source").unwrap_or("");
+    let kind = text(input, "cell_type");
+    let cells = document.get_mut("cells")?.as_array_mut()?;
+    let index = text(input, "cell_id").and_then(|id| find_cell(cells, id));
+    match text(input, "edit_mode").unwrap_or("replace") {
+        "insert" => {
+            let cell = serde_json::json!({
+                "cell_type": kind.unwrap_or("code"),
+                "metadata": {},
+                "source": source,
+            });
+            let at = index.map_or(0, |found| found.saturating_add(1));
+            cells.insert(at.min(cells.len()), cell);
+        }
+        "delete" => {
+            if let Some(found) = index {
+                cells.remove(found);
+            }
+        }
+        _ => {
+            let cell = cells.get_mut(index?)?;
+            cell["source"] = Value::String(source.to_owned());
+            if let Some(kind) = kind {
+                cell["cell_type"] = Value::String(kind.to_owned());
+            }
+        }
+    }
+    let new = notebook_text(&document.to_string())?;
+    Some(Change::whole(file.to_owned(), old, new))
 }
 
 fn one(change: Option<Change>) -> Vec<Change> {

@@ -15,6 +15,7 @@ pub struct Language {
     pub dash_symbols: bool,
     pub nested: bool,
     pub regex: bool,
+    pub rem: bool,
 }
 
 const C_BLOCKS: &[(&str, &str)] = &[("/*", "*/")];
@@ -37,6 +38,7 @@ const BASE: Language = Language {
     dash_symbols: false,
     nested: false,
     regex: false,
+    rem: false,
 };
 
 pub const HASH: Language = Language { line: &["#"], ..BASE };
@@ -97,6 +99,28 @@ pub const COMPONENT: Language = Language {
 pub const CSS: Language = Language { block: &[("/*", "*/")], ..BASE };
 pub const SCSS: Language = Language { line: &["//"], block: &[("/*", "*/")], ..BASE };
 
+pub const POWERSHELL: Language = Language { line: &["#"], block: &[("<#", "#>")], hash_after_space: true, ..BASE };
+pub const HCL: Language = Language { line: &["#", "//"], block: C_BLOCKS, quotes: "\"", ..BASE };
+pub const CMAKE: Language =
+    Language { line: &["#"], block: &[("#[[", "]]"), ("#[=[", "]=]")], hash_after_space: true, ..BASE };
+pub const BATCH: Language = Language { rem: true, ..BASE };
+pub const BASIC: Language = Language { line: &["'"], quotes: "\"", rem: true, ..BASE };
+pub const LISP: Language = Language { line: &[";"], block: &[("#|", "|#")], quotes: "\"", nested: true, ..BASE };
+pub const SEMICOLON: Language = Language { line: &[";"], ..BASE };
+pub const PERCENT: Language = Language { line: &["%"], quotes: "\"", ..BASE };
+pub const OCAML: Language = Language { block: &[("(*", "*)")], quotes: "\"", nested: true, ..BASE };
+pub const FSHARP: Language = Language { line: &["//"], block: &[("(*", "*)")], quotes: "\"", nested: true, ..BASE };
+pub const PASCAL: Language = Language { line: &["//"], block: &[("(*", "*)"), ("{", "}")], quotes: "'", ..BASE };
+pub const DASHES: Language = Language { line: &["--"], quotes: "\"", ..BASE };
+pub const FORTRAN: Language = Language { line: &["!"], ..BASE };
+pub const NIX: Language = Language { line: &["#"], block: C_BLOCKS, quotes: "\"", ..BASE };
+pub const JULIA: Language = Language { line: &["#"], block: &[("#=", "=#")], nested: true, ..BASE };
+pub const ERB: Language = Language { block: &[("<!--", "-->"), ("<%#", "%>"), ("/*", "*/")], ..BASE };
+pub const JINJA: Language = Language { block: &[("<!--", "-->"), ("{#", "#}"), ("/*", "*/")], ..BASE };
+pub const HANDLEBARS: Language = Language { block: &[("<!--", "-->"), ("{{!--", "--}}"), ("{{!", "}}")], ..BASE };
+pub const RAZOR: Language = Language { block: &[("<!--", "-->"), ("@*", "*@"), ("/*", "*/")], ..BASE };
+pub const PUG: Language = Language { line: &["//"], ..BASE };
+
 const TABLE: &[(&str, Language)] = &[
     ("sh", SHELL),
     ("bash", SHELL),
@@ -156,6 +180,206 @@ const TABLE: &[(&str, Language)] = &[
     ("scss", SCSS),
     ("sass", SCSS),
     ("less", SCSS),
+    ("svg", HTML),
+    ("ipynb", PYTHON),
+    ("ps1", POWERSHELL),
+    ("psm1", POWERSHELL),
+    ("psd1", POWERSHELL),
+    ("tf", HCL),
+    ("tfvars", HCL),
+    ("hcl", HCL),
+    ("nomad", HCL),
+    ("thrift", HCL),
+    ("jsonnet", HCL),
+    ("libsonnet", HCL),
+    ("mk", SHELL),
+    ("mak", SHELL),
+    ("make", SHELL),
+    ("dockerfile", SHELL),
+    ("containerfile", SHELL),
+    ("just", SHELL),
+    ("bats", SHELL),
+    ("ksh", SHELL),
+    ("csh", SHELL),
+    ("tcsh", SHELL),
+    ("ash", SHELL),
+    ("command", SHELL),
+    ("cmake", CMAKE),
+    ("nix", NIX),
+    ("jl", JULIA),
+    ("tcl", HASH),
+    ("awk", HASH),
+    ("graphql", HASH),
+    ("gql", HASH),
+    ("capnp", HASH),
+    ("rego", HASH),
+    ("mojo", HASH),
+    ("bat", BATCH),
+    ("cmd", BATCH),
+    ("vb", BASIC),
+    ("vbs", BASIC),
+    ("bas", BASIC),
+    ("clj", LISP),
+    ("cljs", LISP),
+    ("cljc", LISP),
+    ("lisp", LISP),
+    ("lsp", LISP),
+    ("el", LISP),
+    ("scm", LISP),
+    ("rkt", LISP),
+    ("asm", SEMICOLON),
+    ("nasm", SEMICOLON),
+    ("erl", PERCENT),
+    ("hrl", PERCENT),
+    ("ml", OCAML),
+    ("mli", OCAML),
+    ("fs", FSHARP),
+    ("fsi", FSHARP),
+    ("fsx", FSHARP),
+    ("pas", PASCAL),
+    ("dpr", PASCAL),
+    ("adb", DASHES),
+    ("ads", DASHES),
+    ("vhd", DASHES),
+    ("vhdl", DASHES),
+    ("purs", HASKELL),
+    ("idr", HASKELL),
+    ("agda", HASKELL),
+    ("lean", HASKELL),
+    ("dhall", HASKELL),
+    ("f90", FORTRAN),
+    ("f95", FORTRAN),
+    ("f03", FORTRAN),
+    ("f08", FORTRAN),
+    ("bzl", PYTHON),
+    ("bazel", PYTHON),
+    ("star", PYTHON),
+    ("pyw", PYTHON),
+    ("pyx", PYTHON),
+    ("pxd", PYTHON),
+    ("rake", RUBY),
+    ("gemspec", RUBY),
+    ("ru", RUBY),
+    ("podspec", RUBY),
+    ("mts", SCRIPT),
+    ("cts", SCRIPT),
+    ("prisma", SLASH),
+    ("bicep", SLASH),
+    ("cue", SLASH),
+    ("move", SLASH),
+    ("cairo", SLASH),
+    ("odin", SLASH),
+    ("gleam", SLASH),
+    ("hx", SLASH),
+    ("vala", SLASH),
+    ("v", SLASH),
+    ("sv", SLASH),
+    ("svh", SLASH),
+    ("d", SLASH),
+    ("cu", SLASH),
+    ("cuh", SLASH),
+    ("cl", SLASH),
+    ("glsl", SLASH),
+    ("vert", SLASH),
+    ("frag", SLASH),
+    ("wgsl", SLASH),
+    ("hlsl", SLASH),
+    ("metal", SLASH),
+    ("ino", SLASH),
+    ("erb", ERB),
+    ("ejs", ERB),
+    ("j2", JINJA),
+    ("jinja", JINJA),
+    ("jinja2", JINJA),
+    ("twig", JINJA),
+    ("njk", JINJA),
+    ("hbs", HANDLEBARS),
+    ("handlebars", HANDLEBARS),
+    ("mustache", HANDLEBARS),
+    ("cshtml", RAZOR),
+    ("razor", RAZOR),
+    ("pug", PUG),
+    ("jade", PUG),
+];
+
+const NAMES: &[(&str, Language)] = &[
+    ("makefile", SHELL),
+    ("gnumakefile", SHELL),
+    ("bsdmakefile", SHELL),
+    ("dockerfile", SHELL),
+    ("containerfile", SHELL),
+    ("justfile", SHELL),
+    ("earthfile", SHELL),
+    ("pkgbuild", SHELL),
+    ("apkbuild", SHELL),
+    (".bashrc", SHELL),
+    (".bash_profile", SHELL),
+    (".bash_login", SHELL),
+    (".bash_logout", SHELL),
+    (".profile", SHELL),
+    (".zshrc", SHELL),
+    (".zshenv", SHELL),
+    (".zprofile", SHELL),
+    (".zlogin", SHELL),
+    (".zlogout", SHELL),
+    (".kshrc", SHELL),
+    (".envrc", SHELL),
+    ("jenkinsfile", GROOVY),
+    ("vagrantfile", RUBY),
+    ("rakefile", RUBY),
+    ("gemfile", RUBY),
+    ("podfile", RUBY),
+    ("brewfile", RUBY),
+    ("guardfile", RUBY),
+    ("capfile", RUBY),
+    ("fastfile", RUBY),
+    ("appfile", RUBY),
+    ("dangerfile", RUBY),
+    ("berksfile", RUBY),
+    ("puppetfile", RUBY),
+    ("thorfile", RUBY),
+    ("cmakelists.txt", CMAKE),
+    ("build", PYTHON),
+    ("workspace", PYTHON),
+    ("tiltfile", PYTHON),
+    ("sconstruct", PYTHON),
+    ("sconscript", PYTHON),
+];
+
+const INTERPRETERS: &[(&str, Language)] = &[
+    ("sh", SHELL),
+    ("bash", SHELL),
+    ("zsh", SHELL),
+    ("dash", SHELL),
+    ("ash", SHELL),
+    ("ksh", SHELL),
+    ("fish", SHELL),
+    ("csh", SHELL),
+    ("tcsh", SHELL),
+    ("make", SHELL),
+    ("python", PYTHON),
+    ("pypy", PYTHON),
+    ("ruby", RUBY),
+    ("perl", PERL),
+    ("node", SCRIPT),
+    ("nodejs", SCRIPT),
+    ("deno", SCRIPT),
+    ("bun", SCRIPT),
+    ("tsx", SCRIPT),
+    ("php", PHP),
+    ("lua", LUA),
+    ("luajit", LUA),
+    ("rscript", HASH),
+    ("tclsh", HASH),
+    ("wish", HASH),
+    ("expect", HASH),
+    ("awk", HASH),
+    ("gawk", HASH),
+    ("mawk", HASH),
+    ("julia", JULIA),
+    ("groovy", GROOVY),
+    ("pwsh", POWERSHELL),
+    ("powershell", POWERSHELL),
 ];
 
 impl Language {
@@ -172,9 +396,20 @@ impl Language {
     }
 }
 
-pub fn language_for(path: &str) -> Option<Language> {
+fn file_name(path: &str) -> &str {
     let name = path.rsplit_once('/').map_or(path, |(_, tail)| tail);
-    let name = name.rsplit_once('\\').map_or(name, |(_, tail)| tail);
+    name.rsplit_once('\\').map_or(name, |(_, tail)| tail)
+}
+
+pub fn language_for(path: &str) -> Option<Language> {
+    let name = file_name(path);
+    let lower = name.to_ascii_lowercase();
+    if let Some((_, language)) = NAMES.iter().find(|(known, _)| lower == *known) {
+        return Some(*language);
+    }
+    if lower.starts_with("dockerfile.") || lower.starts_with("containerfile.") {
+        return Some(SHELL);
+    }
     let (_, ext) = name.rsplit_once('.')?;
     if ext.is_empty() {
         return None;
@@ -185,9 +420,48 @@ pub fn language_for(path: &str) -> Option<Language> {
         .map(|(_, language)| *language)
 }
 
+fn interpreter_language(first_line: &str) -> Option<Language> {
+    let mut words = first_line.strip_prefix("#!")?.split_whitespace();
+    let program = words.next()?;
+    let mut name = program.rsplit('/').next().unwrap_or(program);
+    if name == "env" {
+        name = words.find(|word| !word.starts_with('-') && !word.contains('='))?;
+        name = name.rsplit('/').next().unwrap_or(name);
+    }
+    let name = name.to_ascii_lowercase();
+    let name = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    INTERPRETERS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, language)| *language)
+}
+
+pub fn language_for_text(path: &str, text: &str) -> Option<Language> {
+    if let Some(language) = language_for(path) {
+        return Some(language);
+    }
+    if file_name(path).contains('.') {
+        return None;
+    }
+    interpreter_language(text.trim_start_matches('\u{feff}').lines().next().unwrap_or(""))
+}
+
+pub fn language_for_file(path: &str) -> Option<Language> {
+    if let Some(language) = language_for(path) {
+        return Some(language);
+    }
+    if file_name(path).contains('.') {
+        return None;
+    }
+    let mut head = [0u8; 160];
+    let length = std::io::Read::read(&mut std::fs::File::open(path).ok()?, &mut head).ok()?;
+    let text = String::from_utf8_lossy(head.get(..length)?).into_owned();
+    interpreter_language(text.trim_start_matches('\u{feff}').lines().next().unwrap_or(""))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{language_for, PHP, SLASH};
+    use super::{language_for, language_for_text, PHP, SLASH};
 
     #[test]
     fn picks_by_extension_ignoring_case_and_folders() {
@@ -202,11 +476,40 @@ mod tests {
 
     #[test]
     fn markup_and_style_files_are_checked_but_data_files_are_not() {
-        for name in ["a.html", "a.HTM", "a.css", "a.scss", "a.less", "a.vue", "a.svelte"] {
+        for name in ["a.html", "a.HTM", "a.css", "a.scss", "a.less", "a.vue", "a.svelte", "a.svg"] {
             assert!(language_for(name).is_some(), "{name}");
         }
-        for name in ["a.yaml", "a.yml", "a.toml", "a.json", "a.md", "a.xml", "a.ini", "a.lock"] {
+        for name in ["a.yaml", "a.yml", "a.toml", "a.json", "a.md", "a.xml", "a.ini", "a.lock", "a.txt", "a.cfg"] {
             assert!(language_for(name).is_none(), "{name}");
         }
+    }
+
+    #[test]
+    fn build_files_are_known_by_their_whole_name() {
+        for name in ["Makefile", "sub/GNUmakefile", "Dockerfile", "Dockerfile.dev", "a.dockerfile", "CMakeLists.txt"] {
+            assert!(language_for(name).is_some(), "{name}");
+        }
+        for name in ["Jenkinsfile", "Vagrantfile", "Gemfile", "Rakefile", ".zshrc", ".envrc", "BUILD", "justfile"] {
+            assert!(language_for(name).is_some(), "{name}");
+        }
+        for name in ["notes", "LICENSE", "NOTICE", "Procfile", "Gemfile.lock", "CMakeLists.cmake.in", "x.txt"] {
+            assert!(language_for(name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_file_without_extension_is_judged_by_its_first_line() {
+        let python = language_for_text("bin/tool", "#!/usr/bin/env python3\nx = 1\n");
+        assert_eq!(python.map(|l| l.docstring), Some(true));
+        assert!(language_for_text("bin/tool", "#!/bin/bash\n").is_some());
+        assert!(language_for_text("bin/tool", "#!/usr/bin/env -S node --flag\n").is_some());
+        assert!(language_for_text("bin/tool", "#!/usr/bin/python3.11\n").is_some());
+        assert!(language_for_text("bin/tool", "#!/usr/bin/pwsh\n").is_some());
+        assert!(language_for_text("bin/tool", "\u{feff}#!/bin/sh\n").is_some());
+        assert!(language_for_text("bin/tool", "# plain notes\n").is_none());
+        assert!(language_for_text("bin/tool", "#!/usr/bin/cat\n").is_none());
+        assert!(language_for_text("bin/tool", "").is_none());
+        assert!(language_for_text("notes.txt", "#!/bin/sh\n").is_none());
+        assert!(language_for_text("notes.md", "#!/bin/sh\n").is_none());
     }
 }

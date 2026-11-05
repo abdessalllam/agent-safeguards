@@ -18,7 +18,7 @@ pub use changes::collect;
 pub use decision::{evaluate, Change};
 
 use decision::comment_lines;
-use languages::{language_for, Language};
+use languages::{language_for, language_for_text, Language};
 use session::Ledger;
 
 pub const MAX_INPUT: usize = 8 * 1024 * 1024;
@@ -105,7 +105,7 @@ fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) -> Has
         if change.partial {
             continue;
         }
-        let Some(lang) = language_for(&change.file) else {
+        let Some(lang) = language_for_text(&change.file, &change.new) else {
             continue;
         };
         let id = session::identity(&changes::resolve(base, &change.file));

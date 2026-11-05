@@ -142,47 +142,75 @@ fn a_line_of_101_characters_is_denied_and_100_is_allowed() {
 }
 
 #[test]
-fn every_exemption_is_ignored() {
-    let prefixes = [
+fn every_tool_directive_is_ignored() {
+    let directives = [
         "noqa",
-        "type:",
-        "pragma",
-        "pylint:",
-        "mypy:",
-        "ruff:",
-        "fmt:",
-        "isort:",
-        "pyright:",
-        "eslint-",
-        "prettier-ignore",
-        "@ts-",
-        "istanbul ",
-        "c8 ",
-        "go:",
-        "nolint",
-        "swiftlint:",
-        "mark:",
-        "region",
-        "endregion",
-        "spdx-license-identifier",
-        "copyright",
-        "license",
-        "shellcheck",
-        "vim:",
-        "nosec",
-        "cspell:",
-        "-*-",
+        "noqa: E501",
+        "noqa: E501,W291",
+        "type: ignore",
+        "type: ignore[attr-defined]",
+        "type: List[int]",
+        "pragma: no cover",
+        "pragma: no branch",
+        "pragma once",
+        "pylint: disable=missing-docstring,invalid-name",
+        "mypy: ignore-errors",
+        "ruff: noqa: E501",
+        "fmt: off",
+        "fmt: skip",
+        "isort: skip",
+        "pyright: basic",
+        "pyright: ignore[reportMissingImports]",
+        "eslint-disable-next-line no-console",
         "eslint-disable",
-        "lint:",
-        "clippy::",
-        "rustfmt::",
-        "+build",
-        "@flow",
-        "@jsx",
+        "eslint-env node",
+        "prettier-ignore",
+        "@ts-ignore",
+        "@ts-expect-error",
+        "istanbul ignore next",
+        "c8 ignore next 2",
+        "go:generate stringer -type=Color",
+        "go:build linux && amd64",
+        "nolint:errcheck",
+        "nolint:gosec,errcheck",
+        "swiftlint:disable force_cast",
+        "swiftlint:disable:next identifier_name",
+        "spdx-license-identifier: MIT",
+        "SPDX-License-Identifier: Apache-2.0",
+        "SPDX-License-Identifier: MIT OR Apache-2.0",
+        "shellcheck disable=SC2086",
+        "shellcheck source=/dev/null",
+        "nosec",
+        "nosec B101",
+        "cspell:disable-next-line",
+        "-*- coding: utf-8 -*-",
+        "clippy::needless_return",
+        "rustfmt::skip",
+        "+build linux,amd64",
+        "@flow strict",
+        "@jsx h",
     ];
-    for prefix in prefixes {
-        let line = format!("# {prefix} one\n# {prefix} two\n# {prefix} three\n");
-        assert!(!denied(&edit("a.py", "", &line)), "exemption {prefix} counted");
+    for directive in directives {
+        let line = format!("# {directive}\n# {directive}\n# {directive}\n");
+        assert!(!denied(&edit("a.py", "", &line)), "directive {directive} counted");
+    }
+}
+
+#[test]
+fn a_directive_followed_by_prose_is_a_comment() {
+    let starts = [
+        "noqa", "type:", "pragma", "pylint:", "mypy:", "ruff:", "fmt:", "isort:", "pyright:", "eslint-", "prettier-ignore",
+        "@ts-", "istanbul ", "c8 ", "go:", "nolint", "swiftlint:", "spdx-license-identifier", "shellcheck", "nosec",
+        "cspell:", "-*-", "lint:", "clippy::", "rustfmt::", "+build", "@flow", "@jsx",
+    ];
+    for prefix in starts {
+        let line = format!("# {prefix} note one\n# {prefix} note two\n# {prefix} note three\n");
+        assert!(denied(&edit("a.py", "", &line)), "prose after {prefix} went through");
+    }
+    let removed = ["mark:", "region", "endregion", "copyright", "license", "vim:"];
+    for prefix in removed {
+        let line = format!("# {prefix} note one\n# {prefix} note two\n# {prefix} note three\n");
+        assert!(denied(&edit("a.py", "", &line)), "{prefix} is no directive");
     }
 }
 

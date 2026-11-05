@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::comments::{body, scan, LineKind};
-use crate::languages::{language_for, Language};
+use crate::languages::{language_for_text, Language};
 use crate::locale::message;
 
 pub const MAX_LINES: usize = 2;
@@ -237,7 +237,7 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
 }
 
 pub fn net_lines(change: &Change) -> usize {
-    let Some(lang) = language_for(&change.file) else {
+    let Some(lang) = language_for_text(&change.file, &change.new) else {
         return 0;
     };
     let lang = if change.partial { lang.fragment() } else { lang };
@@ -248,7 +248,7 @@ fn evaluate_detail(changes: &[Change]) -> Option<String> {
     let mut order: Vec<Aggregate<'_>> = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
     for change in changes {
-        let Some(lang) = language_for(&change.file) else {
+        let Some(lang) = language_for_text(&change.file, &change.new) else {
             continue;
         };
         let lang = if change.partial { lang.fragment() } else { lang };
