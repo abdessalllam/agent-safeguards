@@ -62,6 +62,15 @@ fn ledger_of(payload: &Map<String, Value>, state: Option<&Path>) -> Option<Ledge
     Ledger::open(state?, session)
 }
 
+fn mark_start(payload: &Map<String, Value>, state: Option<&Path>) {
+    let Some(id) = payload.get("tool_use_id").and_then(Value::as_str) else {
+        return;
+    };
+    if let Some(ledger) = ledger_of(payload, state) {
+        ledger.mark_start(id);
+    }
+}
+
 fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) {
     for change in changes.iter_mut() {
         if change.partial {
@@ -74,6 +83,7 @@ fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) {
         let origin = change
             .origin
             .as_deref()
+            .filter(|source| language_for(source) == Some(lang))
             .map(|path| session::identity(&changes::resolve(base, path)));
         let baseline = ledger.baseline(&id, || {
             match origin.as_deref().and_then(|source| ledger.read(source)) {
@@ -99,6 +109,10 @@ pub fn judge_in(input: &str, provider: Provider, state: Option<&Path>) -> Verdic
     let Some(tool) = payload.get("tool_name").and_then(Value::as_str) else {
         return Verdict::Allow;
     };
+    if tool == "Bash" {
+        mark_start(&payload, state);
+        return Verdict::Allow;
+    }
     let Some(Value::Object(tool_input)) = payload.get("tool_input") else {
         return Verdict::Allow;
     };

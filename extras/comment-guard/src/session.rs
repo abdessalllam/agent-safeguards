@@ -83,7 +83,8 @@ fn owned(name: &str) -> bool {
     }
     let stem = name
         .strip_suffix(".json")
-        .or_else(|| name.strip_suffix(".stamp"));
+        .or_else(|| name.strip_suffix(".stamp"))
+        .or_else(|| name.strip_suffix(".start"));
     stem.and_then(|stem| stem.split_once('-'))
         .is_some_and(|(session, entry)| hex16(session) && hex16(entry))
 }
@@ -109,6 +110,11 @@ impl Ledger {
     fn stamp(&self, key: &str) -> PathBuf {
         self.dir
             .join(format!("{:016x}-{:016x}.stamp", self.session, hash(key)))
+    }
+
+    fn start_file(&self, id: &str) -> PathBuf {
+        self.dir
+            .join(format!("{:016x}-{:016x}.start", self.session, hash(id)))
     }
 
     fn temp(&self) -> PathBuf {
@@ -166,14 +172,29 @@ impl Ledger {
         fs::metadata(self.stamp(key)).ok()?.modified().ok()
     }
 
-    pub fn mark_check(&self, key: &str) {
+    fn touch(&self, target: PathBuf) {
         let temp = self.temp();
         if fs::write(&temp, b"").is_err() {
             return;
         }
-        if fs::rename(&temp, self.stamp(key)).is_err() {
+        if fs::rename(&temp, target).is_err() {
             let _ = fs::remove_file(&temp);
         }
+    }
+
+    pub fn mark_check(&self, key: &str) {
+        self.touch(self.stamp(key));
+    }
+
+    pub fn mark_start(&self, id: &str) {
+        self.touch(self.start_file(id));
+    }
+
+    pub fn take_start(&self, id: &str) -> Option<SystemTime> {
+        let path = self.start_file(id);
+        let started = fs::metadata(&path).ok()?.modified().ok();
+        let _ = fs::remove_file(&path);
+        started
     }
 
     fn prune(&self) {
@@ -259,6 +280,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_start_time_is_read_once_per_command() {
+        let dir = scratch("start");
+        let ledger = Ledger::open(&dir, "session-f").expect("ledger");
+        assert!(ledger.take_start("tool-1").is_none());
+        ledger.mark_start("tool-1");
+        assert!(ledger.take_start("tool-2").is_none());
+        assert!(ledger.take_start("tool-1").is_some());
+        assert!(ledger.take_start("tool-1").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_stamp_that_is_a_symlink_is_replaced_not_followed() {
@@ -295,6 +328,7 @@ mod tests {
     fn only_files_in_the_tools_own_format_are_owned() {
         assert!(owned("0123456789abcdef-fedcba9876543210.json"));
         assert!(owned("0123456789abcdef-fedcba9876543210.stamp"));
+        assert!(owned("0123456789abcdef-fedcba9876543210.start"));
         assert!(owned(".tmp-123-456789"));
         assert!(!owned("notes.json"));
         assert!(!owned("backup.stamp"));

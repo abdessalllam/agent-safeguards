@@ -313,6 +313,32 @@ impl Rig {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    fn pre_bash(&self, session: &str, tool_use_id: &str) {
+        let payload = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": session,
+            "tool_use_id": tool_use_id,
+            "cwd": self.cwd.to_string_lossy(),
+            "tool_name": "Bash",
+            "tool_input": { "command": "true" },
+        });
+        let output = self.feed("PreToolUse", &payload);
+        assert!(output.stdout.is_empty());
+    }
+
+    fn bash_with_id(&self, session: &str, tool_use_id: &str, command: &str) -> String {
+        let payload = json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": session,
+            "tool_use_id": tool_use_id,
+            "cwd": self.cwd.to_string_lossy(),
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "tool_response": {},
+        });
+        String::from_utf8_lossy(&self.feed("PostToolUse", &payload).stdout).into_owned()
+    }
+
     fn pre_edit(&self, session: &str, path: &Path, old: &str, new: &str) -> String {
         let payload = json!({
             "hook_event_name": "PreToolUse",
@@ -486,6 +512,171 @@ fn editing_the_code_next_to_an_inline_comment_leaves_the_comment_unchanged() {
 fn nested_block_comments_are_counted_to_their_real_end() {
     let haskell = "{- {- inner -}\none\ntwo\n-}\nx = 1\n";
     assert!(denied(&write_file(None, None, Path::new("a.hs"), haskell)));
+}
+
+#[cfg(unix)]
+fn fake_git(dir: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("git");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_git_that_never_answers_is_cut_off() {
+    let rig = Rig::new("slow-git");
+    let bin = temp_dir("slow-git-bin");
+    fake_git(&bin, "/bin/sleep 8");
+    let file = rig.cwd.join("a.py");
+    std::fs::write(&file, lines("#", "", 6)).expect("write");
+    let started = std::time::Instant::now();
+    let out = rig.bash_at(&rig.cwd, Some("g3"), &format!("cat {}", file.display()), "claude", Some(&bin));
+    assert!(out.is_empty(), "{out}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(4), "{:?}", started.elapsed());
+    let _ = std::fs::remove_dir_all(&bin);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_git_helper_that_keeps_the_pipe_open_does_not_hold_the_hook() {
+    let rig = Rig::new("pipe-git");
+    let bin = temp_dir("pipe-git-bin");
+    fake_git(&bin, "/bin/sleep 8 &\nexit 0");
+    let file = rig.cwd.join("a.py");
+    std::fs::write(&file, lines("#", "", 6)).expect("write");
+    let started = std::time::Instant::now();
+    let out = rig.bash_at(&rig.cwd, Some("g4"), &format!("cat {}", file.display()), "claude", Some(&bin));
+    assert!(out.is_empty(), "{out}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(4), "{:?}", started.elapsed());
+    let _ = std::fs::remove_dir_all(&bin);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_git_error_is_not_taken_for_a_missing_file() {
+    let rig = Rig::new("git-error");
+    let bin = temp_dir("git-error-bin");
+    fake_git(&bin, "echo 'fatal: detected dubious ownership in repository' >&2\nexit 128");
+    let file = rig.cwd.join("a.py");
+    std::fs::write(&file, lines("#", "", 10)).expect("write");
+    if !creation_time_is_known(&file) {
+        return;
+    }
+    let out = rig.bash_at(&rig.cwd, Some("g5"), &format!("cat {}", file.display()), "claude", Some(&bin));
+    assert!(out.is_empty(), "{out}");
+    let _ = std::fs::remove_dir_all(&bin);
+}
+
+#[test]
+fn a_new_file_in_a_repository_is_judged_against_nothing() {
+    let rig = Rig::new("untracked");
+    init_repo(&rig.cwd);
+    commit_file(&rig.cwd, "a.py", "x = 1\n");
+    let fresh = rig.cwd.join("b.py");
+    std::fs::write(&fresh, lines("#", "", 4)).expect("write");
+    if !creation_time_is_known(&fresh) {
+        return;
+    }
+    let out = rig.bash(Some("g6"), &format!("cat {}", fresh.display()));
+    assert!(blocked(&out), "{out}");
+}
+
+#[test]
+fn a_command_is_judged_from_the_moment_it_started() {
+    let rig = Rig::new("started");
+    init_repo(&rig.cwd);
+    let file = commit_file(&rig.cwd, "a.py", "x = 1\n");
+    std::fs::write(&file, "x = 1\n# u1\n# u2\n# u3\n").expect("write");
+    rig.pre_bash("st1", "tool-1");
+    let read = rig.bash_with_id("st1", "tool-1", &format!("cat {}", file.display()));
+    assert!(read.is_empty(), "{read}");
+    rig.pre_bash("st1", "tool-2");
+    std::fs::write(&file, "x = 1\n# u1\n# u2\n# u3\n# a\n# b\n# c\n").expect("write");
+    let wrote = rig.bash_with_id("st1", "tool-2", &format!("printf x >> {}", file.display()));
+    assert!(blocked(&wrote), "{wrote}");
+}
+
+#[test]
+fn a_whitespace_difference_after_an_anchor_does_not_rewind_the_search() {
+    let dir = temp_dir("rewind");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "DATA = \"\"\"\n    return 1\n\"\"\"\ndef f():\n    return 1 \n").expect("write");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@ def f():\n-    return 1\n+    # one\n+    # two\n+    # three\n+    return 1\n*** End Patch\n",
+        path.display()
+    );
+    let verdict = pre(None, None, "apply_patch", json!({ "command": patch }), Provider::Codex);
+    assert!(denied(&verdict));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_indented_anchor_keeps_its_indentation() {
+    let dir = temp_dir("indent-anchor");
+    let path = dir.join("a.py");
+    let text = "class C:\n    def f(self):\n        return 1\nDATA = \"\"\"\ndef f(self):\n        return 1\n\"\"\"\n";
+    std::fs::write(&path, text).expect("write");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@     def f(self):\n-        return 1\n+        # one\n+        # two\n+        # three\n+        return 1\n*** End Patch\n",
+        path.display()
+    );
+    let verdict = pre(None, None, "apply_patch", json!({ "command": patch }), Provider::Codex);
+    assert!(denied(&verdict));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_later_comment_on_a_line_with_a_block_comment_is_still_judged() {
+    let verdict = write_file(None, None, Path::new("a.c"), "int x = /* stable */ 1; // previously broken\n");
+    assert!(denied(&verdict));
+    assert!(reason(&verdict).contains("previously"));
+}
+
+#[test]
+fn a_move_to_another_language_does_not_inherit_the_old_scanners_record() {
+    let dir = temp_dir("cross-move");
+    let state = temp_dir("cross-move-state");
+    let from = dir.join("a.pl");
+    let to = dir.join("b.py");
+    let text = "print(1);# one\nprint(2);# two\nprint(3);# three\n";
+    std::fs::write(&from, text).expect("write");
+    let first = edit_file(Some(&state), Some("x1"), &from, "print(1)", "print(4)");
+    assert!(!denied(&first));
+    apply_edit(&from, "print(1)", "print(4)");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n*** Move to: {}\n@@\n print(4);# one\n print(2);# two\n print(3);# three\n*** End Patch\n",
+        from.display(),
+        to.display()
+    );
+    let verdict = pre(Some(&state), Some("x1"), "apply_patch", json!({ "command": patch }), Provider::Codex);
+    assert!(!denied(&verdict));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn a_multi_edit_that_exhausts_the_work_budget_is_allowed_not_judged_by_fragments() {
+    let dir = temp_dir("budget");
+    let path = dir.join("big.py");
+    let padding = "x".repeat(1024 * 1024);
+    std::fs::write(&path, format!("flag = 0\nDATA = \"\"\"\nold\n{padding}\n\"\"\"\n")).expect("write");
+    let mut edits: Vec<Value> = (0..70)
+        .map(|n| {
+            let (from, to) = if n % 2 == 0 { ("flag = 0", "flag = 1") } else { ("flag = 1", "flag = 0") };
+            json!({ "old_string": from, "new_string": to })
+        })
+        .collect();
+    edits.push(json!({ "old_string": "\nold\n", "new_string": "\n# one\n# two\n# three\n" }));
+    let verdict = pre(
+        None,
+        None,
+        "MultiEdit",
+        json!({ "file_path": path.to_string_lossy(), "edits": edits }),
+        Provider::Claude,
+    );
+    assert!(!denied(&verdict));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn creation_time_is_known(path: &Path) -> bool {

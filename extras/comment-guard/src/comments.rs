@@ -174,6 +174,7 @@ pub struct Scan<'a> {
     lines: std::str::Split<'a, char>,
     lang: Language,
     state: State,
+    extra: std::collections::VecDeque<&'a str>,
 }
 
 pub fn scan(text: &str, lang: Language) -> Scan<'_> {
@@ -182,6 +183,7 @@ pub fn scan(text: &str, lang: Language) -> Scan<'_> {
         lines: text.split('\n'),
         lang,
         state: State::Code,
+        extra: std::collections::VecDeque::new(),
     }
 }
 
@@ -189,8 +191,13 @@ impl<'a> Iterator for Scan<'a> {
     type Item = LineKind<'a>;
 
     fn next(&mut self) -> Option<LineKind<'a>> {
-        let line = self.lines.next()?;
-        let kind = self.classify(line);
+        let kind = match self.extra.pop_front() {
+            Some(text) => LineKind::Comment(text),
+            None => {
+                let line = self.lines.next()?;
+                self.classify(line)
+            }
+        };
         Some(match kind {
             LineKind::Comment(text) if is_exempt(body(text)) => LineKind::Other,
             other => other,
@@ -209,6 +216,7 @@ impl<'a> Scan<'a> {
                 let (left, end) = block_scan(trimmed, open, close, self.lang.nested, depth);
                 if left == 0 {
                     self.state = State::Code;
+                    self.trailing_after(trimmed.get(end..), close);
                     return LineKind::Comment(trimmed.get(..end).unwrap_or(trimmed));
                 }
                 self.state = State::Block { open, close, depth: left };
@@ -241,6 +249,16 @@ impl<'a> Scan<'a> {
                 Some(kind) => kind,
                 None => self.code(trimmed, None),
             },
+        }
+    }
+
+    fn trailing_after(&mut self, remainder: Option<&'a str>, delimiter: &str) {
+        let Some(rest) = remainder else {
+            return;
+        };
+        let last = delimiter.as_bytes().last().copied();
+        if let LineKind::Comment(next) = self.code(rest, last) {
+            self.extra.push_front(next);
         }
     }
 
@@ -286,6 +304,7 @@ impl<'a> Scan<'a> {
                     return Some(LineKind::Comment(trimmed));
                 }
                 let upto = open.len().saturating_add(end);
+                self.trailing_after(trimmed.get(upto..), close);
                 return Some(LineKind::Comment(trimmed.get(..upto).unwrap_or(trimmed)));
             }
         }
@@ -355,11 +374,22 @@ impl<'a> Scan<'a> {
     }
 
     fn code(&mut self, text: &'a str, start: Option<u8>) -> LineKind<'a> {
+        let mut found: Vec<&'a str> = Vec::new();
+        self.scan_code(text, start, &mut found);
+        let mut found = found.into_iter();
+        let Some(first) = found.next() else {
+            return LineKind::Other;
+        };
+        self.extra.extend(found);
+        LineKind::Comment(first)
+    }
+
+    fn scan_code(&mut self, text: &'a str, start: Option<u8>, found: &mut Vec<&'a str>) {
         let lang = self.lang;
         let bytes = text.as_bytes();
         let mut at = 0usize;
         let mut previous = start;
-        while at < bytes.len() {
+        'scan: while at < bytes.len() {
             let Some(rest) = text.get(at..) else {
                 at = at.saturating_add(1);
                 continue;
@@ -377,7 +407,7 @@ impl<'a> Scan<'a> {
                     }
                     None => {
                         self.state = State::Triple { delim, doc: false };
-                        return LineKind::Other;
+                        return;
                     }
                 }
             }
@@ -389,7 +419,7 @@ impl<'a> Scan<'a> {
             if lang.quotes.contains(first) {
                 match string_length(rest, first) {
                     Some(length) => at = at.saturating_add(length),
-                    None => return LineKind::Other,
+                    None => return,
                 }
                 previous = Some(first as u8);
                 continue;
@@ -403,7 +433,7 @@ impl<'a> Scan<'a> {
                     }
                     None => {
                         self.state = State::Backtick;
-                        return LineKind::Other;
+                        return;
                     }
                 }
             }
@@ -417,21 +447,25 @@ impl<'a> Scan<'a> {
                     let (left, end) = block_scan(tail, open, close, lang.nested, 1);
                     if left > 0 {
                         self.state = State::Block { open, close, depth: left };
-                        return LineKind::Comment(rest);
+                        found.push(rest);
+                        return;
                     }
                     let upto = open.len().saturating_add(end);
-                    return LineKind::Comment(rest.get(..upto).unwrap_or(rest));
+                    found.push(rest.get(..upto).unwrap_or(rest));
+                    at = at.saturating_add(upto);
+                    previous = close.as_bytes().last().copied();
+                    continue 'scan;
                 }
             }
             for &marker in lang.line {
                 if rest.starts_with(marker) && marker_fits(lang, marker, previous, rest) {
-                    return LineKind::Comment(rest);
+                    found.push(rest);
+                    return;
                 }
             }
             previous = rest.as_bytes().first().copied();
             at = at.saturating_add(first.len_utf8());
         }
-        LineKind::Other
     }
 }
 
@@ -558,6 +592,17 @@ mod tests {
         assert_eq!(comments("int a = /* stable a */ 1;\n", SLASH), vec!["/* stable a */"]);
         assert_eq!(comments("/* c */ x = 1;\n", SLASH), vec!["/* c */"]);
         assert_eq!(comments("*/ y = 2;\n", SLASH), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn several_comments_on_one_line_are_each_counted() {
+        assert_eq!(
+            comments("int x = /* stable */ 1; // previously broken\n", SLASH),
+            vec!["/* stable */", "// previously broken"]
+        );
+        assert_eq!(comments("/* a */ x(); // b\n", SLASH), vec!["/* a */", "// b"]);
+        assert_eq!(comments("/*\na\n*/ y(); // c\n", SLASH), vec!["/*", "a", "*/", "// c"]);
+        assert_eq!(comments("f(/* a */ 1, /* b */ 2);\n", SLASH), vec!["/* a */", "/* b */"]);
     }
 
     #[test]

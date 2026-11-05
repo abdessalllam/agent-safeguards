@@ -55,8 +55,11 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger) -> Verdict {
         .and_then(Value::as_str)
         .unwrap_or("");
     let key = identity(&cwd);
-    let since = ledger
-        .last_check(&key)
+    let since = payload
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .and_then(|id| ledger.take_start(id))
+        .or_else(|| ledger.last_check(&key))
         .or_else(|| SystemTime::now().checked_sub(FIRST_WINDOW))
         .unwrap_or(SystemTime::UNIX_EPOCH);
     ledger.mark_check(&key);
@@ -148,55 +151,90 @@ fn walk(root: &Path, since: SystemTime, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn head_text(path: &Path, deadline: Instant) -> Head {
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|name| name.to_str())) else {
-        return Head::Unavailable;
-    };
-    let spawned = Command::new("git")
+struct Ran {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: String,
+}
+
+fn reader<R: Read + Send + 'static>(source: R, limit: u64) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = source.take(limit).read_to_end(&mut bytes);
+        let _ = sender.send(bytes);
+    });
+    receiver
+}
+
+fn run_git(dir: &Path, args: &[&str], deadline: Instant) -> Option<Ran> {
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(dir)
-        .arg("show")
-        .arg(format!("HEAD:./{name}"))
+        .args(args)
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
-    let Ok(mut child) = spawned else {
-        return Head::Unavailable;
-    };
-    let Some(stdout) = child.stdout.take() else {
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill();
         let _ = child.wait();
-        return Head::Unavailable;
+        return None;
     };
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout.take(MAX_OLD_FILE.saturating_add(1)).read_to_end(&mut bytes);
-        bytes
-    });
+    let stdout = reader(out, MAX_OLD_FILE.saturating_add(1));
+    let stderr = reader(err, 4096);
     let limit = deadline.min(Instant::now() + GIT_TIME);
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < limit => std::thread::sleep(Duration::from_millis(5)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                break None;
+                return None;
             }
         }
     };
-    let bytes = reader.join().unwrap_or_default();
-    let Some(status) = status else {
+    let wait = limit
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(100));
+    let stdout = stdout.recv_timeout(wait).ok()?;
+    let stderr = stderr.recv_timeout(wait).ok()?;
+    Some(Ran {
+        success: status.success(),
+        stdout,
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+fn absent(stderr: &str, dir: &Path) -> bool {
+    let known = ["exists on disk, but not in", "does not exist in", "invalid object name 'HEAD'"];
+    known.iter().any(|message| stderr.contains(message))
+        || (stderr.contains("not a git repository")
+            && !dir.ancestors().any(|folder| folder.join(".git").exists()))
+}
+
+fn head_text(path: &Path, deadline: Instant) -> Head {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|name| name.to_str())) else {
         return Head::Unavailable;
     };
-    if bytes.len() as u64 > MAX_OLD_FILE {
+    let spec = format!("HEAD:./{name}");
+    let Some(ran) = run_git(dir, &["show", &spec], deadline) else {
+        return Head::Unavailable;
+    };
+    if ran.stdout.len() as u64 > MAX_OLD_FILE {
         return Head::Unavailable;
     }
-    if !status.success() {
-        return Head::Missing;
+    if ran.success {
+        return String::from_utf8(ran.stdout).map_or(Head::Unavailable, Head::Found);
     }
-    String::from_utf8(bytes).map_or(Head::Unavailable, Head::Found)
+    if absent(&ran.stderr, dir) {
+        Head::Missing
+    } else {
+        Head::Unavailable
+    }
 }
 
 #[cfg(unix)]

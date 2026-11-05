@@ -12,14 +12,22 @@ const MAX_WORK: usize = 64 * 1024 * 1024;
 const MAX_HUNKS: usize = 2000;
 const MAX_STARTS: usize = 5_000_000;
 
-struct Work(usize);
+struct Work {
+    left: usize,
+    out: bool,
+}
 
 impl Work {
+    fn new(left: usize) -> Work {
+        Work { left, out: false }
+    }
+
     fn spend(&mut self, amount: usize) -> bool {
-        if amount > self.0 {
+        if amount > self.left {
+            self.out = true;
             return false;
         }
-        self.0 = self.0.saturating_sub(amount);
+        self.left = self.left.saturating_sub(amount);
         true
     }
 }
@@ -162,16 +170,14 @@ fn multi_edit(input: &Map<String, Value>, base: &Path) -> Vec<Change> {
         pairs.push((old, new, all));
     }
     if let Some(current) = current_text(&resolve(base, file)) {
-        let mut work = Work(MAX_WORK);
+        let mut work = Work::new(MAX_WORK);
         let mut next = current.clone();
         let mut applied = true;
         for (old, new, all) in &pairs {
-            let stepped = if work.spend(next.len()) {
-                replace(&next, old, new, *all)
-            } else {
-                None
-            };
-            match stepped {
+            if !work.spend(next.len()) {
+                return Vec::new();
+            }
+            match replace(&next, old, new, *all) {
                 Some(done) => next = done,
                 None => {
                     applied = false;
@@ -240,8 +246,8 @@ fn sections(command: &str) -> Vec<Section> {
                     if !hunk.old.is_empty() || !hunk.new.is_empty() {
                         flush(section, &mut hunk);
                     }
-                    let anchor = rest.trim();
-                    if !anchor.is_empty() {
+                    let anchor = rest.strip_prefix(' ').unwrap_or(rest);
+                    if !anchor.trim().is_empty() {
                         hunk.anchors.push(anchor.to_owned());
                     }
                 }
@@ -279,13 +285,13 @@ fn fragments(hunks: &[Hunk], old: bool) -> String {
 
 fn find_chunk(lines: &[String], chunk: &[String], from: usize, starts: &mut Work) -> Option<usize> {
     let last = lines.len().checked_sub(chunk.len())?;
-    for level in 0..3u8 {
-        let same = |a: &str, b: &str| match level {
-            0 => a == b,
-            1 => a.trim_end() == b.trim_end(),
-            _ => a.trim() == b.trim(),
-        };
-        for origin in [from, 0] {
+    for origin in [from, 0] {
+        for level in 0..3u8 {
+            let same = |a: &str, b: &str| match level {
+                0 => a == b,
+                1 => a.trim_end() == b.trim_end(),
+                _ => a.trim() == b.trim(),
+            };
             let mut at = origin;
             while at <= last {
                 if !starts.spend(1) {
@@ -301,9 +307,9 @@ fn find_chunk(lines: &[String], chunk: &[String], from: usize, starts: &mut Work
                 }
                 at = at.saturating_add(1);
             }
-            if from == 0 {
-                break;
-            }
+        }
+        if from == 0 {
+            break;
         }
     }
     None
@@ -364,18 +370,22 @@ fn assemble(
         return;
     }
     let source = section.source.clone().unwrap_or_else(|| section.path.clone());
-    let previous = lookup.remove(&source);
-    let mut current = match previous.and_then(|at| changes.get(at)) {
+    let previous = lookup.get(&source).copied();
+    let current = match previous.and_then(|at| changes.get(at)) {
         Some(change) if change.partial => None,
         Some(change) => Some(change.new.clone()),
         None => read_old(&resolve(base, &source)),
     };
     if current.as_ref().is_some_and(|text| !budget.0.spend(text.len())) {
-        current = None;
+        return;
     }
     let applied = current
         .as_deref()
         .and_then(|text| apply_hunks(text, &section.hunks, &mut budget.1));
+    if applied.is_none() && budget.1.out {
+        return;
+    }
+    lookup.remove(&source);
     let target = section.path.clone();
     let moved = target != source;
     if let Some(change) = previous.and_then(|at| changes.get_mut(at)) {
@@ -419,7 +429,7 @@ fn patch(input: &Map<String, Value>, base: &Path) -> Vec<Change> {
     };
     let mut changes: Vec<Change> = Vec::new();
     let mut lookup: HashMap<String, usize> = HashMap::new();
-    let mut budget = (Work(MAX_WORK), Work(MAX_STARTS));
+    let mut budget = (Work::new(MAX_WORK), Work::new(MAX_STARTS));
     for section in sections(command) {
         assemble(&mut changes, &mut lookup, section, base, &mut budget);
     }
@@ -443,7 +453,7 @@ mod tests {
 
     #[test]
     fn the_work_budget_is_spent_and_refuses_more() {
-        let mut work = Work(10);
+        let mut work = Work::new(10);
         assert!(work.spend(6));
         assert!(!work.spend(5));
         assert!(work.spend(4));

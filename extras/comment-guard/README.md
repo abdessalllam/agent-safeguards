@@ -1,6 +1,6 @@
 # comment-guard (optional, off by default)
 
-A small Rust program that keeps coding agents from flooding code with comments. It runs as a `PreToolUse` hook for Claude Code (`Edit`, `Write`, `MultiEdit`) and Codex (`apply_patch`), works out the whole file the edit would leave, and refuses the call with a reason when the comments the session has added to that file break the rule. The agent then retries with fewer comments. A `PostToolUse` hook on `Bash` reports files that a command wrote with too many comments, and `safe-tool git commit` runs the same rule on the files of the commit about to be made.
+A small Rust program that keeps coding agents from flooding code with comments. It runs as a `PreToolUse` hook for Claude Code (`Edit`, `Write`, `MultiEdit`) and Codex (`apply_patch`), works out the whole file the edit would leave, and refuses the call with a reason when the comments the session has added to that file break the rule. The agent then retries with fewer comments. A `PostToolUse` hook on `Bash` (with a `PreToolUse` entry that notes when each command starts) reports files that a command wrote with too many comments, and `safe-tool git commit` runs the same rule on the files of the commit about to be made.
 
 It is a quality guard, not a security guard. It is **off** until you turn it on, it is not part of the plugin's default hooks, and it fails open: bad input, an internal error or an oversized payload allow the call and print one line on stderr.
 
@@ -29,7 +29,7 @@ The first time a session touches a file, the hook records the comments that file
 
 ## Commands that write files
 
-A command's writes (`printf ... > file`, `sed -i`, `tee`, a script) cannot be stopped in advance, so the `PostToolUse` hook on `Bash` looks afterwards. It looks at the source files the command names and the source files under the working folder, keeps only those whose content or status changed since the previous check in that folder (reading a file changes nothing), and judges each against the session's record, else against the last commit (`git show HEAD:`, with a size and time limit, and skipped when `git` cannot answer), else, for a file that did not exist before the command, against an empty file. Whichever baseline it uses is recorded, so a later edit of the same file is judged against it too. A violation answers `{"decision":"block","reason":...}` so the agent is told to shorten the comments; it cannot undo the write, and `safe-tool git commit` refuses the result anyway. Files whose first lines say `generated` or `do not edit` are skipped, as are hidden folders, `node_modules`, `target`, `dist`, `build` and similar; the check stops after 40 files, 4000 folder entries or 3 seconds, and does not walk the home folder or `/`. Each working folder keeps its own check time.
+A command's writes (`printf ... > file`, `sed -i`, `tee`, a script) cannot be stopped in advance, so the `PostToolUse` hook on `Bash` looks afterwards. It looks at the source files the command names and the source files under the working folder, keeps only those whose content or status changed since the command started (reading a file changes nothing; the `PreToolUse` entry for `Bash` records the start time under the command's `tool_use_id`, and without one the hook uses the previous check in that folder, or the last 60 seconds for the first), and judges each against the session's record, else against the last commit (`git show HEAD:`, with a size and time limit, and skipped when `git` cannot answer), else, for a file that did not exist before the command, against an empty file. Whichever baseline it uses is recorded, so a later edit of the same file is judged against it too. A violation answers `{"decision":"block","reason":...}` so the agent is told to shorten the comments; it cannot undo the write, and `safe-tool git commit` refuses the result anyway. Files whose first lines say `generated` or `do not edit` are skipped, as are hidden folders, `node_modules`, `target`, `dist`, `build` and similar; the check stops after 40 files, 4000 folder entries or 3 seconds, and does not walk the home folder or `/`. Each working folder keeps its own check time.
 
 ## Commit-time check
 
@@ -67,7 +67,7 @@ comment-guard check
 
 The hook files here are not wired in by default. Merge one into your own settings, next to the plugin's hooks.
 
-- **Claude Code:** add the `PreToolUse` and `PostToolUse` entries of `hooks/claude.json` to `hooks.PreToolUse` and `hooks.PostToolUse` in `~/.claude/settings.json` (or a project's `.claude/settings.json`).
+- **Claude Code:** add the `PreToolUse` and `PostToolUse` entries of `hooks/claude.json` to `hooks.PreToolUse` and `hooks.PostToolUse` in `~/.claude/settings.json` (or a project's `.claude/settings.json`). The `PreToolUse` matcher covers `Bash` as well as the edit tools.
 - **Codex:** add the `PreToolUse` and `PostToolUse` entries of `hooks/codex.json` to `hooks.PreToolUse` and `hooks.PostToolUse` in `~/.codex/hooks.json`, then approve the new hooks in Codex.
 - **Grok** reads the Claude Code settings, so the Claude registration covers it.
 
