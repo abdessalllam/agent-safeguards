@@ -316,6 +316,12 @@ MAX_GLOB_WORD_CHARS = 512
 # A command that prints a variable named like a secret shows the secret, so it is refused for the printing commands.
 SECRET_VARIABLE_PATTERN = re.compile(r"\$\{?[#!]?[A-Za-z0-9_]*(?:key|token|secret|pass|credential|auth)[A-Za-z0-9_]*", re.IGNORECASE)
 PRINTING_COMMANDS = frozenset({"echo", "print", "printf"})
+PLAIN_UTILITIES = frozenset(
+    {"[", "awk", "basename", "cat", "cd", "chmod", "cmp", "column", "comm", "cp", "cut", "df", "diff", "dirname", "du", "egrep",
+     "false", "fgrep", "file", "find", "fmt", "fold", "gmake", "grep", "gunzip", "gzip", "head", "install", "join", "just", "less",
+     "link", "ln", "ls", "make", "mkdir", "mktemp", "more", "mv", "nl", "od", "paste", "pr", "strings", "hexdump", "expand", "unexpand", "pwd", "readlink", "realpath", "rev", "rg", "rm", "rmdir",
+     "sed", "sort", "split", "stat", "tac", "tail", "tar", "tee", "test", "touch", "tr", "true", "unlink", "unzip", "uniq", "wc", "zip"}
+)
 # These read from a password manager or a secret store, so the command is refused whatever it asks for.
 CREDENTIAL_COMMANDS = frozenset({"bw", "gopass", "keyctl", "pass", "secret-tool"})
 ENVIRONMENT_SERVICE_ACTIONS = frozenset({"dumpstate", "export", "getenv", "print", "print-cache", "print-disabled", "procinfo"})
@@ -442,6 +448,73 @@ SENSITIVE_PATH_FRAGMENTS = (
     "/.gitconfig",
 )
 TEMPLATE_SUFFIX = r"(?!\.(?:example|sample|template|dist)(?![A-Za-z0-9_-]))"
+# Keys whose values name no person and hold no secret: reading one, or removing any local key, cannot leak anything.
+SAFE_CONFIG_KEYS = frozenset(
+    {
+        "commit.gpgsign",
+        "core.autocrlf",
+        "core.bare",
+        "core.eol",
+        "core.filemode",
+        "core.hookspath",
+        "core.ignorecase",
+        "core.logallrefupdates",
+        "core.longpaths",
+        "core.precomposeunicode",
+        "core.repositoryformatversion",
+        "core.sparsecheckout",
+        "core.symlinks",
+        "core.untrackedcache",
+        "extensions.worktreeconfig",
+        "fetch.prune",
+        "init.defaultbranch",
+        "merge.ff",
+        "pull.ff",
+        "pull.rebase",
+        "push.autosetupremote",
+        "push.default",
+        "rebase.autostash",
+        "status.showuntrackedfiles",
+        "tag.gpgsign",
+    }
+)
+# Words that only occur in the lines of such keys, so a search for one of them prints nothing else of the file.
+SAFE_CONFIG_WORDS = frozenset(
+    {
+        "autosetupremote",
+        "defaultbranch",
+        "hookspath",
+        "logallrefupdates",
+        "precomposeunicode",
+        "repositoryformatversion",
+        "showuntrackedfiles",
+        "sparsecheckout",
+        "untrackedcache",
+        "worktreeconfig",
+    }
+)
+CONFIG_SCOPES = frozenset({"--global", "--local", "--system", "--worktree"})
+CONFIG_ENVIRONMENT = re.compile(
+    r"git_(?:config|dir|common_dir|work_tree|index_file|object_directory|alternate_object_directories|namespace)"
+)
+SEPARATORS_AFTER_QUIET = frozenset({"", ";", "&&", "||", "&", "\n"})
+UNRESOLVED_WORD = re.compile(r"[$`*?{}\\]")
+GREP_ENVIRONMENT = re.compile(r"grep_(?:options|color)")
+NEIGHBOR_COMMANDS = frozenset(
+    {"[", "basename", "cat", "cd", "cmp", "cut", "df", "diff", "dirname", "du", "echo", "egrep", "false", "fgrep", "file", "git", "grep",
+     "head", "ls", "pwd", "readlink", "realpath", "rg", "sort", "stat", "tail", "test", "tr", "true", "uniq", "wc"}
+)
+GIT_CONFIG_FRAGMENTS = ("/.config/git/config", "/.git/config", "/.gitconfig")
+# Commands that print only names, sizes, times or counts, or nothing at all.
+METADATA_COMMANDS = frozenset({"[", "[[", "ls", "stat", "test", "wc"})
+GREP_COMMANDS = frozenset({"egrep", "fgrep", "grep", "rg"})
+GREP_COUNTING_FLAGS = frozenset("Lclq")
+GREP_VALUE_FLAGS = frozenset("ABCDdefm")
+GREP_PLAIN_FLAGS = frozenset("EFGHIahinsw")
+GREP_COUNTING_OPTIONS = frozenset({"--count", "--files-with-matches", "--files-without-match", "--quiet", "--silent"})
+GREP_PLAIN_OPTIONS = frozenset(
+    {"--ignore-case", "--line-number", "--no-filename", "--no-messages", "--with-filename", "--word-regexp"}
+)
 SECRET_FILE_EXEMPT = r"(?!(?:\.[a-z0-9_-]{1,64}){0,8}\.(?:pub|example|sample|template|dist)(?![^\s\"'|;&<>()=:/]))"
 SECRET_FILE_NAME = (
     r"\.pgpass|\.my\.cnf|\.git-credentials|\.vault-token|\.dev\.vars|\.envrc"
@@ -452,6 +525,13 @@ SECRET_FILE_NAME = (
 )
 SENSITIVE_FILE_PATTERN = re.compile(
     r"(?:^|[\s\"'=:(<>|;&/])(?:" + SECRET_FILE_NAME + r")(?![a-z0-9_-])" + SECRET_FILE_EXEMPT
+)
+GIT_CONFIG_PATH_PATTERN = re.compile(
+    "|".join(re.escape(fragment) + TEMPLATE_SUFFIX for fragment in GIT_CONFIG_FRAGMENTS)
+    + "|"
+    + "|".join(
+        r"(?:^|[\s\"'=:(<>|;&/])" + re.escape(fragment[1:]) + TEMPLATE_SUFFIX for fragment in GIT_CONFIG_FRAGMENTS
+    )
 )
 SENSITIVE_PATH_PATTERN = re.compile(
     "|".join(
@@ -735,9 +815,45 @@ def _formats_are_unsafe(arguments: list[str], *headers: str, refs: bool = False)
     return not (_ref_format_is_safe(fmt) if refs else _log_format_is_safe(fmt))
 
 
+# Only removing or reading a key of SAFE_CONFIG_KEYS cannot leak; no git option may precede `config`.
+def _safe_git_config(words: list[str]) -> bool:
+    normalized = [_normalized(word) for word in words]
+    if "git" not in normalized:
+        return False
+    rest = words[normalized.index("git") + 1 :]
+    if rest[:1] == ["-C"] and len(rest) >= 3:
+        rest = rest[2:]
+    if not rest or rest[0] != "config":
+        return False
+    arguments = rest[1:]
+    scopes = [argument for argument in arguments if argument in CONFIG_SCOPES]
+    operands = [argument for argument in arguments if argument not in CONFIG_SCOPES]
+    if len(scopes) > 1:
+        return False
+    if operands[:1] in (["unset"], ["get"]) and len(operands) == 2:
+        operands[0] = "--" + operands[0]
+    if len(operands) == 2 and operands[0] in {"--unset", "--unset-all"}:
+        return scopes in ([], ["--local"], ["--worktree"]) and operands[1].lower() in SAFE_CONFIG_KEYS
+    if len(operands) == 2 and operands[0] in {"--get", "--get-all"}:
+        return operands[1].lower() in SAFE_CONFIG_KEYS
+    if len(operands) == 1 and not operands[0].startswith("-"):
+        return operands[0].lower() in SAFE_CONFIG_KEYS
+    return False
+
+
+def _runs_git_config(raw_words: list[str]) -> bool:
+    try:
+        words, _ = _unwrap(raw_words)
+    except UnresolvableCommand:
+        return False
+    return _git_subcommand(words)[0] == "config"
+
+
 def _sensitive_git_command(words: list[str]) -> bool:
     subcommand, arguments = _git_subcommand(words)
-    if subcommand in {"blame", "cat-file", "commit", "config", "format-patch", "request-pull", "send-email", "shortlog", "whatchanged"}:
+    if subcommand == "config":
+        return not _safe_git_config(words)
+    if subcommand in {"blame", "cat-file", "commit", "format-patch", "request-pull", "send-email", "shortlog", "whatchanged"}:
         return True
     if subcommand == "var":
         return any(argument.upper() in {"GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"} for argument in arguments)
@@ -890,6 +1006,124 @@ def _traces_commands(executable: str, arguments: list[str]) -> bool:
     return False
 
 
+def _chunks_with_separators(command: str) -> list[tuple[list[str], str, str]]:
+    try:
+        lexer = shlex.shlex(normalize_command(command), posix=True, punctuation_chars=";&|()\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = [token for token in lexer if token != REDIRECTION_MARKER]
+    except ValueError:
+        return []
+    parts: list[tuple[list[str], str, str]] = []
+    current: list[str] = []
+    before = ""
+    for token in tokens:
+        if token and all(character in SHELL_PUNCTUATION for character in token):
+            if current:
+                parts.append((current, before, token))
+                current = []
+                before = token
+            else:
+                before += token
+            continue
+        current.append(token)
+    if current:
+        parts.append((current, before, ""))
+    return parts
+
+
+# Returns "names" when a search prints only counts, names or lines with a harmless key word and its
+# output can hold a file name, "quiet" when it cannot, and None when any other option could print more.
+def _grep_prints_nothing_private(arguments: list[str]) -> str | None:
+    counting = False
+    plain = True
+    names = False
+    operands: list[str] = []
+    index = 0
+    after_options = False
+    while index < len(arguments):
+        word = arguments[index]
+        index += 1
+        if operands and word.startswith("-") and word != "-" and not after_options:
+            return None
+        if after_options or not word.startswith("-") or word == "-":
+            operands.append(word)
+        elif word == "--":
+            after_options = True
+        elif word.startswith("--"):
+            name = word.split("=", 1)[0]
+            if name in GREP_COUNTING_OPTIONS:
+                counting = True
+                names = names or name in {"--files-with-matches", "--files-without-match"}
+            elif name in GREP_PLAIN_OPTIONS:
+                names = names or name == "--with-filename"
+            else:
+                plain = False
+        else:
+            for position, flag in enumerate(word[1:], 1):
+                if flag in GREP_VALUE_FLAGS:
+                    plain = False
+                    if position == len(word) - 1:
+                        index += 1
+                    break
+                if flag in GREP_COUNTING_FLAGS:
+                    counting = True
+                    names = names or flag in "lL"
+                elif flag in GREP_PLAIN_FLAGS:
+                    names = names or flag == "H"
+                else:
+                    plain = False
+    if not plain or not operands:
+        return None
+    if not counting and operands[0].lower() not in SAFE_CONFIG_WORDS:
+        return None
+    return "names" if names or len(operands) > 2 else "quiet"
+
+
+def _prints_nothing_private(raw_words: list[str]) -> str | None:
+    if not raw_words:
+        return None
+    executable = _normalized(raw_words[0])
+    arguments = raw_words[1:]
+    if any(argument.startswith("--files0") or UNRESOLVED_WORD.search(argument) for argument in arguments):
+        return None
+    if executable in {"[", "[[", "test"}:
+        return "quiet"
+    if executable in METADATA_COMMANDS:
+        return "names"
+    if executable in GREP_COMMANDS:
+        return _grep_prints_nothing_private(arguments)
+    return None
+
+
+# A git config file may be named only by a quiet command, next to plain commands only,
+# with no redirect but /dev/null, and without a pipe or group that hands its output to a reader.
+def _names_sensitive_path(lowered: str, code: str) -> bool:
+    total = len(SENSITIVE_PATH_PATTERN.findall(lowered))
+    if not total:
+        return False
+    redirects = re.sub(r"\d*>>?\s*(?:/dev/null|&\d)", "", lowered)
+    if SHADOWING_PATTERN.search(lowered) or re.search(r"[<>]", redirects):
+        return True
+    harmless = 0
+    parts = _chunks_with_separators(code)
+    if GREP_ENVIRONMENT.search(lowered) or any(_normalized(chunk[0]) not in NEIGHBOR_COMMANDS for chunk, _, _ in parts):
+        return True
+    for chunk, before, after in parts:
+        text = " ".join(chunk).lower()
+        mentions = len(SENSITIVE_PATH_PATTERN.findall(text))
+        if not mentions:
+            continue
+        kind = _prints_nothing_private(chunk)
+        if kind is None or len(GIT_CONFIG_PATH_PATTERN.findall(text)) != mentions:
+            return True
+        if kind == "names" and (before not in SEPARATORS_AFTER_QUIET or after not in SEPARATORS_AFTER_QUIET):
+            return True
+        harmless += mentions
+    return harmless != total
+
+
 def _sensitive_chunk(raw_words: list[str]) -> bool:
     if all(ASSIGNMENT.fullmatch(word) or word in SHELL_KEYWORDS for word in raw_words):
         return False
@@ -920,6 +1154,8 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
     if printer[0] in DEFINITION_PRINTERS and _prints_definitions(printer[0], printer[1:]):
         return True
     if any(word.split("=", 1)[0] in SENSITIVE_FLAGS for word in normalized):
+        return True
+    if "git" in normalized and _git_subcommand(words)[0] == "config" and any(ASSIGNMENT.fullmatch(word) for word in raw_words):
         return True
     if "git" in normalized and (_sensitive_git_command(words) or (_git_subcommand(words)[0] or "").startswith("credential")):
         return True
@@ -976,13 +1212,15 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
         return True
     if startup_operand:
         return False
+    if executable in PLAIN_UTILITIES:
+        return False
     if first == "doctor" or first == "whoami":
         return True
     if first == "status" and executable not in {"git", "pm2", "systemctl"}:
         return True
     if first in GENERIC_PRIVATE_SUBCOMMANDS and (not second or second in GENERIC_PRIVATE_ACTIONS):
         return True
-    if first == "config" and any(argument in GENERIC_PRIVATE_ACTIONS or argument in {"--list", "-l", "dump", "view"} for argument in arguments[1:]):
+    if first == "config" and executable != "git" and any(argument in GENERIC_PRIVATE_ACTIONS or argument in {"--list", "-l", "dump", "view"} for argument in arguments[1:]):
         return True
     return False
 
@@ -1310,7 +1548,7 @@ def _sensitive_command(command: str, data_heredocs: bool = True) -> bool:
     lowered = command.lower()
     if (
         DEFINITION_PARAMETER_PATTERN.search(lowered)
-        or SENSITIVE_PATH_PATTERN.search(lowered)
+        or _names_sensitive_path(lowered, code)
         or SENSITIVE_FILE_PATTERN.search(lowered)
         or PROCESS_ENVIRONMENT_PATTERN.search(lowered)
         or _reads_startup_file(command)
@@ -1321,6 +1559,8 @@ def _sensitive_command(command: str, data_heredocs: bool = True) -> bool:
         return True
     chunks = _tokenize(code)
     if not chunks or any(_sensitive_chunk(chunk) for chunk in chunks):
+        return True
+    if CONFIG_ENVIRONMENT.search(lowered) and any(_runs_git_config(chunk) for chunk in chunks):
         return True
     return any(_sensitive_command(body, False) for body in command_substitutions(code) if body.strip())
 
@@ -1499,6 +1739,11 @@ def _shows_host_details(command: str, text: str) -> bool:
     )
 
 
+def _plain_chunk(chunk: list[str]) -> bool:
+    words = [word for word in chunk if not ASSIGNMENT.fullmatch(word)]
+    return bool(words) and _normalized(words[0]) in PLAIN_UTILITIES
+
+
 def _sensitive_output(command: str, response: Any) -> bool:
     return _withheld_because(command, response) is not None
 
@@ -1515,6 +1760,7 @@ def _withheld_because(command: str, response: Any) -> str | None:
         or "identity" in _normalized(token)
         for text in (command, *command_substitutions(command))
         for chunk in _tokenize(text)
+        if not _plain_chunk(chunk)
         for token in chunk
     )
     labeled_non_email_identity = NON_EMAIL_IDENTITY_FIELD_PATTERN.search(text) is not None
@@ -2153,6 +2399,16 @@ def _self_test() -> int:
         "rtk proxy security find-identity -v -p codesigning",
         "rtk proxy ./gradlew test",
         "./other/safe-tool env",
+        "git config --list",
+        "git config --get remote.origin.url",
+        "git config --local --unset user.name",
+        "git -c include.path=/tmp/x config --get user.name",
+        "cat .git/config",
+        "grep url .git/config",
+        "grep -c -o url .git/config",
+        "ls .git/config | xargs cat",
+        "export GREP_OPTIONS=-v; grep hooksPath .git/config",
+        "npm whoami",
     )
     allowed = (
         "safe-tool status coderabbit",
@@ -2163,6 +2419,13 @@ def _self_test() -> int:
         "rtk git status --short",
         "rtk proxy git diff --stat",
         'rg "git config" AGENTS.md',
+        "git config --local --unset core.hooksPath",
+        "git config --get core.hooksPath",
+        "grep -c hooksPath .git/config",
+        "rg -c url .git/config",
+        "stat -f '%Sm' .git/config",
+        "rm status",
+        "make status",
     )
     status_payload = [{"type": "status", "authenticated": True, "email": "withheld@example.invalid"}]
     secret_output = {"stdout": "token=" + "ghp_" + ("A" * 32), "stderr": ""}
