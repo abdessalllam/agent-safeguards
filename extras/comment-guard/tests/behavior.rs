@@ -265,7 +265,9 @@ fn a_directive_followed_by_prose_is_a_comment() {
     let starts = [
         "noqa", "type:", "pragma", "pylint:", "mypy:", "ruff:", "fmt:", "isort:", "pyright:", "eslint-", "prettier-ignore",
         "@ts-", "istanbul ", "c8 ", "go:", "nolint", "swiftlint:", "spdx-license-identifier", "shellcheck", "nosec",
-        "cspell:", "-*-", "lint:", "clippy::", "rustfmt::", "+build", "@flow", "@jsx",
+        "cspell:", "-*-", "lint:", "clippy::", "rustfmt::", "+build", "@flow", "@jsx", "nolintnextline", "nolintbegin",
+        "nolintend", "clang-format", "deno-lint-ignore", "deno-fmt-ignore", "stylelint-", "@generated", "line ", "sbatch",
+        "pbs",
     ];
     for prefix in starts {
         let line = format!("# {prefix} note one\n# {prefix} note two\n# {prefix} note three\n");

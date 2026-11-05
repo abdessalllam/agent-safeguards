@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::comments::{body, scan, LineKind};
+use crate::comments::{body, protected, scan, LineKind};
 use crate::languages::{language_for_text, Language, CLIKE, GO, RUST, SCRIPT, SHELL};
 use crate::locale::message;
 
@@ -281,8 +281,23 @@ fn nested_template(text: &str) -> bool {
         let start = at.saturating_add(found).saturating_add(2);
         let mut depth = 1usize;
         let mut closed = false;
+        let mut quote: Option<u8> = None;
+        let mut escaped = false;
         for byte in bytes.iter().skip(start).take(4096) {
+            if let Some(open) = quote {
+                if escaped {
+                    escaped = false;
+                } else if *byte == b'\\' {
+                    escaped = true;
+                } else if *byte == open {
+                    quote = None;
+                } else if *byte == b'\n' {
+                    return true;
+                }
+                continue;
+            }
             match byte {
+                b'"' | b'\'' => quote = Some(*byte),
                 b'{' => depth = depth.saturating_add(1),
                 b'}' => {
                     depth = depth.saturating_sub(1);
@@ -291,7 +306,7 @@ fn nested_template(text: &str) -> bool {
                         break;
                     }
                 }
-                b'`' => return true,
+                b'`' | b'/' => return true,
                 _ => {}
             }
         }
@@ -312,9 +327,14 @@ fn directive_shaped(line: &str) -> bool {
     !word.is_empty() && text.get(word.len()..).is_some_and(|rest| rest.trim_start().starts_with([':', '=']))
 }
 
+fn jsx_like(text: &str) -> bool {
+    text.lines().any(|line| !line.trim_start().starts_with("//") && (line.contains("</") || line.contains("/>")))
+}
+
 fn risky(text: &str, lang: Language) -> bool {
     if !lang.trim
         || text.contains("\\\n")
+        || text.contains("\\\r")
         || text.starts_with("__END__")
         || text.contains("\n__END__")
         || text.contains("__DATA__")
@@ -324,8 +344,8 @@ fn risky(text: &str, lang: Language) -> bool {
     (lang == SHELL && text.contains("<<"))
         || (lang == RUST && text.lines().any(raw_string_open))
         || (lang == CLIKE && (text.contains("R\"") || text.contains("@\"")))
-        || (lang == GO && text.contains("import \"C\""))
-        || (lang == SCRIPT && nested_template(text))
+        || (lang == GO && text.contains("\"C\""))
+        || (lang == SCRIPT && (nested_template(text) || jsx_like(text)))
 }
 
 pub fn trimmed(change: &Change) -> Option<Trimmed> {
@@ -366,7 +386,7 @@ pub fn trimmed(change: &Change) -> Option<Trimmed> {
             }
             _ => false,
         };
-        let guarded = scanner.line_index() < 3 && directive_shaped(line);
+        let guarded = protected(body(line)) || (scanner.line_index() < 3 && directive_shaped(line));
         if !kept && !same_line && scanner.standalone() && !guarded {
             fresh.push((scanner.line_index(), line));
         }
