@@ -1507,6 +1507,20 @@ fn empty_comment_lines_replaced_one_for_one_are_not_new_commentary() {
     std::fs::write(&path, "<?php\n// ----\n$a = 1;\n").expect("write");
     let ruler = write_file(None, None, &path, "<?php\n# ====\n$a = 1;\n");
     assert!(!denied(&ruler), "{}", reason(&ruler));
+    std::fs::write(&path, "<?php\n// alpha beta gamma delta\n$a = 1;\n").expect("write");
+    let hollow = write_file(None, None, &path, "<?php\n//\n//\n//\n$a = 1;\n");
+    assert!(!denied(&hollow), "{}", reason(&hollow));
+    let padded = write_file(None, None, &path, "<?php\n//\n//\n//\n//\n$a = 1;\n");
+    assert!(denied(&padded));
+    std::fs::write(&path, "<?php\n// release note\n$a = 1;\n").expect("write");
+    let emptied = write_file(None, None, &path, "<?php\n//\n//\n//\n$a = 1;\n");
+    assert!(!denied(&emptied), "{}", reason(&emptied));
+    std::fs::write(&path, "<?php\n// 1.\n// 2.\n// 3.\n$a = 1;\n").expect("write");
+    let dotted = write_file(None, None, &path, "<?php\n// ...\n// ...\n// ...\n$a = 1;\n");
+    assert!(!denied(&dotted), "{}", reason(&dotted));
+    std::fs::write(&path, "<?php\n// ----\n$a = 1;\n").expect("write");
+    let titled = write_file(None, None, &path, "<?php\n// Parsing helpers\n$a = 1;\n");
+    assert!(!denied(&titled), "{}", reason(&titled));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1519,5 +1533,17 @@ fn html_delimiter_lines_are_not_letters_that_a_rewrap_could_hide() {
     assert!(denied(&hollow));
     let plain = write_file(None, None, &path, "<!-- ab -->\n<p>hi there</p>\n");
     assert!(!denied(&plain));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_comment_split_into_thin_lines_is_not_a_rewrap() {
+    let dir = temp_dir("thin-lines");
+    let path = dir.join("a.rs");
+    std::fs::write(&path, "// hello\nfn a() {}\n").expect("write");
+    let padded = "// h ----\n// e ----\n// l ----\n// l ----\n// o ----\nfn a() {}\n";
+    assert!(denied(&write_file(None, None, &path, padded)));
+    let letters = "// h\n// e\n// l\n// l\n// o\nfn a() {}\n";
+    assert!(denied(&write_file(None, None, &path, letters)));
     let _ = std::fs::remove_dir_all(&dir);
 }

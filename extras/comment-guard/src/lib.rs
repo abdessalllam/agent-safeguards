@@ -138,14 +138,15 @@ fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) -> Has
 
 fn settle(ledger: &Ledger, prepared: &HashMap<String, Prepared>, changes: &mut [Change]) -> Option<String> {
     let mut retry: Vec<(String, u64, u64, usize)> = Vec::new();
-    let mut committed: Vec<(String, u64, u64, usize)> = Vec::new();
+    let mut committed: Vec<(String, u64, usize)> = Vec::new();
     for change in changes.iter_mut() {
         let Some(item) = prepared.get(&change.file) else {
             continue;
         };
         let net = decision::net_lines(change);
         match ledger.commit_note(&item.id, item.before, item.after.hash, net, change.carry) {
-            Ok(()) => committed.push((item.id.clone(), item.before, item.after.hash, net)),
+            Ok(true) => committed.push((item.id.clone(), item.before, net)),
+            Ok(false) => {}
             Err(current) => {
                 change.carry = current;
                 retry.push((item.id.clone(), item.before, item.after.hash, net));
@@ -169,8 +170,8 @@ fn settle(ledger: &Ledger, prepared: &HashMap<String, Prepared>, changes: &mut [
             }
         }
     } else {
-        for (id, before, after, net) in &committed {
-            ledger.revoke_note(id, *before, *after, *net);
+        for (id, before, net) in &committed {
+            ledger.revoke_note(id, *before, *net);
         }
     }
     verdict
@@ -246,13 +247,16 @@ mod tests {
     use crate::decision::Change;
     use crate::session::{identity, seen_of, Ledger};
     use std::collections::HashMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    #[test]
-    fn a_denied_call_leaves_no_note_behind_for_the_files_it_had_already_noted() {
-        let dir = std::env::temp_dir().join(format!("comment-guard-settle-{}", std::process::id()));
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("comment-guard-settle-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
-        let ledger = Ledger::open(&dir, "settle").expect("ledger");
+        dir
+    }
+
+    fn pair(ledger: &Ledger) -> (HashMap<String, Prepared>, Vec<Change>) {
         let mut prepared = HashMap::new();
         let mut changes = Vec::new();
         for (name, old, new) in [("/t/a.py", "x = 1\n", "# one\nx = 1\n"), ("/t/b.py", "y = 1\n", "# two\ny = 1\n")] {
@@ -266,12 +270,35 @@ mod tests {
             change.baseline = Some(Vec::new());
             changes.push(change);
         }
+        (prepared, changes)
+    }
+
+    #[test]
+    fn a_denied_call_leaves_no_note_behind_for_the_files_it_had_already_noted() {
+        let dir = scratch("denied");
+        let ledger = Ledger::open(&dir, "settle").expect("ledger");
+        let (prepared, mut changes) = pair(&ledger);
         let other = &prepared["/t/b.py"];
-        assert_eq!(ledger.commit_note(&other.id, other.before, 77, 2, 0), Ok(()));
+        assert_eq!(ledger.commit_note(&other.id, other.before, 77, 2, 0), Ok(true));
         let verdict = settle(&ledger, &prepared, &mut changes);
         assert!(verdict.is_some());
         let first = &prepared["/t/a.py"];
         assert_eq!(ledger.carry(&first.id, first.before, 12345), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_denied_call_keeps_the_note_an_identical_earlier_edit_left() {
+        let dir = scratch("identical");
+        let ledger = Ledger::open(&dir, "settle").expect("ledger");
+        let (prepared, mut changes) = pair(&ledger);
+        let first = &prepared["/t/a.py"];
+        assert_eq!(ledger.commit_note(&first.id, first.before, first.after.hash, 1, 0), Ok(true));
+        let other = &prepared["/t/b.py"];
+        assert_eq!(ledger.commit_note(&other.id, other.before, 77, 2, 0), Ok(true));
+        let verdict = settle(&ledger, &prepared, &mut changes);
+        assert!(verdict.is_some());
+        assert_eq!(ledger.carry(&first.id, first.before, 12345), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

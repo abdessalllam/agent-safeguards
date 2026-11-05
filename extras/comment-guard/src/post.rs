@@ -168,7 +168,7 @@ pub fn refresh_named(payload: &Map<String, Value>, ledger: &Ledger) {
         let comments = comment_lines(&current, lang);
         let state = seen_of(&current, &comments);
         if !ledger.knows(&id, state) {
-            ledger.rebaseline(&id, comments, state);
+            ledger.rebaseline_soon(&id, comments, state);
         }
     }
 }
