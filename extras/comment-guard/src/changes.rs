@@ -361,6 +361,11 @@ fn assemble(
     base: &Path,
     budget: &mut (Work, Work),
 ) {
+    if budget.0.out || budget.1.out {
+        let origin = section.source.as_ref().unwrap_or(&section.path);
+        abandon(changes, lookup.get(origin).copied());
+        return;
+    }
     if section.add {
         let content = fragments(&section.hunks, false);
         match lookup.get(&section.path).copied().and_then(|at| changes.get_mut(at)) {
@@ -377,10 +382,6 @@ fn assemble(
     }
     let source = section.source.clone().unwrap_or_else(|| section.path.clone());
     let previous = lookup.get(&source).copied();
-    if budget.0.out || budget.1.out {
-        abandon(changes, previous);
-        return;
-    }
     let current = match previous.and_then(|at| changes.get(at)) {
         Some(change) if change.partial => None,
         Some(change) => Some(change.new.clone()),

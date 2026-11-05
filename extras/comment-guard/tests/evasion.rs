@@ -753,6 +753,30 @@ fn once_the_patch_budget_is_spent_later_sections_do_not_restart_from_the_origina
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn nothing_further_in_a_patch_is_judged_once_its_budget_is_spent() {
+    let dir = temp_dir("patch-spent");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "flag = 0\n").expect("write");
+    let target = path.display();
+    let padding = "x".repeat(1024 * 1024);
+    let mut patch = String::from("*** Begin Patch\n");
+    patch.push_str(&format!("*** Update File: {target}\n@@\n+DATA = \"\"\"\n+{padding}\n"));
+    for n in 0..64 {
+        let (from, to) = if n % 2 == 0 { ("flag = 0", "flag = 1") } else { ("flag = 1", "flag = 0") };
+        patch.push_str(&format!("*** Update File: {target}\n@@\n-{from}\n+{to}\n"));
+    }
+    let fresh = dir.join("fresh.py");
+    patch.push_str(&format!("*** Add File: {}\n+# one\n+# two\n+# three\n", fresh.display()));
+    patch.push_str("*** End Patch\n");
+    let verdict = pre(None, None, "apply_patch", json!({ "command": patch }), Provider::Codex);
+    assert!(!denied(&verdict));
+    let short = format!("*** Begin Patch\n*** Add File: {}\n+# one\n+# two\n+# three\n*** End Patch\n", fresh.display());
+    let alone = pre(None, None, "apply_patch", json!({ "command": short }), Provider::Codex);
+    assert!(denied(&alone));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn creation_time_is_known(path: &Path) -> bool {
     std::fs::metadata(path).and_then(|meta| meta.created()).is_ok()
 }

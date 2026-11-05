@@ -74,6 +74,7 @@ The hook files here are not wired in by default. Merge one into your own setting
 ## Limits
 
 - The commit-time check does not stop comments spread over several commits (each commit then adds two lines next to the earlier ones), and does not run for a commit made some other way.
+- A patch with very many or very large sections stops being judged once its work budget is spent (64 MiB of text, 2000 hunks, 5 million search steps), and so does a `MultiEdit` that spends the budget: the call is allowed.
 - The `Bash` check reports after the fact. It sees only the files a command names and the recently changed source files under the working folder, so a script that writes somewhere else is missed. Outside a git repository, an existing file that the session never touched cannot be judged on its first change by a command (its comments are recorded for the next check).
 - The commit-time check also refuses a generated or vendored source file that is full of comments. The agent should tell you; turn the guard off for that commit.
 - Line-based reading has limits: a heredoc body or a multi-line plain string (not triple-quoted or backtick) can hide or invent a trailing comment, a regex literal that contains ` // ` can read as a comment, and a triple-quoted string that begins a Python line inside brackets reads as a docstring. A bare one-line string statement is not counted as a docstring.
