@@ -6,7 +6,7 @@ use guard_common::locale::{message, FormatValue};
 use guard_common::shell::split_options;
 use regex::Regex;
 
-use crate::check::{check_command, check_one_chunk};
+use crate::check::{check_command_weighted, check_one_chunk, NESTED_FRAMES};
 use crate::consts::{
     MOSH_FLAG_LETTERS, MOSH_LONG_FLAGS, MOSH_LONG_VALUES, MOSH_VALUE_LETTERS, QUICK_SCAN,
     QUOTED_TILDE, REMOTE_COMMAND_NAMES, RSYNC_VALUE_LETTERS, RSYNC_VALUE_OPTIONS, SSH_FLAG_LETTERS,
@@ -110,7 +110,7 @@ pub fn check_remote_command(text: &str) -> Result<(), Stop> {
                 ],
             ))));
         }
-        check_command(text, None)
+        check_command_weighted(text, None, NESTED_FRAMES)
     })();
     set_remote(previous);
     result

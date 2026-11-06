@@ -4,20 +4,30 @@ use std::thread::LocalKey;
 #[derive(Debug)]
 pub struct RecursionLimit;
 
-struct Restore(&'static LocalKey<Cell<usize>>);
+struct Restore(&'static LocalKey<Cell<usize>>, usize);
 
 impl Drop for Restore {
     fn drop(&mut self) {
-        self.0.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        let weight = self.1;
+        self.0.with(|depth| depth.set(depth.get().saturating_sub(weight)));
     }
 }
 
 pub fn with_depth<T>(counter: &'static LocalKey<Cell<usize>>, limit: usize, body: impl FnOnce() -> T) -> T {
+    with_weight(counter, 1, limit, body)
+}
+
+pub fn with_weight<T>(
+    counter: &'static LocalKey<Cell<usize>>,
+    weight: usize,
+    limit: usize,
+    body: impl FnOnce() -> T,
+) -> T {
     let level = counter.with(|depth| {
-        depth.set(depth.get() + 1);
+        depth.set(depth.get().saturating_add(weight));
         depth.get()
     });
-    let _restore = Restore(counter);
+    let _restore = Restore(counter, weight);
     if level > limit {
         std::panic::panic_any(RecursionLimit);
     }

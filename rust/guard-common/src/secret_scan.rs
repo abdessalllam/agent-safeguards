@@ -6,6 +6,10 @@ use regex::{Captures, Regex};
 
 pub const SCAN_BUDGET_SECONDS: f64 = 3.0;
 
+fn scan_budget() -> f64 {
+    crate::overrides::number("SCAN_BUDGET_SECONDS").unwrap_or(SCAN_BUDGET_SECONDS)
+}
+
 const INTEGRITY_PREFIXES: [&str; 5] = ["sha1-", "sha256-", "sha384-", "sha512-", "md5-"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -856,7 +860,7 @@ pub fn bare_secret(text: &str, deadline: Deadline) -> bool {
 }
 
 pub fn contains_secret(text: &str) -> bool {
-    contains_secret_by(text, Deadline::after(SCAN_BUDGET_SECONDS))
+    contains_secret_by(text, Deadline::after(scan_budget()))
 }
 
 pub fn contains_secret_by(text: &str, deadline: Deadline) -> bool {
@@ -870,7 +874,7 @@ pub fn contains_secret_by(text: &str, deadline: Deadline) -> bool {
 }
 
 pub fn contains_key(text: &str) -> bool {
-    contains_key_by(text, Deadline::after(SCAN_BUDGET_SECONDS))
+    contains_key_by(text, Deadline::after(scan_budget()))
 }
 
 pub fn contains_key_by(text: &str, deadline: Deadline) -> bool {

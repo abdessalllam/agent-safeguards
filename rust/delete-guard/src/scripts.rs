@@ -16,7 +16,7 @@ use guard_common::shell::{
 use guard_common::sys::realpath;
 use regex::Regex;
 
-use crate::check::check_command;
+use crate::check::{check_command_weighted, NESTED_FRAMES};
 use crate::consts::{
     self, MAX_SCRIPT_BYTES, MAX_SCRIPT_DEPTH, SHELL_SHEBANG, TEXT_HEREDOC_OWNER, TEXT_HEREDOC_TAIL,
     VETTED_COMMANDS, VETTED_MENTION,
@@ -294,7 +294,7 @@ pub fn check_script_file(raw: &str, cwd: Option<&str>, shell: bool) -> Result<()
         return Ok(());
     }
     SCRIPT_STACK.with(|stack| stack.borrow_mut().push(resolved.clone()));
-    let result = check_command(&without_text_heredocs(&text), cwd);
+    let result = check_command_weighted(&without_text_heredocs(&text), cwd, NESTED_FRAMES);
     SCRIPT_STACK.with(|stack| {
         stack.borrow_mut().pop();
     });

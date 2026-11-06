@@ -61,6 +61,7 @@ fn vectors_match_python() {
     let records: Vec<Value> = serde_json::from_str(&source).expect("vectors JSON");
     let home = fixture();
     guard_common::overrides::set_local("USER_HOME", json!(home.0.to_string_lossy().to_string()));
+    guard_common::overrides::set_local("SCAN_BUDGET_SECONDS", json!(300.0));
     for (index, record) in records.iter().enumerate() {
         let name = string(record.get("fn").expect("fn"));
         let args = record.get("args").and_then(Value::as_array).expect("args");

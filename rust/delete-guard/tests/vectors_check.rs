@@ -124,7 +124,7 @@ fn setup(record: &Value, root: &str) {
     find::set_stdin_files(stdin);
 }
 
-fn whole_run(args: &[Value], root: &str) -> Value {
+fn whole_run(args: &[Value], root: &str, hex: bool) -> Value {
     let args: Vec<String> = args.iter().map(|value| decode(value, root)).collect();
     let hook = args.first().is_some_and(|arg| arg == "hook");
     let count = if hook { 2 } else { args.len() };
@@ -140,9 +140,9 @@ fn whole_run(args: &[Value], root: &str) -> Value {
     let mut child = command.spawn().expect("binary");
     if hook {
         if let Some(mut input) = child.stdin.take() {
-            input
-                .write_all(args.get(2).map(String::as_bytes).unwrap_or(&[]))
-                .expect("stdin");
+            let given = args.get(2).map(String::as_str).unwrap_or("");
+            let bytes = if hex { hex_to_bytes(given) } else { given.as_bytes().to_vec() };
+            input.write_all(&bytes).expect("stdin");
         }
     }
     let output = child.wait_with_output().expect("output");
@@ -238,13 +238,14 @@ fn check_vectors_match_python() {
             "script_path" => (json!(cli::script_path(&arg(0))), None),
             "preflight_trash_patterns" => (json!(cli::preflight_trash_patterns()), None),
             "remote_preflight_script" => (json!(cli::remote_preflight_script()), None),
-            "whole_run" => (whole_run(args, &root_text), None),
+            "whole_run" => (whole_run(args, &root_text, false), None),
+            "whole_run_bytes" => (whole_run(args, &root_text, true), None),
             _ => panic!("unexpected function {name}"),
         };
         let actual = normalize(ret, &root_text);
         if actual != record.get("ret").cloned().unwrap_or(Value::Null)
             || exc != record.get("exc").and_then(Value::as_str)
-            || (name != "whole_run"
+            || (!name.starts_with("whole_run")
                 && normalize(json!(decision::pending_ask()), &root_text)
                     != record.get("ask").cloned().unwrap_or(Value::Null))
         {
@@ -264,6 +265,14 @@ fn check_vectors_match_python() {
 
 fn arg_in(tuple: &[Value], at: usize, root: &str) -> String {
     decode(tuple.get(at).unwrap_or(&Value::Null), root)
+}
+
+fn hex_to_bytes(value: &str) -> Vec<u8> {
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).expect("hex"), 16).expect("byte"))
+        .collect()
 }
 
 fn decode_hex(value: &str) -> String {

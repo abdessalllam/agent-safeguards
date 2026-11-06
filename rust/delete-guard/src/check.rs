@@ -183,7 +183,7 @@ pub fn check_one_chunk(
         return Ok((shell_cwd, false));
     }
     if name == "eval" {
-        check_command(
+        check_command_weighted(
             &stripped
                 .iter()
                 .skip(1)
@@ -191,6 +191,7 @@ pub fn check_one_chunk(
                 .collect::<Vec<_>>()
                 .join(" "),
             cwd,
+            EVAL_FRAMES,
         )?;
         return Ok((shell_cwd, false));
     }
@@ -506,13 +507,13 @@ pub fn check_shell(words: &[String], cwd: Option<&str>) -> Result<(), Stop> {
                 .map_or("", |found| found.as_str());
             let chars: Vec<char> = option.chars().collect();
             for cut in 1..=prefix.chars().count() {
-                check_command(&chars.iter().skip(cut).collect::<String>(), cwd)?;
+                check_command_weighted(&chars.iter().skip(cut).collect::<String>(), cwd, NESTED_FRAMES)?;
             }
         }
     }
     if !command_options.is_empty() {
         for operand in &operands {
-            check_command(operand, cwd)?;
+            check_command_weighted(operand, cwd, NESTED_FRAMES)?;
         }
     }
     if remote().is_some() {
@@ -633,10 +634,27 @@ pub fn device_redirect_hint(text: &str) -> bool {
 
 thread_local! {
     static CHECK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SUBSTITUTION_LEVEL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// Python frames used per level (measured): the budget is 1000 frames, so eval fits 246
+// levels, a remote command 197 and a substitution 1006.
+const FRAME_BUDGET: usize = 987;
+pub const ROOT_FRAMES: usize = 1;
+pub const EVAL_FRAMES: usize = 4;
+pub const NESTED_FRAMES: usize = 5;
+const SUBSTITUTION_LEVELS: usize = 1006;
+
 pub fn check_command(command: &str, cwd: Option<&str>) -> Result<(), Stop> {
-    guard_common::depth::with_depth(&CHECK_DEPTH, 245, || check_command_level(command, cwd))
+    check_command_weighted(command, cwd, ROOT_FRAMES)
+}
+
+pub fn check_command_weighted(command: &str, cwd: Option<&str>, frames: usize) -> Result<(), Stop> {
+    guard_common::depth::with_weight(&CHECK_DEPTH, frames, FRAME_BUDGET, || check_command_level(command, cwd))
+}
+
+fn check_substitution(command: &str, cwd: Option<&str>) -> Result<(), Stop> {
+    guard_common::depth::with_depth(&SUBSTITUTION_LEVEL, SUBSTITUTION_LEVELS, || check_command_level(command, cwd))
 }
 
 fn check_command_level(command: &str, cwd: Option<&str>) -> Result<(), Stop> {
@@ -696,7 +714,7 @@ fn check_command_level(command: &str, cwd: Option<&str>) -> Result<(), Stop> {
                 .trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '\u{1c}'..='\u{1f}'))
                 .is_empty()
             {
-                check_command(&body, substitution_cwd)?;
+                check_substitution(&body, substitution_cwd)?;
             }
         }
         check_chunks(command, cwd)
@@ -713,6 +731,7 @@ pub fn check_chunks(command: &str, cwd: Option<&str>) -> Result<(), Stop> {
         let mut redirects = Vec::new();
         normalize_command(command, Some(&mut redirects));
         let current = cwd
+            .filter(|path| !path.is_empty())
             .map(try_realpath)
             .transpose()
             .map_err(|_| Stop::Internal)?;
@@ -725,6 +744,7 @@ pub fn check_chunks(command: &str, cwd: Option<&str>) -> Result<(), Stop> {
         return Ok(());
     }
     let mut current = cwd
+        .filter(|path| !path.is_empty())
         .map(try_realpath)
         .transpose()
         .map_err(|_| Stop::Internal)?;

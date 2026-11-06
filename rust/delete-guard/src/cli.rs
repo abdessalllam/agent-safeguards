@@ -51,6 +51,14 @@ fn command_repr(command: &str) -> String {
     out
 }
 
+fn join_path(base: &str, tail: &str) -> String {
+    if base.is_empty() || base.ends_with('/') {
+        format!("{base}{tail}")
+    } else {
+        format!("{base}/{tail}")
+    }
+}
+
 fn emit_stop(key: &str) {
     if !fail_open() {
         emit_decision("deny", &message(key, &[]), "PreToolUse");
@@ -135,10 +143,9 @@ pub fn run_hook(runtime: &str) -> i32 {
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty())
     {
-        cwd = Some(if Path::new(workdir).is_absolute() || cwd.is_none() {
-            workdir.to_owned()
-        } else {
-            format!("{}/{}", cwd.as_deref().unwrap_or(""), workdir)
+        cwd = Some(match cwd.as_deref() {
+            Some(base) if !Path::new(workdir).is_absolute() => join_path(base, workdir),
+            _ => workdir.to_owned(),
         });
     }
     set_pending_ask(None);

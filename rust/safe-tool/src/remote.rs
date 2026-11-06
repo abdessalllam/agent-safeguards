@@ -647,12 +647,12 @@ pub fn remote_check(command_text: &str) -> Result<Option<String>, EmbeddedNul> {
         })
         .collect::<Vec<_>>()
         .join(" | ");
-    let previous = consts::ps_target();
+    let previous = consts::ps_target_pinned();
     consts::set_ps_target("linux");
-    struct Restore(String);
+    struct Restore(Option<String>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            consts::set_ps_target(&self.0);
+            consts::pin_ps_target(self.0.take());
         }
     }
     let _restore = Restore(previous);

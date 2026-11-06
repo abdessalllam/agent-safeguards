@@ -20,15 +20,18 @@ fn compile(pattern: &str) -> Regex {
 }
 
 thread_local! {
-    static PS_TARGET_CELL: RefCell<String> = RefCell::new(String::from(if cfg!(target_os = "macos") { "darwin" } else { "linux" }));
+    static PS_TARGET_CELL: RefCell<Option<String>> = const { RefCell::new(None) };
     static STARTUP_RULES_CELL: Cell<bool> = const { Cell::new(true) };
 }
 
 pub fn ps_target() -> String {
+    if let Some(value) = PS_TARGET_CELL.with(|cell| cell.borrow().clone()) {
+        return value;
+    }
     if let Some(value) = guard_common::overrides::list("_PS_TARGET").and_then(|items| items.into_iter().next()) {
         return value;
     }
-    PS_TARGET_CELL.with(|cell| cell.borrow().clone())
+    String::from(if cfg!(target_os = "macos") { "darwin" } else { "linux" })
 }
 
 pub fn rtk_path() -> Option<String> {
@@ -42,8 +45,16 @@ pub fn hook_budget_seconds() -> f64 {
     guard_common::overrides::number("HOOK_BUDGET_SECONDS").unwrap_or(HOOK_BUDGET_SECONDS)
 }
 
+pub fn ps_target_pinned() -> Option<String> {
+    PS_TARGET_CELL.with(|cell| cell.borrow().clone())
+}
+
+pub fn pin_ps_target(value: Option<String>) {
+    PS_TARGET_CELL.with(|cell| *cell.borrow_mut() = value);
+}
+
 pub fn set_ps_target(value: &str) {
-    PS_TARGET_CELL.with(|cell| *cell.borrow_mut() = value.to_owned());
+    PS_TARGET_CELL.with(|cell| *cell.borrow_mut() = Some(value.to_owned()));
 }
 
 pub fn startup_rules() -> bool {

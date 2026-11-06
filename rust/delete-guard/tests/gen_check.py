@@ -145,6 +145,11 @@ with tempfile.TemporaryDirectory(prefix="d5-check-") as temporary:
         ("hook", "claude", {"tool_input": {"command": "echo safe"}, "cwd": root}),
         ("hook", "claude", {"tool_input": {"command": "rm -rf plain"}, "cwd": root}),
         ("hook", "claude", {"tool_input": {"command": "echo hi >/dev/disk4"}, "cwd": root}),
+        ("hook", "claude", {"tool_input": {"command": "rm -rf plain", "workdir": "plain"}, "cwd": root}),
+        ("hook", "claude", {"tool_input": {"command": "rm -rf plain", "workdir": "plain"}, "cwd": root + "/"}),
+        ("hook", "claude", {"tool_input": {"command": "rm -rf plain", "workdir": root}, "cwd": ""}),
+        ("hook", "claude", {"tool_input": {"command": "rm -rf build"}, "cwd": ""}),
+        ("hook", "codex", {"tool_input": {"command": "rm -rf build"}, "cwd": ""}),
         ("hook", "claude", {"tool_input": {"command": "rm -rf /"}, "cwd": root, "workdir": "plain"}),
         ("hook", "claude", {}), ("hook", "claude", []), ("hook", "claude", "bad"),
     ]
@@ -156,10 +161,24 @@ with tempfile.TemporaryDirectory(prefix="d5-check-") as temporary:
     for raw in [b"{", b"x" * (GUARD.MAX_INPUT_BYTES + 1),
                 b'{"tool_input":{"command":"rm -rf /"},"unused":NaN}',
                 b'{"tool_input":{"command":"rm -rf /"},"unused":Infinity}',
-                b'{"tool_input":{"command":"rm -rf /"},"unused":-Infinity}']:
+                b'{"tool_input":{"command":"rm -rf /"},"unused":-Infinity}',
+                b'\xef\xbb\xbf{"tool_input":{"command":"echo safe"}}',
+                '{"tool_input":{"command":"rm -rf /"}}'.encode("utf-16"),
+                '{"tool_input":{"command":"rm -rf /"}}'.encode("utf-16-le"),
+                '{"tool_input":{"command":"rm -rf /"}}'.encode("utf-32-be"),
+                ('{"tool_input":{"command":"echo safe"},"number":' + "9" * 4301 + "}").encode(),
+                ('{"tool_input":{"command":"echo safe"},"number":' + "9" * 4300 + "}").encode(),
+                b'{"$serde_json::private::Number":"0","tool_input":{"command":"echo safe"}}',
+                b'{"tool_input":{"command":"echo safe"},"tool_input":{"command":"rm -rf /"}}',
+                b'{"tool_input":{"command":"echo safe"}} x',
+                b'{"tool_input":{"command":"echo \\ud83d\\ude00"}}']:
         done = subprocess.run([sys.executable, "-I", str(ROOT / "bin" / "delete-guard"), "hook", "claude"],
                               input=raw, capture_output=True, check=False)
-        ROWS.append({"fn": "whole_run", "args": ["hook", "claude", raw.decode()],
+        try:
+            shown, kind = raw.decode(), "whole_run"
+        except UnicodeDecodeError:
+            shown, kind = raw.hex(), "whole_run_bytes"
+        ROWS.append({"fn": kind, "args": ["hook", "claude", shown],
                      "ret": {"code": done.returncode, "stdout": done.stdout.decode(), "stderr": done.stderr.decode()}, "exc": None})
     for arguments in [("self-test",), ("check-remote", "ls ~"), ("check-remote", "rm -rf ~/ci/run"),
                       ("remote-preflight", "ls ~"), ("remote-preflight", "rm -rf ~/ci/run"),
