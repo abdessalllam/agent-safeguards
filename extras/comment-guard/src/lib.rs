@@ -5,6 +5,7 @@ pub mod comments;
 pub mod decision;
 pub mod git;
 pub mod languages;
+pub mod limits;
 pub mod locale;
 pub mod post;
 pub mod session;
@@ -208,7 +209,11 @@ fn trimmed_note(file: &str, removed: &[String]) -> String {
         lines.push_str(" ...");
     }
     let count = removed.len().to_string();
-    message("comment_guard.trimmed", &[("count", count.as_str()), ("file", file), ("lines", lines.as_str())])
+    let max_lines = limits::current().lines.to_string();
+    message(
+        "comment_guard.trimmed",
+        &[("count", count.as_str()), ("file", file), ("lines", lines.as_str()), ("max_lines", max_lines.as_str())],
+    )
 }
 
 fn edit_region(input: &Map<String, Value>, change: &Change, cut: &decision::Trimmed) -> Option<String> {

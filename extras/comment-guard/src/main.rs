@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 use serde_json::Value;
 
+use comment_guard::limits::{self, Limits};
 use comment_guard::locale::message;
 use comment_guard::{judge, judge_after, judge_trimming, Provider, Verdict, MAX_INPUT};
 
@@ -30,6 +31,12 @@ fn main() -> ExitCode {
                 "comment_guard.check.off"
             };
             say(&message(key, &[]));
+            if guard_enabled() {
+                let found = load_limits();
+                let lines = found.lines.to_string();
+                let chars = found.line_chars.to_string();
+                say(&message("comment_guard.check.limits", &[("lines", lines.as_str()), ("chars", chars.as_str())]));
+            }
             ExitCode::SUCCESS
         }
         Some("hook") if args.len() <= 3 => match second {
@@ -77,6 +84,17 @@ fn switch_file() -> Option<PathBuf> {
     Some(config.join("agent-safeguards").join("comment-guard"))
 }
 
+fn load_limits() -> Limits {
+    let file = switch_file().and_then(|path| {
+        let mut text = String::new();
+        std::fs::File::open(path).ok()?.take(4096).read_to_string(&mut text).ok()?;
+        Some(text)
+    });
+    let lines = std::env::var("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES").ok();
+    let chars = std::env::var("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS").ok();
+    limits::parse(file.as_deref(), lines.as_deref(), chars.as_deref())
+}
+
 fn trimming_enabled() -> bool {
     if let Ok(value) = std::env::var("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM") {
         let value = value.trim();
@@ -110,6 +128,7 @@ fn hook(provider: Provider, event: Option<&str>) -> ExitCode {
     if !guard_enabled() {
         return ExitCode::SUCCESS;
     }
+    limits::configure(load_limits());
     let limit = MAX_INPUT.saturating_add(1) as u64;
     let mut stdin = std::io::stdin().lock().take(limit);
     let mut input = String::new();

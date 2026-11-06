@@ -862,7 +862,7 @@ fn an_existing_long_comment_may_be_reworded_but_a_short_one_may_not_grow_long() 
     std::fs::write(&path, "// short\nconst a = 1;\n").expect("write");
     let grown = write_file(None, None, &path, &format!("{long}const a = 1;\n"));
     assert!(denied(&grown));
-    assert!(reason(&grown).contains("100"));
+    assert!(reason(&grown).contains("75"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

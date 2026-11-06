@@ -10,20 +10,31 @@ At most one short rationale comment per file, and never narration, history, date
 
 | Limit | Value |
 | --- | --- |
-| New comment lines per file | 2 (counted against the file as the session first saw it, see below) |
+| New comment lines per file | 2 by default, tunable (counted against the file as the session first saw it, see below) |
 | New comment blocks per file | 1 (a block is a run of adjacent comment lines) |
-| Length of a comment line | 100 characters, counted on the trimmed line |
+| Length of a comment line | 75 characters by default, tunable, counted on the trimmed line |
 | History markers | a date `YYYY-MM-DD`, a decision number such as `D556`, or one of `previously`, `used to`, `no longer`, `was already`, `originally`, `formerly`, `this change`, `as requested` |
 
 A comment already present in the old text is not new, so moving code together with its comment, or editing the code under it, is never refused.
 
 These count as comment lines: a whole-line comment, a comment after code on the same line (`x = 1  # why`, `run(); // why`, `{/* why */}`), every line of a block comment (`/* */`, `<!-- -->`, `{- -}`, `--[[ ]]`, Ruby `=begin`, Perl POD, Nim `#[ ]#`), and the text lines of a Python docstring or an Elixir `@doc`/`@moduledoc` heredoc. A comment marker inside a string (`"http://x"`, `'a # b'`), a triple-quoted value assigned to a variable, or a backtick string is data, not a comment. Several comments on one physical line count as one line, and each of them is still checked for history markers and length.
 
-Only the net increase counts. A comment you reword or rename replaces one that was there, so renaming a word in 200 comments adds none. Lines the file gained beyond the lines it lost count; a line longer than 100 characters counts only when the comments it replaced were not that long; and a date, decision number or history phrase counts only when the replaced comments did not already contain it. Rewrapping a comment into more lines adds nothing as long as every word in the new lines comes from the comments it replaced (case and punctuation aside, no word more often than before) and the lines are a reflow, not padding (lines of about 24 letters are assumed, so a comment may grow by about one line per 24 letters); a rewrap that also changes a word is judged as a plain replacement (within a session, against the comments the file had when the session first touched it, so rewording a comment you already rewrapped is judged the same way); blank comment lines and comment delimiter lines (`//`, `/*`, `-->`, `----`) are never forgiven that way, but a line you remove offsets one you add. A word that merely contains a history word (`previously_cached`) is not a history phrase.
+Only the net increase counts. A comment you reword or rename replaces one that was there, so renaming a word in 200 comments adds none. Lines the file gained beyond the lines it lost count; a line longer than the length limit counts only when the comments it replaced were not that long; and a date, decision number or history phrase counts only when the replaced comments did not already contain it. Rewrapping a comment into more lines adds nothing as long as every word in the new lines comes from the comments it replaced (case and punctuation aside, no word more often than before) and the lines are a reflow, not padding (lines of about 24 letters are assumed, so a comment may grow by about one line per 24 letters); a rewrap that also changes a word is judged as a plain replacement (within a session, against the comments the file had when the session first touched it, so rewording a comment you already rewrapped is judged the same way); blank comment lines and comment delimiter lines (`//`, `/*`, `-->`, `----`) are never forgiven that way, but a line you remove offsets one you add. A word that merely contains a history word (`previously_cached`) is not a history phrase.
 
 These are never counted: a shebang, a PHP `#[attribute]`, and tool directives (`noqa`, `type:`, `pragma`, `pylint:`, `eslint-`, `@ts-`, `go:`, `nolint`, `spdx-license-identifier`, `shellcheck`, `-*-` and similar; the full list is `EXEMPT` in `src/comments.rs`). A directive is exempt only while what follows it is its own arguments: `noqa` takes codes only (`E501`), `nolint` linter names, an SPDX line a license expression, `go:` one of the Go directives, and the others at most six arguments that look like codes or rule names (a digit, a hyphen, a slash, a bracket) plus at most two fixed words (`ignore`, `off`, `no cover`). Free text after the prefix (`# noqa: note one`, `# pragma: because ...`) is a comment and counts, as do `region`, `mark:`, `copyright` and `license` lines.
 
 Languages are chosen by file extension, by whole name (`Makefile`, `Dockerfile`, `CMakeLists.txt`, `Jenkinsfile`, `Gemfile`, `Rakefile` and similar), or, for a file with no extension, by the interpreter on its `#!` line. Beyond the forms below, the table covers PowerShell (`#`, `<# #>`), Terraform and HCL, Make, Docker, CMake, Nix, Julia, batch files (`REM`, `::`), Visual Basic, Lisp and Clojure (`;`), Erlang (`%`), OCaml, F# and Pascal, Ada and VHDL (`--`), Fortran, Bazel (Starlark), Verilog, shader languages, SVG, and the ERB, Jinja, Handlebars, Razor and Pug templates (see `TABLE` and `NAMES` in `src/languages.rs`). The code cells of a `.ipynb` notebook are judged as Python, whether the notebook is written, edited as a file or changed with `NotebookEdit`; markdown cells are not. The forms: `#` comments for `py pyi rb sh bash zsh fish pl pm r ex exs nim cr`, `//` and `/* */` for `rs go js jsx mjs cjs ts tsx java kt kts swift c h cc cpp cxx hpp hh cs dart scala groovy gradle m mm zig proto sol`, both for `php`, `--` for `lua sql hs elm`, `<!-- -->` with `//` and `/* */` for `html htm xhtml vue svelte astro`, and `/* */` for `css` (plus `//` for `scss sass less`). Data, configuration and documentation files are not checked: Markdown, JSON, YAML, TOML, XML, INI and the like.
+
+## Tuning the limits
+
+The line count (default 2) and the line length (default 75) can be changed. Put them in the `comment-guard` switch file (see "Turn it on"; an empty file keeps the defaults), one `name = value` per line, `#` starts a note:
+
+```
+lines = 3
+line_chars = 90
+```
+
+or set `AGENT_SAFEGUARDS_COMMENT_GUARD_LINES` and `AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS` in the environment of the hook, which win over the file. `lines` takes 1 to 50 and `line_chars` 20 to 500; a value outside the range or not a number is ignored and the default stays. The block limit stays at one block. `comment-guard check` prints the limits in force, the refusal and trimming messages name the line limit, and trimming keeps as many lines as the limit allows.
 
 ## Trimming
 

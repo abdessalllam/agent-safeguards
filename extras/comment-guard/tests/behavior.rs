@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use comment_guard::{judge, Provider, Verdict};
 
@@ -134,10 +134,10 @@ fn short_decision_lookalikes_are_not_markers() {
 }
 
 #[test]
-fn a_line_of_101_characters_is_denied_and_100_is_allowed() {
-    let long = format!("# {}\n", "a".repeat(99));
+fn a_line_of_76_characters_is_denied_and_75_is_allowed() {
+    let long = format!("# {}\n", "a".repeat(74));
     assert!(denied(&edit("a.py", "", &long)));
-    let fits = format!("# {}\n", "a".repeat(98));
+    let fits = format!("# {}\n", "a".repeat(73));
     assert!(!denied(&edit("a.py", "", &fits)));
 }
 
@@ -509,9 +509,9 @@ fn the_first_violating_path_is_reported_with_its_own_rule() {
 
 #[test]
 fn the_length_limit_counts_characters_not_bytes() {
-    let fits = format!("#{}\n", "\u{e9}".repeat(99));
+    let fits = format!("#{}\n", "\u{e9}".repeat(74));
     assert!(!denied(&edit("a.py", "", &fits)));
-    let long = format!("#{}\n", "\u{e9}".repeat(100));
+    let long = format!("#{}\n", "\u{e9}".repeat(75));
     assert!(denied(&edit("a.py", "", &long)));
 }
 
@@ -549,6 +549,9 @@ fn feed(arguments: &[&str], input: &[u8]) -> std::process::Output {
         .args(arguments)
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "0")
+        .env("XDG_CONFIG_HOME", "/nonexistent-comment-guard-config")
+        .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES")
+        .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -688,6 +691,103 @@ fn a_non_utf8_argument_prints_the_usage_and_exits_two() {
         .expect("could not start the binary");
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).starts_with("usage: comment-guard"));
+}
+
+fn hook_with(envs: &[(&str, &str)], config: Option<&str>, content: &str) -> String {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = temp_dir("tuning");
+    if let Some(text) = config {
+        let folder = dir.join("agent-safeguards");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("comment-guard"), text).expect("config");
+    }
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": { "file_path": dir.join("a.py").to_string_lossy(), "content": content },
+    });
+    let mut command = Command::new(binary());
+    command
+        .args(["hook", "claude", "PreToolUse"])
+        .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES")
+        .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS")
+        .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
+        .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "0")
+        .env("XDG_CONFIG_HOME", &dir);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("start");
+    let _ = child.stdin.take().expect("stdin").write_all(payload.to_string().as_bytes());
+    let out = String::from_utf8_lossy(&child.wait_with_output().expect("wait").stdout).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+#[test]
+fn the_comment_line_limit_can_be_tuned_by_environment_and_file() {
+    let five = "# c1\n# c2\n# c3\n# c4\n# c5\nx = 1\n";
+    let three = "# c1\n# c2\n# c3\nx = 1\n";
+    assert!(hook_with(&[], None, five).contains("deny"));
+    assert!(hook_with(&[], None, three).contains("deny"));
+    assert!(hook_with(&[("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES", "3")], None, three).is_empty());
+    assert!(hook_with(&[("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES", "5")], None, five).is_empty());
+    let four = hook_with(&[("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES", "4")], None, five);
+    assert!(four.contains("deny") && four.contains("4 line(s)"), "{four}");
+    assert!(hook_with(&[], Some("lines = 5\n"), five).is_empty());
+    assert!(hook_with(&[("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES", "2")], Some("lines = 5\n"), five).contains("deny"));
+    assert!(hook_with(&[], Some("lines = 99\n"), three).contains("deny"));
+    assert!(hook_with(&[("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES", "0")], None, three).contains("deny"));
+}
+
+#[test]
+fn the_comment_line_length_can_be_tuned_by_environment_and_file() {
+    let sixty = format!("# {}\nx = 1\n", "a".repeat(58));
+    let ninety = format!("# {}\nx = 1\n", "a".repeat(88));
+    assert!(hook_with(&[], None, &sixty).is_empty());
+    let short = hook_with(&[("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS", "40")], None, &sixty);
+    assert!(short.contains("deny") && short.contains("40 characters"), "{short}");
+    assert!(hook_with(&[], Some("line_chars = 40\n"), &sixty).contains("deny"));
+    assert!(hook_with(&[], None, &ninety).contains("deny"));
+    assert!(hook_with(&[("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS", "100")], None, &ninety).is_empty());
+    assert!(hook_with(&[], Some("line_chars = 100\n"), &ninety).is_empty());
+    assert!(hook_with(&[("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS", "10")], None, &sixty).is_empty());
+}
+
+#[test]
+fn trimming_keeps_as_many_lines_and_characters_as_the_limits_allow() {
+    let trim = ("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "1");
+    let six = "# c1\n# c2\n# c3\n# c4\n# c5\n# c6\nx = 1\n";
+    let out: Value = serde_json::from_str(hook_with(&[trim, ("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES", "3")], None, six).trim()).expect("json");
+    assert_eq!(out["hookSpecificOutput"]["updatedInput"]["content"], "# c1\n# c2\n# c3\nx = 1\n");
+    assert!(out["hookSpecificOutput"]["additionalContext"].as_str().is_some_and(|text| text.contains("3 line(s)")));
+    let wide = format!("# ok\n# {}\nx = 1\n", "a".repeat(80));
+    let out: Value = serde_json::from_str(hook_with(&[trim], None, &wide).trim()).expect("json");
+    assert_eq!(out["hookSpecificOutput"]["updatedInput"]["content"], "# ok\nx = 1\n");
+    assert!(hook_with(&[trim, ("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS", "100")], None, &wide).is_empty());
+    let mid = format!("# {}\n# ok\nx = 1\n", "a".repeat(58));
+    let out: Value = serde_json::from_str(hook_with(&[trim, ("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS", "40")], None, &mid).trim()).expect("json");
+    assert_eq!(out["hookSpecificOutput"]["updatedInput"]["content"], "# ok\nx = 1\n");
+}
+
+#[test]
+fn check_prints_the_limits_in_force() {
+    let dir = temp_dir("check-limits");
+    let folder = dir.join("agent-safeguards");
+    std::fs::create_dir_all(&folder).expect("folder");
+    std::fs::write(folder.join("comment-guard"), "lines = 3\nline_chars = 50\n").expect("config");
+    let run = |lines: Option<&str>| {
+        let mut command = Command::new(binary());
+        command.arg("check").env("XDG_CONFIG_HOME", &dir).env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES").env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS");
+        if let Some(value) = lines {
+            command.env("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES", value);
+        }
+        String::from_utf8_lossy(&command.output().expect("start").stdout).into_owned()
+    };
+    assert!(run(None).contains("Limits: 3 comment line(s) per file, 50 characters per line."));
+    assert!(run(Some("7")).contains("Limits: 7 comment line(s) per file, 50 characters per line."));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -2,11 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::comments::{body, protected, scan, LineKind};
 use crate::languages::{language_for_text, Language, CLIKE, GO, KOTLIN, PYTHON, RUST, SCRIPT, SHELL, SWIFT};
+use crate::limits;
 use crate::locale::message;
 
-pub const MAX_LINES: usize = 2;
 pub const MAX_BLOCKS: usize = 1;
-pub const MAX_LINE_CHARS: usize = 100;
 const REWRAP_FILL: usize = 24;
 
 const HISTORY_PHRASES: [&str; 8] = [
@@ -76,12 +75,14 @@ struct Aggregate<'a> {
 
 pub fn evaluate(changes: &[Change]) -> Option<String> {
     let detail = evaluate_detail(changes)?;
-    Some(message("comment_guard.deny", &[("detail", detail.as_str())]))
+    let max_lines = limits::current().lines.to_string();
+    Some(message("comment_guard.deny", &[("detail", detail.as_str()), ("max_lines", max_lines.as_str())]))
 }
 
 pub fn evaluate_after(changes: &[Change]) -> Option<String> {
     let detail = evaluate_detail(changes)?;
-    Some(message("comment_guard.after", &[("detail", detail.as_str())]))
+    let max_lines = limits::current().lines.to_string();
+    Some(message("comment_guard.after", &[("detail", detail.as_str()), ("max_lines", max_lines.as_str())]))
 }
 
 struct Measure<'a> {
@@ -125,6 +126,7 @@ fn reuses_words(fresh: &[&str], removed: &HashMap<&str, usize>) -> bool {
 }
 
 fn measure(change: &Change, lang: Language) -> Measure<'_> {
+    let max_chars = limits::current().line_chars;
     let mut pool: HashMap<&str, usize> = HashMap::new();
     match &change.baseline {
         Some(lines) if !change.partial => {
@@ -186,7 +188,7 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
             }
             counted = true;
         }
-        if line.chars().count() > MAX_LINE_CHARS {
+        if line.chars().count() > max_chars {
             fresh_long = fresh_long.saturating_add(1);
         }
         fresh_letters = fresh_letters.saturating_add(letters(line));
@@ -203,7 +205,7 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
             continue;
         }
         removed_total = removed_total.saturating_add(*count);
-        if line.chars().count() > MAX_LINE_CHARS {
+        if line.chars().count() > max_chars {
             removed_long = removed_long.saturating_add(*count);
         }
         if let Some(marker) = history_marker(body(line)) {
@@ -451,11 +453,11 @@ pub fn trimmed(change: &Change) -> Option<Trimmed> {
         return None;
     }
     let lines: Vec<&str> = change.new.split('\n').collect();
-    for keep in [MAX_LINES, 1, 0] {
+    for keep in (0..=limits::current().lines).rev() {
         let mut kept = 0usize;
         let mut dropped: HashSet<usize> = HashSet::new();
         for (index, line) in &fresh {
-            let fine = history_marker(body(line)).is_none() && line.chars().count() <= MAX_LINE_CHARS;
+            let fine = history_marker(body(line)).is_none() && line.chars().count() <= limits::current().line_chars;
             if kept < keep && fine {
                 kept = kept.saturating_add(1);
             } else {
@@ -537,17 +539,17 @@ fn evaluate_detail(changes: &[Change]) -> Option<String> {
             return Some(detail);
         }
         if aggregate.too_long {
-            let limit = MAX_LINE_CHARS.to_string();
+            let limit = limits::current().line_chars.to_string();
             let detail = message(
                 "comment_guard.detail.too_long",
                 &[("file", aggregate.file), ("limit", limit.as_str())],
             );
             return Some(detail);
         }
-        if aggregate.lines > MAX_LINES || aggregate.blocks > MAX_BLOCKS {
+        if aggregate.lines > limits::current().lines || aggregate.blocks > MAX_BLOCKS {
             let lines = aggregate.lines.to_string();
             let blocks = aggregate.blocks.to_string();
-            let max_lines = MAX_LINES.to_string();
+            let max_lines = limits::current().lines.to_string();
             let detail = message(
                 "comment_guard.detail.too_many",
                 &[
