@@ -2234,6 +2234,27 @@ fn what_the_twenty_second_review_found_is_refused_or_kept() {
 }
 
 #[test]
+fn a_write_the_guard_reads_in_another_form_is_never_rewritten() {
+    let dir = temp_dir("trim-reform");
+    let notebook = json!({ "cells": [{ "cell_type": "code", "metadata": {}, "source": "# n1\n# n2\n# n3\n# n4\ny = 2" }], "metadata": {}, "nbformat": 4, "nbformat_minor": 5 });
+    let verdict = trimming(None, None, "Write", written(&dir.join("nb.ipynb"), &notebook.to_string()), Provider::Claude);
+    assert!(matches!(verdict, Verdict::Deny(_)), "a notebook was rewritten as plain source");
+    let crlf = "# a\r\n# b\r\n# c\r\n# d\r\nx = 1\r\n";
+    match trimming(None, None, "Write", written(&dir.join("crlf.py"), crlf), Provider::Claude) {
+        Verdict::Trimmed { input, .. } => assert_eq!(input["content"], "# a\r\n# b\r\nx = 1\r\n"),
+        Verdict::Deny(_) => {}
+        _ => panic!("a CRLF write was allowed or unreadable"),
+    }
+    let bom = "\u{feff}# a\n# b\n# c\n# d\nx = 1\n";
+    match trimming(None, None, "Write", written(&dir.join("bom.py"), bom), Provider::Claude) {
+        Verdict::Trimmed { input, .. } => assert_eq!(input["content"], "\u{feff}# a\n# b\nx = 1\n"),
+        Verdict::Deny(_) => {}
+        _ => panic!("a BOM write was allowed or unreadable"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn harmless_look_alikes_do_not_stop_a_trim_and_a_huge_file_is_trimmed_quickly() {
     let dir = temp_dir("trim-alike");
     let shift = "n = 1 << 4\n# one\n# two\n# three\n# four\nx = 1\n";

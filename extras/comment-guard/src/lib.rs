@@ -250,6 +250,9 @@ fn rewritten_input(tool: &str, input: &Map<String, Value>, change: &Change, cut:
     let mut out = input.clone();
     match tool {
         "Write" => {
+            if input.get("content").and_then(Value::as_str) != Some(change.new.as_str()) {
+                return None;
+            }
             out.insert("content".to_owned(), Value::String(cut.text.clone()));
         }
         "Edit" => {
