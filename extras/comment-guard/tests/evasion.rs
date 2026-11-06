@@ -2107,6 +2107,10 @@ fn what_the_eighteenth_review_found_is_refused_or_kept() {
     refuse("f1.js", "const s = `A ${ \"}\" + `\n// one\n// two\n// three\n// four\n` } B`;\nconst x = 1;\n");
     refuse("f1c.js", "const s = `A ${ /}/.test(a) + `\n// one\n// two\n// three\n// four\n` } B`;\nconst x = 1;\n");
     refuse("f1d.js", "const s = `A ${ ' + `\n// one\n// two\n// three\n// four\n` } B`;\nlet y = '}';\nconst x = 1;\n");
+    refuse("h1.js", "const t = `${foo / 2 + \"`\"} say \"hi\n// a\n// b\n// c\n// d\n`;\nconst z = 1;\n");
+    refuse("h1b.ts", "const t = `${foo + '`'} it's '\n// a\n// b\n// c\n// d\n`;\nconst z = 1;\n");
+    refuse("h2.py", "def ready():\n    return 1\n# Local Variables:\n# mode: python\n# End:\n");
+    refuse("h2b.c", "int a;\n/* Local Variables: */\n/* tab-width: 4 */\n/* End: */\n");
     refuse("f1b.ts", "const s = `A ${ '}' + `\n// one\n// two\n// three\n// four\n` } B`;\nconst x = 1;\n");
     refuse("f2.js", "export function F() {\n  return (\n    <pre>\n// one\n// two\n// three\n// four\n    </pre>\n  );\n}\n");
     refuse("f2b.js", "const a = <Foo />;\n// one\n// two\n// three\n// four\nconst x = 1;\n");

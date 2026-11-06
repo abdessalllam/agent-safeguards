@@ -292,7 +292,7 @@ fn nested_template(text: &str) -> bool {
                     escaped = true;
                 } else if *byte == open {
                     quote = None;
-                } else if *byte == b'\n' {
+                } else if matches!(*byte, b'\n' | b'`') {
                     return true;
                 }
                 continue;
@@ -351,6 +351,7 @@ fn risky(text: &str, lang: Language) -> bool {
         || text.starts_with("__END__")
         || text.contains("\n__END__")
         || text.contains("__DATA__")
+        || text.to_ascii_lowercase().contains("local variables:")
     {
         return true;
     }
