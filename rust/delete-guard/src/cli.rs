@@ -448,6 +448,33 @@ pub fn main() -> i32 {
     main_args(&std::env::args().skip(1).collect::<Vec<_>>())
 }
 
+const WORK_STACK_BYTES: usize = 512 * 1024 * 1024;
+
+/// Large stack; a panic gets the answer of Python's catch-all.
+pub fn guarded_main() -> i32 {
+    std::panic::set_hook(Box::new(|_| {}));
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let inner = arguments.clone();
+    let worker = std::thread::Builder::new()
+        .stack_size(WORK_STACK_BYTES)
+        .spawn(move || main_args(&inner));
+    let code = worker.ok().and_then(|handle| handle.join().ok());
+    if let Some(code) = code {
+        return code;
+    }
+    match arguments.first().map(String::as_str) {
+        Some("hook") => {
+            with_output_lock(|| emit_stop("delete_guard.deny_internal"));
+            0
+        }
+        Some("check-remote") => {
+            eprintln!("{}", message("delete_guard.deny_internal", &[]));
+            1
+        }
+        _ => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{command_repr, parse_payload, preflight_trash_patterns, script_path};
