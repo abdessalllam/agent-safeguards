@@ -8,6 +8,7 @@ pub mod languages;
 pub mod limits;
 pub mod locale;
 pub mod post;
+pub mod rewrite;
 pub mod session;
 
 use std::collections::HashMap;
@@ -202,7 +203,7 @@ pub fn judge_in(input: &str, provider: Provider, state: Option<&Path>) -> Verdic
     judge_payload(&payload, provider, state, false)
 }
 
-fn trimmed_note(file: &str, removed: &[String]) -> String {
+pub(crate) fn trimmed_note(key: &str, file: &str, removed: &[String]) -> String {
     let shown: Vec<String> = removed.iter().take(6).map(|line| line.chars().take(70).collect()).collect();
     let mut lines = shown.join(" | ");
     if removed.len() > shown.len() {
@@ -211,61 +212,9 @@ fn trimmed_note(file: &str, removed: &[String]) -> String {
     let count = removed.len().to_string();
     let max_lines = limits::current().lines.to_string();
     message(
-        "comment_guard.trimmed",
+        key,
         &[("count", count.as_str()), ("file", file), ("lines", lines.as_str()), ("max_lines", max_lines.as_str())],
     )
-}
-
-fn edit_region(input: &Map<String, Value>, change: &Change, cut: &decision::Trimmed) -> Option<String> {
-    if input.get("replace_all").and_then(Value::as_bool).unwrap_or(false) {
-        return None;
-    }
-    let old_string = input.get("old_string")?.as_str()?;
-    let new_string = input.get("new_string")?.as_str()?;
-    let start = change.old.find(old_string)?;
-    let end = start.checked_add(new_string.len())?;
-    if change.new.get(start..end) != Some(new_string) {
-        return None;
-    }
-    let total = change.new.len();
-    let count = change.new.split('\n').count();
-    let mut inside = 0usize;
-    let mut offset = 0usize;
-    for (index, line) in change.new.split('\n').enumerate() {
-        let from = offset;
-        let to = from.saturating_add(line.len()).saturating_add(1).min(total);
-        offset = from.saturating_add(line.len()).saturating_add(1);
-        if !cut.dropped.contains(&index) {
-            continue;
-        }
-        let last = index.saturating_add(1) == count;
-        let (a, b) = if last && from > 0 { (from.saturating_sub(1), to) } else { (from, to) };
-        if a >= start && b <= end {
-            inside = inside.saturating_add(b.saturating_sub(a));
-        } else if !last && to == end.saturating_add(1) && from > start {
-            inside = inside.saturating_add(to.saturating_sub(from));
-        } else {
-            return None;
-        }
-    }
-    cut.text.get(start..end.checked_sub(inside)?).map(str::to_owned)
-}
-
-fn rewritten_input(tool: &str, input: &Map<String, Value>, change: &Change, cut: &decision::Trimmed) -> Option<Map<String, Value>> {
-    let mut out = input.clone();
-    match tool {
-        "Write" => {
-            if input.get("content").and_then(Value::as_str) != Some(change.new.as_str()) {
-                return None;
-            }
-            out.insert("content".to_owned(), Value::String(cut.text.clone()));
-        }
-        "Edit" => {
-            out.insert("new_string".to_owned(), Value::String(edit_region(input, change, cut)?));
-        }
-        _ => return None,
-    }
-    Some(out)
 }
 
 fn try_trim(
@@ -275,27 +224,43 @@ fn try_trim(
     changes: &[Change],
     base: &Path,
     state: Option<&Path>,
+    provider: Provider,
 ) -> Option<Verdict> {
-    let [change] = changes else {
+    let mut cuts: Vec<Option<decision::Trimmed>> = Vec::with_capacity(changes.len());
+    for change in changes {
+        if evaluate(std::slice::from_ref(change)).is_some() {
+            cuts.push(Some(decision::trimmed(change)?));
+        } else {
+            cuts.push(None);
+        }
+    }
+    if cuts.iter().all(Option::is_none) {
         return None;
-    };
-    let cut = decision::trimmed(change)?;
-    let new_input = rewritten_input(tool, input, change, &cut)?;
-    let after = collect(tool, &new_input, Provider::Claude, base);
-    let [rewritten] = after.as_slice() else {
+    }
+    let new_input = rewrite::rewritten_input(provider, tool, input, changes, &cuts, base)?;
+    let after = collect(tool, &new_input, provider, base);
+    if after.len() != changes.len() {
         return None;
-    };
-    if rewritten.new != cut.text {
-        return None;
+    }
+    for ((found, change), cut) in after.iter().zip(changes).zip(&cuts) {
+        let expected = cut.as_ref().map_or(change.new.as_str(), |cut| cut.text.as_str());
+        if found.new != expected {
+            return None;
+        }
     }
     let mut again = payload.clone();
     again.insert("tool_input".to_owned(), Value::Object(new_input.clone()));
-    if !matches!(judge_payload(&again, Provider::Claude, state, false), Verdict::Allow) {
+    if !matches!(judge_payload(&again, provider, state, false), Verdict::Allow) {
         return None;
     }
+    let notes: Vec<String> = changes
+        .iter()
+        .zip(&cuts)
+        .filter_map(|(change, cut)| cut.as_ref().map(|cut| trimmed_note("comment_guard.trimmed", &change.file, &cut.removed)))
+        .collect();
     Some(Verdict::Trimmed {
         input: Value::Object(new_input),
-        note: trimmed_note(&change.file, &cut.removed),
+        note: notes.join(" "),
     })
 }
 
@@ -333,8 +298,8 @@ fn judge_payload(payload: &Map<String, Value>, provider: Provider, state: Option
     }
     match verdict {
         Some(reason) => {
-            if trim && provider == Provider::Claude {
-                if let Some(trimmed) = try_trim(&payload, tool, tool_input, &changes, &base, state) {
+            if trim {
+                if let Some(trimmed) = try_trim(&payload, tool, tool_input, &changes, &base, state, provider) {
                     return trimmed;
                 }
             }
@@ -348,7 +313,19 @@ pub fn judge_after(input: &str) -> Verdict {
     judge_after_in(input, session::state_dir().as_deref())
 }
 
+pub fn judge_after_trimming(input: &str) -> Verdict {
+    judge_after_with(input, session::state_dir().as_deref(), true)
+}
+
 pub fn judge_after_in(input: &str, state: Option<&Path>) -> Verdict {
+    judge_after_with(input, state, false)
+}
+
+pub fn judge_after_trimming_in(input: &str, state: Option<&Path>) -> Verdict {
+    judge_after_with(input, state, true)
+}
+
+fn judge_after_with(input: &str, state: Option<&Path>, trim: bool) -> Verdict {
     let Some(payload) = parse(input) else {
         return Verdict::BadInput;
     };
@@ -359,7 +336,7 @@ pub fn judge_after_in(input: &str, state: Option<&Path>) -> Verdict {
         return Verdict::Allow;
     }
     match ledger_of(&payload, state) {
-        Some(ledger) => post::judge_command(&payload, &ledger),
+        Some(ledger) => post::judge_command(&payload, &ledger, trim),
         None => Verdict::Allow,
     }
 }

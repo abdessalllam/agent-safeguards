@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use comment_guard::limits::{self, Limits};
 use comment_guard::locale::message;
-use comment_guard::{judge, judge_after, judge_trimming, Provider, Verdict, MAX_INPUT};
+use comment_guard::{judge, judge_after, judge_after_trimming, judge_trimming, Provider, Verdict, MAX_INPUT};
 
 fn main() -> ExitCode {
     std::panic::set_hook(Box::new(|_| {}));
@@ -138,7 +138,11 @@ fn hook(provider: Provider, event: Option<&str>) -> ExitCode {
     }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if after {
-            judge_after(&input)
+            if trimming_enabled() {
+                judge_after_trimming(&input)
+            } else {
+                judge_after(&input)
+            }
         } else if trimming_enabled() {
             judge_trimming(&input, provider)
         } else {
@@ -152,7 +156,11 @@ fn hook(provider: Provider, event: Option<&str>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Verdict::Trimmed { input, note }) => {
-            print_trimmed(&input, &note);
+            if after {
+                print_after_note(&note);
+            } else {
+                print_trimmed(&input, &note, provider);
+            }
             ExitCode::SUCCESS
         }
         Ok(Verdict::Deny(reason)) => {
@@ -179,11 +187,24 @@ fn print_block(reason: &str) {
     }
 }
 
-fn print_trimmed(input: &Value, note: &str) {
+fn print_after_note(note: &str) {
+    let mut inner = serde_json::Map::new();
+    inner.insert("hookEventName".to_owned(), Value::String("PostToolUse".to_owned()));
+    inner.insert("additionalContext".to_owned(), Value::String(note.to_owned()));
+    let mut outer = serde_json::Map::new();
+    outer.insert("hookSpecificOutput".to_owned(), Value::Object(inner));
+    if let Ok(text) = serde_json::to_string(&Value::Object(outer)) {
+        say(&text);
+    }
+}
+
+fn print_trimmed(input: &Value, note: &str, provider: Provider) {
     let mut inner = serde_json::Map::new();
     inner.insert("hookEventName".to_owned(), Value::String("PreToolUse".to_owned()));
     inner.insert("permissionDecision".to_owned(), Value::String("allow".to_owned()));
-    inner.insert("permissionDecisionReason".to_owned(), Value::String(note.to_owned()));
+    if provider == Provider::Claude {
+        inner.insert("permissionDecisionReason".to_owned(), Value::String(note.to_owned()));
+    }
     inner.insert("updatedInput".to_owned(), input.clone());
     inner.insert("additionalContext".to_owned(), Value::String(note.to_owned()));
     let mut outer = serde_json::Map::new();

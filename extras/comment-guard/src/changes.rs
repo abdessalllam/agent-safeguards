@@ -153,6 +153,25 @@ fn notebook_edit(input: &Map<String, Value>, base: &Path) -> Option<Change> {
     Some(Change::whole(file.to_owned(), old, new))
 }
 
+pub fn notebook_offset(input: &Map<String, Value>, base: &Path) -> Option<usize> {
+    let file = text(input, "notebook_path").or_else(|| text(input, "file_path"))?;
+    let document: Value = serde_json::from_str(&current_text(&resolve(base, file))?).ok()?;
+    let cells = document.get("cells")?.as_array()?;
+    let index = text(input, "cell_id").and_then(|id| find_cell(cells, id));
+    let at = match text(input, "edit_mode").unwrap_or("replace") {
+        "insert" => index.map_or(0, |found| found.saturating_add(1)).min(cells.len()),
+        "delete" => return None,
+        _ => index?,
+    };
+    let mut offset = 0usize;
+    for cell in cells.iter().take(at) {
+        if cell.get("cell_type").and_then(Value::as_str) == Some("code") {
+            offset = offset.saturating_add(cell_source(cell.get("source")).len()).saturating_add(2);
+        }
+    }
+    Some(offset)
+}
+
 fn one(change: Option<Change>) -> Vec<Change> {
     match change {
         Some(value) => vec![value],

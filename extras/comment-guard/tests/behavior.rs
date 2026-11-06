@@ -772,6 +772,35 @@ fn trimming_keeps_as_many_lines_and_characters_as_the_limits_allow() {
 }
 
 #[test]
+fn a_codex_trim_answers_with_the_documented_fields_only() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = temp_dir("codex-shape");
+    let patch = format!("*** Begin Patch\n*** Add File: {}\n+x = 1\n+# a\n+# b\n+# c\n*** End Patch\n", dir.join("p.py").display());
+    let payload = json!({ "hook_event_name": "PreToolUse", "tool_name": "apply_patch", "tool_input": { "command": patch } });
+    let mut child = Command::new(binary())
+        .args(["hook", "codex", "PreToolUse"])
+        .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
+        .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "1")
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES")
+        .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start");
+    let _ = child.stdin.take().expect("stdin").write_all(payload.to_string().as_bytes());
+    let out: Value = serde_json::from_str(String::from_utf8_lossy(&child.wait_with_output().expect("wait").stdout).trim()).expect("json");
+    let inner = &out["hookSpecificOutput"];
+    assert_eq!(inner["permissionDecision"], "allow");
+    assert!(inner["updatedInput"]["command"].as_str().is_some_and(|text| text.contains("+# b\n") && !text.contains("+# c")));
+    assert!(inner["additionalContext"].is_string());
+    assert!(inner.get("permissionDecisionReason").is_none(), "{inner}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn check_prints_the_limits_in_force() {
     let dir = temp_dir("check-limits");
     let folder = dir.join("agent-safeguards");

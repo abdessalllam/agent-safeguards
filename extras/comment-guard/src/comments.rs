@@ -20,8 +20,7 @@ enum Tail {
     Options,
 }
 
-// A tool directive is exempt only while what follows is its own arguments (codes, rule names),
-// never free text.
+// A directive is exempt only with its own arguments, never with prose.
 const EXEMPT: &[(&str, Tail)] = &[
     ("noqa", Tail::Codes),
     ("type:", Tail::Words),

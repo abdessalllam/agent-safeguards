@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{Map, Value};
 
 use crate::changes::{read_source, resolve, MAX_OLD_FILE};
-use crate::decision::{comment_lines, evaluate_after, Change};
+use crate::decision::{comment_lines, evaluate, evaluate_after, trimmed, Change};
 use crate::git::{drop_marked, inside_repository, run_git};
 use crate::languages::language_for_file;
 use crate::session::{content_hash, identity, seen_of, Ledger};
@@ -73,7 +73,7 @@ enum Head {
     Unavailable,
 }
 
-pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger) -> Verdict {
+pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger, trim: bool) -> Verdict {
     let deadline = Instant::now() + TOTAL_TIME;
     if payload.get("cwd").and_then(Value::as_str).is_none() {
         return Verdict::Allow;
@@ -131,10 +131,56 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger) -> Verdict {
         }
         verdict = evaluate_after(&changes);
     }
-    match verdict {
-        Some(reason) => Verdict::Deny(reason),
-        None => Verdict::Allow,
+    let Some(reason) = verdict else {
+        return Verdict::Allow;
+    };
+    if !trim {
+        return Verdict::Deny(reason);
     }
+    let mut notes: Vec<String> = Vec::new();
+    let mut left: Vec<Change> = Vec::new();
+    for change in changes {
+        if evaluate(std::slice::from_ref(&change)).is_none() {
+            continue;
+        }
+        match trim_on_disk(&change, &cwd, ledger) {
+            Some(note) => notes.push(note),
+            None => left.push(change),
+        }
+    }
+    match (evaluate_after(&left), notes.is_empty()) {
+        (Some(rest), true) => Verdict::Deny(rest),
+        (Some(rest), false) => Verdict::Deny(format!("{rest} {}", notes.join(" "))),
+        (None, true) => Verdict::Deny(reason),
+        (None, false) => Verdict::Trimmed {
+            input: Value::Null,
+            note: notes.join(" "),
+        },
+    }
+}
+
+fn trim_on_disk(change: &Change, cwd: &Path, ledger: &Ledger) -> Option<String> {
+    let path = Path::new(&change.file);
+    let lang = language_for_file(&change.file)?;
+    let inside = fs::canonicalize(path).ok()?.starts_with(fs::canonicalize(cwd).ok()?);
+    let meta = fs::symlink_metadata(path).ok()?;
+    if !inside || !meta.is_file() {
+        return None;
+    }
+    let cut = trimmed(change)?;
+    if fs::read(path).ok()? != change.new.as_bytes() {
+        return None;
+    }
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let temp = path.with_file_name(format!(".{name}.comment-guard-{}", std::process::id()));
+    let written = fs::write(&temp, cut.text.as_bytes()).is_ok() && fs::set_permissions(&temp, meta.permissions()).is_ok();
+    if !written || fs::rename(&temp, path).is_err() {
+        let _ = fs::remove_file(&temp);
+        return None;
+    }
+    let comments = comment_lines(&cut.text, lang);
+    ledger.accept(&identity(path), &[seen_of(&cut.text, &comments)]);
+    Some(crate::trimmed_note("comment_guard.trimmed_after", &change.file, &cut.removed))
 }
 
 fn command_of(payload: &Map<String, Value>) -> &str {
@@ -880,6 +926,57 @@ mod tests {
 
     fn soon() -> Instant {
         Instant::now() + Duration::from_secs(30)
+    }
+
+    fn trim_rig(name: &str) -> (std::path::PathBuf, std::path::PathBuf, crate::session::Ledger) {
+        let root = std::env::temp_dir().join(format!("comment-guard-trim-{}-{name}", std::process::id()));
+        let cwd = root.join("cwd");
+        let state = root.join("state");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let ledger = crate::session::Ledger::open(&state, "unit").expect("ledger");
+        (root, cwd, ledger)
+    }
+
+    fn judged_file(path: &Path, text: &str) -> crate::decision::Change {
+        crate::decision::Change::whole(path.to_string_lossy().into_owned(), String::new(), text.to_owned())
+    }
+
+    #[test]
+    fn a_regular_file_in_the_folder_is_trimmed_in_place_with_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, cwd, ledger) = trim_rig("plain");
+        let text = "x = 1\n# a\n# b\n# c\n# d\n";
+        let file = cwd.join("a.py");
+        std::fs::write(&file, text).expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o750)).expect("mode");
+        let note = super::trim_on_disk(&judged_file(&file, text), &cwd, &ledger).expect("trimmed");
+        assert!(note.contains("# c | # d"));
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "x = 1\n# a\n# b\n");
+        assert_eq!(std::fs::metadata(&file).expect("meta").permissions().mode() & 0o777, 0o750);
+        assert_eq!(std::fs::read_dir(&cwd).expect("dir").count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_symlink_a_file_outside_and_a_file_changed_since_it_was_judged_are_left_alone() {
+        let (root, cwd, ledger) = trim_rig("guards");
+        let text = "x = 1\n# a\n# b\n# c\n# d\n";
+        let real = cwd.join("real.py");
+        std::fs::write(&real, text).expect("write");
+        let link = cwd.join("link.py");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        assert!(super::trim_on_disk(&judged_file(&link, text), &cwd, &ledger).is_none());
+        let outside = root.join("outside.py");
+        std::fs::write(&outside, text).expect("write");
+        assert!(super::trim_on_disk(&judged_file(&outside, text), &cwd, &ledger).is_none());
+        let moved = cwd.join("moved.py");
+        std::fs::write(&moved, format!("{text}y = 2\n")).expect("write");
+        assert!(super::trim_on_disk(&judged_file(&moved, text), &cwd, &ledger).is_none());
+        for file in [&real, &outside] {
+            assert_eq!(std::fs::read_to_string(file).expect("read"), text);
+        }
+        assert_eq!(std::fs::read_to_string(&moved).expect("read"), format!("{text}y = 2\n"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

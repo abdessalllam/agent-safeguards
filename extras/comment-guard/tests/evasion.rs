@@ -2272,11 +2272,154 @@ fn harmless_look_alikes_do_not_stop_a_trim_and_a_huge_file_is_trimmed_quickly() 
 }
 
 #[test]
-fn the_codex_patch_and_a_partial_edit_are_refused_not_trimmed() {
+fn a_codex_patch_is_written_without_the_extra_comment_lines() {
+    let dir = temp_dir("trim-patch");
+    let name = dir.join("p.py").display().to_string();
+    let patch = format!("*** Begin Patch\n*** Add File: {name}\n+x = 1\n+# a\n+# b\n+# c\n+# d\n*** End Patch\n");
+    let (input, note) = cut(trimming(None, None, "apply_patch", json!({ "command": patch }), Provider::Codex));
+    assert_eq!(input["command"], format!("*** Begin Patch\n*** Add File: {name}\n+x = 1\n+# a\n+# b\n*** End Patch\n"));
+    assert!(note.contains("# c | # d"), "{note}");
+    let target = dir.join("u.py");
+    std::fs::write(&target, "def f():\n    return 1\n\ndef g():\n    return 2\n").expect("write");
+    let path = target.display().to_string();
+    let update = format!("*** Begin Patch\n*** Update File: {path}\n@@ def g():\n+    # a\n+    # b\n+    # c\n+    # d\n     return 2\n*** End Patch\n");
+    let (input, _) = cut(trimming(None, None, "apply_patch", json!({ "command": update }), Provider::Codex));
+    assert_eq!(input["command"], format!("*** Begin Patch\n*** Update File: {path}\n@@ def g():\n+    # a\n+    # b\n     return 2\n*** End Patch\n"));
+    let other = dir.join("o.py").display().to_string();
+    let two = format!("*** Begin Patch\n*** Add File: {name}\n+x = 1\n+# a\n+# b\n+# c\n*** Add File: {other}\n+y = 1\n+# a\n+# b\n*** End Patch\n");
+    let (input, _) = cut(trimming(None, None, "apply_patch", json!({ "command": two }), Provider::Codex));
+    assert_eq!(input["command"], format!("*** Begin Patch\n*** Add File: {name}\n+x = 1\n+# a\n+# b\n*** Add File: {other}\n+y = 1\n+# a\n+# b\n*** End Patch\n"));
+    let shared = format!("*** Begin Patch\n*** Add File: {name}\n+x = 1\n+# a\n+# b\n+# c\n*** Add File: {other}\n+y = 1\n+# c\n*** End Patch\n");
+    let (input, _) = cut(trimming(None, None, "apply_patch", json!({ "command": shared }), Provider::Codex));
+    assert_eq!(input["command"], format!("*** Begin Patch\n*** Add File: {name}\n+x = 1\n+# a\n+# b\n*** Add File: {other}\n+y = 1\n+# c\n*** End Patch\n"));
+    let same = format!("*** Begin Patch\n*** Add File: {name}\n+x = 1\n+# a\n+# a\n+# a\n+# a\n*** End Patch\n");
+    assert!(matches!(trimming(None, None, "apply_patch", json!({ "command": same }), Provider::Codex), Verdict::Deny(_)));
+    let moved = format!("*** Begin Patch\n*** Update File: {path}\n*** Move to: {other}\n@@ def g():\n+    # a\n+    # b\n+    # c\n+    # d\n     return 2\n*** End Patch\n");
+    let (input, _) = cut(trimming(None, None, "apply_patch", json!({ "command": moved }), Provider::Codex));
+    assert_eq!(input["command"], format!("*** Begin Patch\n*** Update File: {path}\n*** Move to: {other}\n@@ def g():\n+    # a\n+    # b\n     return 2\n*** End Patch\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_notebook_cell_is_written_without_the_extra_comment_lines() {
+    let dir = temp_dir("trim-notebook");
+    let path = dir.join("n.ipynb");
+    let notebook = json!({
+        "cells": [
+            { "cell_type": "markdown", "metadata": {}, "source": "# title", "id": "m0" },
+            { "cell_type": "code", "metadata": {}, "source": "x = 1\n# keep", "id": "c1" },
+            { "cell_type": "code", "metadata": {}, "source": "y = 2", "id": "c2" },
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    });
+    std::fs::write(&path, notebook.to_string()).expect("write");
+    let file = path.to_string_lossy().into_owned();
+    let replace = json!({ "notebook_path": file, "cell_id": "c2", "new_source": "# n1\n# n2\n# n3\n# n4\ny = 3", "edit_mode": "replace" });
+    let (input, _) = cut(trimming(None, None, "NotebookEdit", replace, Provider::Claude));
+    assert_eq!(input["new_source"], "# n1\n# n2\ny = 3");
+    let insert = json!({ "notebook_path": file, "cell_id": "m0", "new_source": "z = 1\n# n1\n# n2\n# n3", "cell_type": "code", "edit_mode": "insert" });
+    let (input, _) = cut(trimming(None, None, "NotebookEdit", insert, Provider::Claude));
+    assert_eq!(input["new_source"], "z = 1\n# n1\n# n2");
+    let first = json!({ "notebook_path": file, "cell_id": "c1", "new_source": "# n1\n# n2\n# n3\n# n4\nx = 5", "edit_mode": "replace" });
+    let (input, _) = cut(trimming(None, None, "NotebookEdit", first, Provider::Claude));
+    assert_eq!(input["new_source"], "# n1\n# n2\nx = 5");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn apply_edits(start: &str, input: &Value) -> String {
+    let mut text = start.to_owned();
+    for edit in input["edits"].as_array().expect("edits") {
+        let (old, new) = (edit["old_string"].as_str().expect("old"), edit["new_string"].as_str().expect("new"));
+        text = text.replacen(old, new, 1);
+    }
+    text
+}
+
+#[test]
+fn a_multi_edit_is_written_without_the_extra_comment_lines() {
+    let dir = temp_dir("trim-multi");
+    let path = dir.join("m.py");
+    let start = "a = 1\nb = 2\nc = 3\nd = 4\n";
+    std::fs::write(&path, start).expect("write");
+    let file = path.to_string_lossy().into_owned();
+    let two = json!({ "file_path": file, "edits": [
+        { "old_string": "a = 1", "new_string": "# a1\n# a2\na = 1" },
+        { "old_string": "c = 3", "new_string": "c = 3\n# c1\n# c2\n# c3" },
+    ] });
+    let (input, _) = cut(trimming(None, None, "MultiEdit", two, Provider::Claude));
+    assert_eq!(apply_edits(start, &input), "# a1\n# a2\na = 1\nb = 2\nc = 3\nd = 4\n");
+    assert_eq!(input["edits"][0]["new_string"], "# a1\n# a2\na = 1");
+    assert_eq!(input["edits"][1]["new_string"], "c = 3");
+    let chained = json!({ "file_path": file, "edits": [
+        { "old_string": "b = 2", "new_string": "b = 2\n# x1\n# x2\n# x3\n# x4" },
+        { "old_string": "# x4", "new_string": "# y4" },
+    ] });
+    let (input, _) = cut(trimming(None, None, "MultiEdit", chained, Provider::Claude));
+    assert_eq!(apply_edits(start, &input), "a = 1\nb = 2\n# x1\n# x2\nc = 3\nd = 4\n");
+    let every = json!({ "file_path": file, "edits": [{ "old_string": "a = 1", "new_string": "a = 1\n# a\n# b\n# c\n# d", "replace_all": true }] });
+    assert!(matches!(trimming(None, None, "MultiEdit", every, Provider::Claude), Verdict::Deny(_)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn after_trimming(rig: &Rig, host: &str, command: &str) -> String {
+    let payload = json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "bash-trim",
+        "cwd": rig.cwd.to_string_lossy(),
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+        "tool_response": {},
+    });
+    let mut child = Command::new(binary())
+        .args(["hook", host, "PostToolUse"])
+        .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
+        .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "1")
+        .env("XDG_STATE_HOME", &rig.state)
+        .env("HOME", &rig.home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start");
+    let _ = child.stdin.take().expect("stdin").write_all(payload.to_string().as_bytes());
+    String::from_utf8_lossy(&child.wait_with_output().expect("wait").stdout).into_owned()
+}
+
+#[test]
+fn a_file_a_command_wrote_loses_its_extra_comment_lines() {
+    let rig = Rig::new("bash-trim");
+    let five = "x = 1\n# a\n# b\n# c\n# d\n";
+    let file = rig.cwd.join("a.py");
+    std::fs::write(&file, five).expect("write");
+    let out: Value = serde_json::from_str(after_trimming(&rig, "claude", "printf x > a.py").trim()).expect("json");
+    assert_eq!(std::fs::read_to_string(&file).expect("read"), "x = 1\n# a\n# b\n");
+    let note = out["hookSpecificOutput"]["additionalContext"].as_str().expect("note");
+    assert!(note.contains("# c | # d") && out.get("decision").is_none(), "{out}");
+    assert_eq!(out["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    let other = rig.cwd.join("b.py");
+    std::fs::write(&other, five).expect("write");
+    let out: Value = serde_json::from_str(after_trimming(&rig, "codex", "printf x > b.py").trim()).expect("json");
+    assert_eq!(std::fs::read_to_string(&other).expect("read"), "x = 1\n# a\n# b\n");
+    assert!(out["hookSpecificOutput"]["additionalContext"].is_string());
+    let outside = temp_dir("bash-trim-out");
+    let far = outside.join("o.py");
+    std::fs::write(&far, five).expect("write");
+    let command = format!("printf x > {}", far.display());
+    let text = after_trimming(&rig, "claude", &command);
+    assert!(text.contains("\"decision\":\"block\""), "{text}");
+    assert_eq!(std::fs::read_to_string(&far).expect("read"), five);
+    let script = rig.cwd.join("s.ps1");
+    std::fs::write(&script, "$a = 1\n# a\n# b\n# c\n# d\n").expect("write");
+    let text = after_trimming(&rig, "claude", "printf x > s.ps1");
+    assert!(text.contains("\"decision\":\"block\""), "{text}");
+    assert_eq!(std::fs::read_to_string(&script).expect("read"), "$a = 1\n# a\n# b\n# c\n# d\n");
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn a_partial_edit_is_refused_not_trimmed() {
     let dir = temp_dir("trim-other");
-    let patch = format!("*** Begin Patch\n*** Add File: {}\n+x = 1\n+# a\n+# b\n+# c\n+# d\n*** End Patch\n", dir.join("p.py").display());
-    let verdict = trimming(None, None, "apply_patch", json!({ "command": patch }), Provider::Codex);
-    assert!(matches!(verdict, Verdict::Deny(_)));
     let all = dir.join("a.py");
     std::fs::write(&all, "x = 1\nx = 1\n").expect("write");
     let every = json!({ "file_path": all.to_string_lossy(), "old_string": "x = 1", "new_string": "x = 1\n# a\n# b\n# c\n# d", "replace_all": true });
