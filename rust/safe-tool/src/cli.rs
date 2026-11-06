@@ -50,9 +50,9 @@ pub fn has_key_result(arguments: &[String]) -> Result<(i32, String, String), Emb
 
 pub fn has_key(arguments: &[String]) -> Result<i32, EmbeddedNul> {
     let (code, stdout, stderr) = has_key_result(arguments)?;
-    let _ = std::io::stdout().write_all(stdout.as_bytes());
+    let written = guard_common::emit::write_stdout(stdout.as_bytes());
     let _ = std::io::stderr().write_all(stderr.as_bytes());
-    Ok(code)
+    Ok(if written == 0 { code } else { written })
 }
 
 fn normalize_nonfinite(raw: &[u8]) -> Option<Vec<u8>> {
@@ -116,8 +116,7 @@ pub fn main_args(arguments: &[String]) -> i32 {
     let second = arguments.get(1).map(String::as_str);
     let third = arguments.get(2).map(String::as_str);
     if arguments.len() == 1 && matches!(first, Some("-h" | "--help")) {
-        let _ = std::io::stdout().write_all(usage().as_bytes());
-        return 0;
+        return guard_common::emit::write_stdout(usage().as_bytes());
     }
     if first == Some("hook")
         && (2..=3).contains(&arguments.len())

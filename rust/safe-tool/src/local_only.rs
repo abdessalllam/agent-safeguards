@@ -297,17 +297,24 @@ pub fn requires_local_artifact_approval(
         return Ok(false);
     };
     let chunks = tokenize(command);
+    let mut adds = false;
     for chunk in &chunks {
-        if is_force_git_add(chunk)? && !untracked_local_only_paths(&root).is_empty() {
-            return Ok(true);
+        if is_force_git_add(chunk)? {
+            adds = true;
+            break;
         }
     }
+    if adds && !untracked_local_only_paths(&root).is_empty() {
+        return Ok(true);
+    }
+    let mut commits = false;
     for chunk in &chunks {
-        if is_safe_tool_commit(chunk)? && !new_staged_local_only_paths(&root).is_empty() {
-            return Ok(true);
+        if is_safe_tool_commit(chunk)? {
+            commits = true;
+            break;
         }
     }
-    Ok(false)
+    Ok(commits && !new_staged_local_only_paths(&root).is_empty())
 }
 
 #[cfg(test)]
@@ -463,6 +470,41 @@ mod tests {
         assert_eq!(
             requires_local_artifact_approval("git add -f CLAUDE.local.md", Some(root_text)),
             Ok(true)
+        );
+        assert_mock_consumed();
+
+        mock_git_calls(vec![
+            root_call(root_text),
+            (
+                vec![
+                    "ls-files".into(),
+                    "--others".into(),
+                    "--exclude-standard".into(),
+                    "-z".into(),
+                    "--".into(),
+                    "CLAUDE.local.md".into(),
+                ],
+                finished(0, b""),
+            ),
+            (
+                vec![
+                    "ls-files".into(),
+                    "--others".into(),
+                    "--ignored".into(),
+                    "--exclude-standard".into(),
+                    "-z".into(),
+                    "--".into(),
+                    "CLAUDE.local.md".into(),
+                ],
+                finished(0, b""),
+            ),
+        ]);
+        assert_eq!(
+            requires_local_artifact_approval(
+                "git add -f CLAUDE.local.md;git add -f CLAUDE.local.md",
+                Some(root_text)
+            ),
+            Ok(false)
         );
         assert_mock_consumed();
 

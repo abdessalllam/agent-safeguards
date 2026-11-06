@@ -75,14 +75,16 @@ fn string_end(input: &str, start: usize) -> Option<usize> {
 }
 
 fn parse_node(input: &str, start: usize, depth: usize) -> Option<(AuthNode, usize)> {
-    if depth > 1024 {
+    let mut at = skip_json_space(input, start);
+    let opening = *input.as_bytes().get(at)?;
+    if matches!(opening, b'{' | b'[') && depth >= guard_common::pyjson::MAX_NESTING {
         return None;
     }
-    let mut at = skip_json_space(input, start);
-    match *input.as_bytes().get(at)? {
+    match opening {
         b'{' => {
             at = skip_json_space(input, at.saturating_add(1));
             let mut entries = Vec::new();
+            let mut positions: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             if input.as_bytes().get(at) == Some(&b'}') {
                 return Some((AuthNode::Object(entries), at.saturating_add(1)));
             }
@@ -95,9 +97,12 @@ fn parse_node(input: &str, start: usize, depth: usize) -> Option<(AuthNode, usiz
                 }
                 let (child, end) =
                     parse_node(input, at.saturating_add(1), depth.saturating_add(1))?;
-                if let Some((_, existing)) = entries.iter_mut().find(|(name, _)| *name == key) {
-                    *existing = child;
+                if let Some(slot) = positions.get(&key).copied() {
+                    if let Some(entry) = entries.get_mut(slot) {
+                        entry.1 = child;
+                    }
                 } else {
+                    positions.insert(key.clone(), entries.len());
                     entries.push((key, child));
                 }
                 at = skip_json_space(input, end);
@@ -406,7 +411,7 @@ pub fn git_identity_ready(root: &str) -> bool {
             || completed
                 .stdout
                 .iter()
-                .all(|byte| byte.is_ascii_whitespace())
+                .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
         {
             return false;
         }
@@ -440,8 +445,8 @@ pub fn git_identity() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_mock_consumed, authentication_state, git, git_identity, mock_git_calls,
-        ordered_json_payloads, AuthNode,
+        assert_mock_consumed, authentication_state, git, git_identity, git_identity_ready,
+        mock_git_calls, ordered_json_payloads, AuthNode,
     };
     use crate::process::ProcessResult;
 
@@ -493,6 +498,45 @@ mod tests {
         .expect("Git wrapper config probe");
         assert_eq!(config.returncode, 0);
         assert_eq!(config.stdout, b"true\n");
+    }
+
+    #[test]
+    fn nesting_follows_python_and_a_repeated_key_keeps_its_first_place() {
+        let worker = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let deep = format!(
+                    "{{\"authenticated\":true,\"extra\":{}0{}}}",
+                    "[".repeat(1100),
+                    "]".repeat(1100)
+                );
+                let node = AuthNode::parse(&deep).expect("deep json");
+                assert_eq!(authentication_state(&node), Some("ready"));
+                let limit = format!("{}0{}", "[".repeat(9997), "]".repeat(9997));
+                assert!(AuthNode::parse(&limit).is_some());
+                let past = format!("{}0{}", "[".repeat(9998), "]".repeat(9998));
+                assert!(AuthNode::parse(&past).is_none());
+                let again =
+                    AuthNode::parse(r#"{"status":"expired","x":1,"status":"ready"}"#).expect("json");
+                assert_eq!(authentication_state(&again), Some("ready"));
+            });
+        assert!(worker.expect("spawn").join().is_ok());
+    }
+
+    #[test]
+    fn a_vertical_tab_is_blank_output_for_the_identity_check() {
+        let root = std::env::current_dir().expect("cwd");
+        let root = root.to_str().expect("utf8 path");
+        mock_git_calls(vec![(
+            vec!["var".into(), "GIT_AUTHOR_IDENT".into()],
+            Some(ProcessResult {
+                returncode: 0,
+                stdout: b"\x0b".to_vec(),
+                stderr: vec![],
+            }),
+        )]);
+        assert!(!git_identity_ready(root));
+        assert_mock_consumed();
     }
 
     #[test]

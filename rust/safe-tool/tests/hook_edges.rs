@@ -190,3 +190,25 @@ fn nesting_is_read_as_deep_as_python_reads_it() {
     let past = hook(&home, "PreToolUse", &nested(9997), None);
     assert!(past.stdout.contains("deny"), "{}", past.stdout);
 }
+
+#[test]
+fn a_closed_stdout_makes_redact_fail_the_way_python_does() {
+    let home = home("closed-pipe");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_safe-tool"));
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home.0)
+        .arg("redact");
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn redact");
+    drop(child.stdout.take());
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(b"plain\n").expect("feed");
+    drop(stdin);
+    assert_eq!(child.wait().expect("status").code(), Some(120));
+}

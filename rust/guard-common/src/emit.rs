@@ -15,6 +15,16 @@ pub fn emit(payload: &Value) {
     let _ = stdout.write_all(b"\n");
 }
 
+pub fn write_stdout(bytes: &[u8]) -> i32 {
+    let mut stdout = std::io::stdout().lock();
+    if stdout.write_all(bytes).and_then(|()| stdout.flush()).is_ok() {
+        return 0;
+    }
+    let note = b"Exception ignored in: <_io.TextIOWrapper name='<stdout>' mode='w' encoding='utf-8'>\nBrokenPipeError: [Errno 32] Broken pipe\n";
+    let _ = std::io::stderr().write_all(note);
+    120
+}
+
 pub fn emit_decision(decision: &str, reason: &str, event: &str) {
     emit(&decision_value(decision, reason, event));
 }

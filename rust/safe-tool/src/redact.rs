@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::Ipv6Addr;
 use std::str::FromStr;
 
@@ -18,7 +18,10 @@ pub fn all_octets(candidate: &str) -> Result<bool, &'static str> {
         }
         let trimmed = part.trim_matches(char::is_whitespace);
         let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
-        if unsigned.is_empty() || unsigned.split('_').any(str::is_empty) {
+        if unsigned.is_empty()
+            || unsigned.starts_with(char::is_whitespace)
+            || unsigned.split('_').any(str::is_empty)
+        {
             return Err("ValueError");
         }
         let digits = unsigned.replace('_', "");
@@ -106,8 +109,7 @@ pub fn redact() -> i32 {
     if input.read_to_end(&mut raw).is_err() {
         return 1;
     }
-    let _ = std::io::stdout().write_all(redact_bytes(&raw).as_bytes());
-    0
+    guard_common::emit::write_stdout(redact_bytes(&raw).as_bytes())
 }
 
 #[cfg(test)]
@@ -121,6 +123,9 @@ mod tests {
         assert_eq!(all_octets("-1.+2.0.1"), Ok(true));
         assert_eq!(all_octets("١.٢.٣.٤"), Ok(true));
         assert_eq!(all_octets("1..2"), Err("ValueError"));
+        assert_eq!(all_octets("+ 0"), Err("ValueError"));
+        assert_eq!(all_octets("-\r1"), Err("ValueError"));
+        assert_eq!(all_octets(" +0 .1.2.3"), Ok(true));
     }
 
     #[test]
