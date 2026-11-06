@@ -64,10 +64,13 @@ Narrow the output and retry: list paths only (`rg -l`), count (`rg -c`), drop ma
 | `invalid_message` | Fix the message to fit the limits above and retry. |
 | `no_staged_changes` | Stage the intended files first. |
 | `not_repository` | `cd` into the repository or worktree. |
-| `hook_failed` | A repository commit hook failed. Run that check yourself, fix the cause, and retry. Never skip hooks. safe-tool runs with a minimal `PATH`, so a hook that needs another tool can fail here; report that case. |
+| `hook_failed` | A repository commit hook failed (also reported when the repository has a commit hook and git gave no other reason). Read `detail`, run that check yourself, fix the cause, and retry. Never skip hooks. safe-tool runs with a minimal `PATH`, so a hook that needs another tool can fail here; report that case. |
+| `lock_held` | Another git process holds `index.lock`. Wait for it, check that no git command is still running, and retry. |
 | `unmerged_changes` | Resolve the conflicts first. |
 | `identity_missing`, `signing_failed` | Stop and tell the user; never set an identity or signing config. |
-| `commit_failed`, `operation_failed`, `verification_failed` | Retry once, then report the status. |
+| `commit_failed`, `operation_failed`, `verification_failed` | Retry once, then report the status and `detail`. |
+
+A failed commit adds `detail` (the last lines git or a hook printed) when that text holds nothing private, and `detail_withheld` (the reason) when it does.
 
 - `safe-tool git identity` prints `configured`, `identity_missing`, or `not_repository` without showing the identity.
 - `safe-tool status coderabbit` prints `ready`, `unauthenticated`, `unavailable`, `schema_mismatch`, or `operation_failed`.

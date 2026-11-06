@@ -2336,6 +2336,34 @@ def _object_id(output: bytes) -> str | None:
     return value if OBJECT_ID_PATTERN.fullmatch(value) else None
 
 
+def _commit_hook_exists(root: str) -> bool:
+    completed = _git(["rev-parse", "--git-path", "hooks"], root, 20)
+    if completed is None or completed.returncode != 0:
+        return False
+    folder = completed.stdout.decode("utf-8", "replace").strip()
+    folder = folder if os.path.isabs(folder) else os.path.join(root, folder)
+    return any(
+        os.path.isfile(os.path.join(folder, name)) and os.access(os.path.join(folder, name), os.X_OK)
+        for name in ("pre-commit", "prepare-commit-msg", "commit-msg")
+    )
+
+
+def _commit_detail(output: bytes) -> dict[str, str]:
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", output.decode("utf-8", "replace")).strip()
+    if not text:
+        return {}
+    shown = "\n".join(line[:300] for line in text.splitlines()[-30:])[-2000:]
+    reason = _withheld_because("git commit", shown)
+    return {"detail": shown} if reason is None else {"detail_withheld": reason}
+
+
+def _commit_operation_failed(*results: Any) -> int:
+    output = b"".join(result.stdout + result.stderr for result in results if result is not None and result.returncode != 0)
+    status = "lock_held" if b"index.lock" in output.lower() else "operation_failed"
+    emit({"tool": "git", "operation": "commit", "status": status, **_commit_detail(output)})
+    return 2
+
+
 def _git_commit(messages: list[str]) -> int:
     commit_message = "\n\n".join(messages).strip()
     if (
@@ -2355,8 +2383,7 @@ def _git_commit(messages: list[str]) -> int:
         return 1
     staged = _git(["diff", "--cached", "--quiet", "--exit-code"], root, 20)
     if staged is None or staged.returncode not in {0, 1}:
-        emit({"tool": "git", "operation": "commit", "status": "operation_failed"})
-        return 2
+        return _commit_operation_failed(staged)
     if staged.returncode == 0:
         emit({"tool": "git", "operation": "commit", "status": "no_staged_changes"})
         return 1
@@ -2364,23 +2391,27 @@ def _git_commit(messages: list[str]) -> int:
     paths = _git(["diff", "--cached", "--name-only", "-z"], root, 20)
     candidate_tree = _object_id(candidate.stdout) if candidate and candidate.returncode == 0 else None
     if candidate_tree is None or paths is None or paths.returncode != 0:
-        emit({"tool": "git", "operation": "commit", "status": "operation_failed"})
-        return 2
+        return _commit_operation_failed(candidate, paths)
     arguments = ["commit", "--quiet", "--no-status"]
     for paragraph in messages:
         arguments.extend(("--message", paragraph))
     completed = _git(arguments, root)
     if completed is None or completed.returncode != 0:
-        combined = (completed.stdout + completed.stderr).lower() if completed else b""
-        if b"hook" in combined:
+        output = (completed.stdout + completed.stderr) if completed else b""
+        combined = output.lower()
+        if b"index.lock" in combined:
+            status = "lock_held"
+        elif b"hook" in combined:
             status = "hook_failed"
         elif b"sign" in combined or b"gpg" in combined:
             status = "signing_failed"
         elif b"unmerged" in combined or b"conflict" in combined:
             status = "unmerged_changes"
+        elif _commit_hook_exists(root):
+            status = "hook_failed"
         else:
             status = "commit_failed"
-        emit({"tool": "git", "operation": "commit", "status": status})
+        emit({"tool": "git", "operation": "commit", "status": status, **_commit_detail(output)})
         return 1
     commit = _git(["rev-parse", "--verify", "HEAD"], root, 20)
     tree = _git(["rev-parse", "--verify", "HEAD^{tree}"], root, 20)
