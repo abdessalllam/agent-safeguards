@@ -48,7 +48,7 @@ impl From<Stop> for GlobError {
 }
 
 fn full_regex(source: &str) -> Regex {
-    Regex::new(&format!(r"\A(?:{source})\z"))
+    guard_common::pyre::new(&format!(r"\A(?:{source})\z"))
         .unwrap_or_else(|error| panic!("invalid fixed regex: {error}"))
 }
 
@@ -330,7 +330,7 @@ pub fn glob_tokens(pattern: &str) -> Result<Vec<GlobToken>, GlobError> {
                     }
                     let source = format!("\u{005b}{}{}]", if negate { "^" } else { "" }, members);
                     tokens.push(GlobToken::Set(
-                        Regex::new(&format!(r"\A(?:{source})\z")).map_err(|_| GlobError::Regex)?,
+                        guard_common::pyre::new(&format!(r"\A(?:{source})\z")).map_err(|_| GlobError::Regex)?,
                     ));
                     index = position;
                 }

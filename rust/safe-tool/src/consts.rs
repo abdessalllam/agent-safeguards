@@ -13,7 +13,7 @@ pub struct Found {
 }
 
 fn compile(pattern: &str) -> Regex {
-    match Regex::new(pattern) {
+    match guard_common::pyre::new(pattern) {
         Ok(compiled) => compiled,
         Err(error) => panic!("constant pattern failed to compile: {error}"),
     }
@@ -738,7 +738,7 @@ fn accept_suffix(text: &str, caps: &Captures<'_>) -> bool {
     let Some(whole) = caps.get(0) else {
         return false;
     };
-    !prefix_has(&SUFFIX_RE, text, whole.end())
+    whole.as_str().ends_with('/') || !prefix_has(&SUFFIX_RE, text, whole.end())
 }
 
 fn accept_ipv6(text: &str, caps: &Captures<'_>) -> bool {
@@ -1011,14 +1011,97 @@ fn find_label(text: &str) -> Vec<Found> {
     scan(text, &LABEL_CORE, accept_label, whole_span, |caps| one_group(caps, 1))
 }
 
+const SECRET_FILE_ALTERNATIVES: [(&str, usize); 13] = [
+    (r"\.pgpass", 16),
+    (r"\.my\.cnf", 16),
+    (r"\.git-credentials", 32),
+    (r"\.vault-token", 32),
+    (r"\.dev\.vars", 16),
+    (r"\.envrc", 16),
+    (r"id_(?:rsa|dsa|ecdsa|ed25519)(?:_[a-z0-9]+)?", 4096),
+    (r"credentials\.json", 32),
+    (r"secrets?\.(?:json|ya?ml|toml)", 32),
+    (r#"service[-_]account[^\s"'|;&<>()=:/]{0,256}\.json"#, 320),
+    (r"kubeconfig", 16),
+    (r"terraform\.tfstate(?:\.backup)?", 32),
+    (r#"[^\s"'|;&<>()=:/]{0,256}\.(?:pem|key|p12|pfx|jks|keystore|p8|tfstate|tfvars)"#, 320),
+];
+
+static SECRET_FILE_NAMES: LazyLock<Vec<(Regex, usize)>> = LazyLock::new(|| {
+    SECRET_FILE_ALTERNATIVES
+        .iter()
+        .map(|(source, reach)| (compile(&format!(r"\A(?:{source})\z")), *reach))
+        .collect()
+});
+
+static SECRET_FILE_PREFIX: LazyLock<Regex> = LazyLock::new(|| compile(r#"\A[\s"'=:(<>|;&/]"#));
+
+fn accept_sensitive_end(text: &str, end: usize) -> bool {
+    if let Some(ch) = char_at(text, end) {
+        if ascii_file_tail(ch) {
+            return false;
+        }
+    }
+    !prefix_has(&EXEMPT_RE, text, end)
+}
+
+fn sensitive_end(text: &str, start: usize, first_end: usize) -> Option<usize> {
+    if accept_sensitive_end(text, first_end) {
+        return Some(first_end);
+    }
+    let mut name_starts = Vec::new();
+    if start == 0 {
+        name_starts.push(0usize);
+    }
+    if let Some(ch) = char_at(text, start) {
+        if SECRET_FILE_PREFIX.is_match(ch.encode_utf8(&mut [0u8; 4])) {
+            name_starts.push(start.saturating_add(ch.len_utf8()));
+        }
+    }
+    for name_start in name_starts {
+        for (alternative, reach) in SECRET_FILE_NAMES.iter() {
+            let mut end = name_start.saturating_add(*reach).min(text.len());
+            while end > name_start {
+                if text.is_char_boundary(end)
+                    && alternative.is_match(&text[name_start..end])
+                    && accept_sensitive_end(text, end)
+                {
+                    return Some(end);
+                }
+                end -= 1;
+            }
+        }
+    }
+    None
+}
+
 fn find_sensitive(text: &str) -> Vec<Found> {
-    scan(
-        text,
-        &SENSITIVE_CORE,
-        accept_sensitive,
-        whole_span,
-        |_| empty_groups(),
-    )
+    let mut found = Vec::new();
+    let mut pos = 0usize;
+    while pos <= text.len() {
+        let Some(whole) = SENSITIVE_CORE.find_at(text, pos) else {
+            break;
+        };
+        if let Some(end) = sensitive_end(text, whole.start(), whole.end()) {
+            found.push(Found {
+                start: whole.start(),
+                end,
+                groups: empty_groups(),
+            });
+            let next = if end > pos { end } else { next_pos(text, pos) };
+            if next == pos {
+                break;
+            }
+            pos = next;
+            continue;
+        }
+        let next = next_pos(text, whole.start());
+        if next <= pos {
+            break;
+        }
+        pos = next;
+    }
+    found
 }
 
 fn find_git(text: &str) -> Vec<Found> {

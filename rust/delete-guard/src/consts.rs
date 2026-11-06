@@ -92,7 +92,7 @@ static TRASH_HOME_SLASH: LazyLock<Regex> = LazyLock::new(|| compile(r"(?:\A|/)\.
 static TRASH_HOME_END: LazyLock<Regex> = LazyLock::new(|| compile(r"(?:\A|/)\.local/share/Trash"));
 
 fn compile(pattern: &str) -> Regex {
-    match Regex::new(pattern) {
+    match guard_common::pyre::new(pattern) {
         Ok(regex) => regex,
         Err(error) => panic!("regex failed to compile: {error}"),
     }

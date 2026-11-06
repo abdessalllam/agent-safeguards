@@ -57,7 +57,7 @@ impl Deadline {
 }
 
 fn compile(source: &str) -> Regex {
-    match Regex::new(source) {
+    match crate::pyre::new(source) {
         Ok(compiled) => compiled,
         Err(_) => match Regex::new(r"\A\z") {
             Ok(compiled) => compiled,

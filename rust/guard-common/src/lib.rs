@@ -5,6 +5,7 @@ pub mod env;
 pub mod locale;
 pub mod overrides;
 pub mod pyglob;
+pub mod pyre;
 pub mod secret_scan;
 pub mod shell;
 pub mod shlex;

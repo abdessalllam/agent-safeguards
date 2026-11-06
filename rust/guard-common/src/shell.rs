@@ -741,7 +741,7 @@ where
 }
 
 fn compile(pattern: &str) -> Regex {
-    match Regex::new(pattern) {
+    match crate::pyre::new(pattern) {
         Ok(regex) => regex,
         Err(_) => match Regex::new("a^") {
             Ok(regex) => regex,

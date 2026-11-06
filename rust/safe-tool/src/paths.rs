@@ -52,7 +52,7 @@ static NULL_REDIRECT: LazyLock<Regex> =
     LazyLock::new(|| compile(r"\d*>>?[\s\u{001c}-\u{001f}]*(?:/dev/null|&\d)"));
 
 fn compile(pattern: &str) -> Regex {
-    Regex::new(pattern).unwrap_or_else(|_| std::process::abort())
+    guard_common::pyre::new(pattern).unwrap_or_else(|_| std::process::abort())
 }
 
 pub fn working_folder() -> String {
