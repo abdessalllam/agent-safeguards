@@ -393,7 +393,7 @@ fn is_exempt(text: &str) -> bool {
 }
 
 fn triple_end(lang: Language, text: &str, delim: &str) -> Option<usize> {
-    if lang.raw_triple {
+    if lang.raw_strings {
         text.find(delim)
     } else {
         find_unescaped(text, delim)
@@ -464,6 +464,16 @@ fn char_literal_length(rest: &str) -> Option<usize> {
         return Some(first.len_utf8().saturating_add(2));
     }
     None
+}
+
+fn keyword_before(text: &str, at: usize) -> bool {
+    let head = text.get(..at).unwrap_or("").trim_end();
+    let word: String = head.chars().rev().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$')).collect();
+    let word: String = word.chars().rev().collect();
+    let before = head.get(..head.len().saturating_sub(word.len())).unwrap_or("");
+    !before.ends_with('.')
+        && ["return", "typeof", "void", "throw", "case", "await", "yield", "delete", "in", "of", "instanceof", "new", "do", "else"]
+            .contains(&word.as_str())
 }
 
 fn regex_allowed(significant: Option<u8>) -> bool {
@@ -675,7 +685,7 @@ impl<'a> Scan<'a> {
                 LineKind::Comment(trimmed)
             }
             State::Triple { delim, doc } => self.in_triple(trimmed, delim, doc),
-            State::Backtick => match find_unescaped(trimmed, "`") {
+            State::Backtick => match triple_end(self.lang, trimmed, "`") {
                 Some(end) => {
                     self.state = State::Code;
                     match trimmed.get(end.saturating_add(1)..) {
@@ -886,7 +896,7 @@ impl<'a> Scan<'a> {
                 continue;
             }
             if lang.backtick && first == '`' {
-                match rest.get(1..).and_then(|tail| find_unescaped(tail, "`")) {
+                match rest.get(1..).and_then(|tail| triple_end(lang, tail, "`")) {
                     Some(end) => {
                         at = at.saturating_add(end.saturating_add(2));
                         previous = Some(b'`');
@@ -936,7 +946,7 @@ impl<'a> Scan<'a> {
                     return;
                 }
             }
-            if lang.regex && first == '/' && regex_allowed(significant) {
+            if lang.regex && first == '/' && (regex_allowed(significant) || keyword_before(text, at)) {
                 if let Some(length) = regex_length(rest) {
                     at = at.saturating_add(length);
                     previous = Some(b')');

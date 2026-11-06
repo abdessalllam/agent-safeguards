@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::comments::{body, protected, scan, LineKind};
-use crate::languages::{language_for_text, Language, CLIKE, GO, KOTLIN, RUST, SCRIPT, SHELL, SWIFT};
+use crate::languages::{language_for_text, Language, CLIKE, GO, KOTLIN, PYTHON, RUST, SCRIPT, SHELL, SWIFT};
 use crate::locale::message;
 
 pub const MAX_LINES: usize = 2;
@@ -340,25 +340,24 @@ fn directive_shaped(line: &str) -> bool {
     !word.is_empty() && text.get(word.len()..).is_some_and(|rest| rest.trim_start().starts_with([':', '=']))
 }
 
-fn kotlin_nested_raw(text: &str) -> bool {
+fn nested_triple(text: &str, opener: &str, inc: u8, dec: u8) -> bool {
     let bytes = text.as_bytes();
     let mut at = 0usize;
-    while let Some(found) = text.get(at..).and_then(|rest| rest.find("${")) {
-        let start = at.saturating_add(found).saturating_add(2);
+    while let Some(found) = text.get(at..).and_then(|rest| rest.find(opener)) {
+        let start = at.saturating_add(found).saturating_add(opener.len());
         let mut depth = 1usize;
         let mut closed = false;
         for (offset, byte) in bytes.iter().enumerate().skip(start).take(4096) {
-            match byte {
-                b'{' => depth = depth.saturating_add(1),
-                b'}' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        closed = true;
-                        break;
-                    }
+            if *byte == inc {
+                depth = depth.saturating_add(1);
+            } else if *byte == dec {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    closed = true;
+                    break;
                 }
-                b'"' if bytes.get(offset..offset.saturating_add(3)) == Some(b"\"\"\"".as_slice()) => return true,
-                _ => {}
+            } else if matches!(bytes.get(offset..offset.saturating_add(3)), Some(b"\"\"\"")) {
+                return true;
             }
         }
         if !closed {
@@ -367,6 +366,16 @@ fn kotlin_nested_raw(text: &str) -> bool {
         at = start;
     }
     false
+}
+
+fn fstring_triple(text: &str) -> bool {
+    ["\"\"\"", "'''"].iter().any(|delim| {
+        text.match_indices(delim).any(|(at, _)| {
+            let head = text.get(..at).unwrap_or("");
+            let run: String = head.chars().rev().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            run.len() <= 3 && run.chars().all(|c| "rRbBuUfF".contains(c)) && run.chars().any(|c| matches!(c, 'f' | 'F'))
+        })
+    })
 }
 
 fn jsx_like(text: &str) -> bool {
@@ -388,8 +397,9 @@ fn risky(text: &str, lang: Language) -> bool {
         || (lang == RUST && text.lines().any(raw_string_open))
         || (lang == CLIKE && (text.contains("R\"") || text.contains("@\"")))
         || (lang == GO && text.contains("\"C\""))
-        || (lang == SWIFT && text.contains("#\""))
-        || (lang == KOTLIN && kotlin_nested_raw(text))
+        || (lang == SWIFT && (text.contains("#\"") || nested_triple(text, "\\(", b'(', b')')))
+        || (lang == KOTLIN && nested_triple(text, "${", b'{', b'}'))
+        || (lang == PYTHON && fstring_triple(text))
         || (lang == SCRIPT && (nested_template(text) || jsx_like(text)))
 }
 

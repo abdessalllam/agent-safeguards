@@ -2199,6 +2199,41 @@ fn what_the_twenty_first_review_found_is_refused_or_kept() {
 }
 
 #[test]
+fn what_the_twenty_second_review_found_is_refused_or_kept() {
+    let dir = temp_dir("trim-twentytwo");
+    let state = temp_dir("trim-twentytwo-state");
+    let path = dir.join("a.py");
+    let text = "# one\n# two\nx = 1\n";
+    assert!(matches!(trimming(Some(&state), Some("t22"), "Write", written(&path, text), Provider::Claude), Verdict::Allow));
+    std::fs::write(&path, text).expect("write");
+    assert!(matches!(trimming(Some(&state), Some("t22"), "Write", written(&path, text), Provider::Claude), Verdict::Allow));
+    let code = json!({ "file_path": path.to_string_lossy(), "old_string": "x = 1", "new_string": "x = 2" });
+    assert!(matches!(trimming(Some(&state), Some("t22"), "Edit", code, Provider::Claude), Verdict::Allow));
+    let not_cut = |name: &str, text: &str| {
+        let verdict = trimming(None, None, "Write", written(&dir.join(name), text), Provider::Claude);
+        assert!(!matches!(verdict, Verdict::Trimmed { .. }), "{name} was trimmed");
+    };
+    not_cut("j2.py", "x = f\"\"\"\n{\"\"\"\n# one\n# two\n# three\n# four\n\"\"\"}\n\"\"\"\ny = 1\n");
+    not_cut("j2b.py", "x = f'''\n{'''\n# one\n# two\n# three\n# four\n'''}\n'''\ny = 1\n");
+    let plain = "x = \"\"\"see the stuff\"\"\"\n# one\n# two\n# three\n# four\ny = 1\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("j2c.py"), plain), Provider::Claude));
+    assert_eq!(input["content"], "x = \"\"\"see the stuff\"\"\"\n# one\n# two\ny = 1\n");
+    let buff = "x = \"\"\"a buff\"\"\"\n# one\n# two\n# three\n# four\ny = 1\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("j2e.py"), buff), Provider::Claude));
+    assert_eq!(input["content"], "x = \"\"\"a buff\"\"\"\n# one\n# two\ny = 1\n");
+    let property = "const t = x.return / 2 + `abc/def\n// one\n// two\n// three\n// four\n`;\nconst z = 1;\n";
+    not_cut("j4b.js", property);
+    not_cut("j2d.swift", "let a = \"\\(\"\n// one\n// two\n// three\n// four\nlet x = 1\n");
+    not_cut("j2.swift", "let s = \"\"\"\n\\(\n\"\"\"\n// one\n// two\n// three\n// four\n\"\"\"\n)\n\"\"\"\nlet x = 1\n");
+    let raw = "package p\nvar s = `\\`\n// one\n// two\n// three\n// four\nvar x = 1\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("j3.go"), raw), Provider::Claude));
+    assert_eq!(input["content"], "package p\nvar s = `\\`\n// one\n// two\nvar x = 1\n");
+    not_cut("j4.js", "function f() {\nreturn /`/\nconst s = `\n// one\n// two\n// three\n// four\n`\nreturn s\n}\n");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
 fn harmless_look_alikes_do_not_stop_a_trim_and_a_huge_file_is_trimmed_quickly() {
     let dir = temp_dir("trim-alike");
     let shift = "n = 1 << 4\n# one\n# two\n# three\n# four\nx = 1\n";

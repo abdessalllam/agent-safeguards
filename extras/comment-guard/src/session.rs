@@ -412,7 +412,7 @@ impl Ledger {
             if current != expected {
                 return Err(current);
             }
-            if net == 0 {
+            if net == 0 || from == to {
                 return Ok(None);
             }
             let (total, since) = match stored.pending.as_ref() {

@@ -24,7 +24,7 @@ pub struct Language {
     pub escape: char,
     pub markup: bool,
     pub trim: bool,
-    pub raw_triple: bool,
+    pub raw_strings: bool,
 }
 
 const C_BLOCKS: &[(&str, &str)] = &[("/*", "*/")];
@@ -56,7 +56,7 @@ const BASE: Language = Language {
     escape: '\\',
     markup: false,
     trim: false,
-    raw_triple: false,
+    raw_strings: false,
 };
 
 pub const HASH: Language = Language { line: &["#"], ..BASE };
@@ -72,7 +72,7 @@ pub const SLASH: Language = Language { line: &["//"], block: C_BLOCKS, ..BASE };
 pub const CLIKE: Language = Language { trim: true, ..SLASH };
 pub const SCRIPT: Language = Language { line: &["//"], block: C_BLOCKS, backtick: true, regex: true, trim: true, ..BASE };
 pub const JSX: Language = Language { trim: false, ..SCRIPT };
-pub const GO: Language = Language { line: &["//"], block: C_BLOCKS, backtick: true, trim: true, ..BASE };
+pub const GO: Language = Language { line: &["//"], block: C_BLOCKS, backtick: true, trim: true, raw_strings: true, ..BASE };
 pub const RUST: Language = Language {
     line: &["//"],
     block: C_BLOCKS,
@@ -83,7 +83,7 @@ pub const RUST: Language = Language {
 };
 pub const TEXT: Language = Language { line: &["//"], block: C_BLOCKS, triple: TEXT_BLOCKS, trim: true, ..BASE };
 pub const SCALA: Language = Language { trim: false, ..TEXT };
-pub const KOTLIN: Language = Language { raw_triple: true, ..TEXT };
+pub const KOTLIN: Language = Language { raw_strings: true, ..TEXT };
 pub const SWIFT: Language = Language {
     line: &["//"],
     block: C_BLOCKS,
