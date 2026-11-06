@@ -102,4 +102,5 @@ def main():
     print("fuzz target records", len(records))
 
 
-main()
+if __name__ == "__main__":
+    main()
