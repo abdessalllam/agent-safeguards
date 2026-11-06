@@ -32,6 +32,15 @@ pub enum GlobError {
     Value(String),
 }
 
+impl From<GlobError> for Stop {
+    fn from(value: GlobError) -> Self {
+        match value {
+            GlobError::Stop(stop) => stop,
+            GlobError::Regex | GlobError::Attribute | GlobError::Value(_) => Stop::Internal,
+        }
+    }
+}
+
 impl From<Stop> for GlobError {
     fn from(value: Stop) -> Self {
         Self::Stop(value)

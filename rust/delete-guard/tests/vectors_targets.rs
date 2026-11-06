@@ -73,6 +73,7 @@ fn stop_result(result: Result<(), Stop>) -> (Value, Option<&'static str>) {
             }),
         ),
         Err(Stop::TooSlow) => (Value::Null, Some("CheckTooSlow")),
+        Err(Stop::Internal) => (Value::Null, Some("ValueError")),
     }
 }
 

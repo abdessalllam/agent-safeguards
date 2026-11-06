@@ -5,21 +5,28 @@ use std::fmt;
 pub enum Stop {
     Denied(Denied),
     TooSlow,
+    Internal,
 }
 
 impl Stop {
     pub fn as_denied(&self) -> Option<&Denied> {
         match self {
             Stop::Denied(denied) => Some(denied),
-            Stop::TooSlow => None,
+            Stop::TooSlow | Stop::Internal => None,
         }
     }
 
     pub fn is_remote(&self) -> bool {
         match self {
             Stop::Denied(denied) => denied.is_remote(),
-            Stop::TooSlow => false,
+            Stop::TooSlow | Stop::Internal => false,
         }
+    }
+}
+
+impl From<Denied> for Stop {
+    fn from(denied: Denied) -> Self {
+        Stop::Denied(denied)
     }
 }
 
@@ -79,5 +86,6 @@ mod tests {
         assert!(caught.is_remote());
         assert!(Stop::TooSlow.as_denied().is_none());
         assert!(!Stop::TooSlow.is_remote());
+        assert!(Stop::Internal.as_denied().is_none());
     }
 }

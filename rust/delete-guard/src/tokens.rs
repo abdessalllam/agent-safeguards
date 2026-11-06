@@ -425,6 +425,12 @@ pub enum ExpandError {
     ValueError,
 }
 
+impl From<ExpandError> for crate::errors::Stop {
+    fn from(_: ExpandError) -> Self {
+        crate::errors::Stop::Internal
+    }
+}
+
 pub fn expand(path: &str, cwd: Option<&str>) -> Result<Option<String>, ExpandError> {
     if variables_changed_state().contains("HOME") && HOME_FORM.is_match(path) {
         return Ok(None);

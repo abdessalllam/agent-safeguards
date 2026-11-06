@@ -87,6 +87,7 @@ fn fuzz_target_records_match_python() {
                 Some(if denied.is_remote() { "RemoteDenied" } else { "Denied" }),
             ),
             Err(GlobError::Stop(Stop::TooSlow)) => (Value::Null, Some("CheckTooSlow")),
+            Err(GlobError::Stop(Stop::Internal)) => (Value::Null, Some("ValueError")),
             Err(GlobError::Regex) => (Value::Null, Some("error")),
             Err(GlobError::Attribute) => (Value::Null, Some("AttributeError")),
             Err(GlobError::Value(_)) => (Value::Null, Some("ValueError")),
