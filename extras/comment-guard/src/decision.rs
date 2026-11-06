@@ -761,6 +761,10 @@ fn needs_pass(
 }
 
 pub fn trimmed(change: &Change) -> Option<Trimmed> {
+    trimmed_with(change, true)
+}
+
+pub fn trimmed_with(change: &Change, docstrings: bool) -> Option<Trimmed> {
     if change.partial {
         return None;
     }
@@ -846,7 +850,7 @@ pub fn trimmed(change: &Change) -> Option<Trimmed> {
         }
         if scanner.doc_end() {
             if let Some(doc) = open.take() {
-                if doc.fresh && !old_unclear && doc.statement && scanner.doc_pure() && !doc.shown.is_empty() {
+                if docstrings && doc.fresh && !old_unclear && doc.statement && scanner.doc_pure() && !doc.shown.is_empty() {
                     pieces.push(Piece {
                         first: doc.first,
                         last: index,

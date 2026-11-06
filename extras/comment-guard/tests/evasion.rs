@@ -2815,6 +2815,40 @@ fn the_remove_mode_drops_every_new_comment_of_a_call_over_the_limit() {
 }
 
 #[test]
+fn files_an_unfinished_merge_brought_in_are_not_cut() {
+    let rig = Rig::new("merge-docs");
+    init_repo(&rig.cwd);
+    let file = commit_file(&rig.cwd, "a.py", "def f():\n    return 1\n");
+    git(&rig.cwd, &["checkout", "-q", "-b", "feature"]);
+    let documented = "def f():\n    \"\"\"One.\n    Two.\n    Three.\n    \"\"\"\n    # a1\n    # a2\n    # a3\n    return 1\n";
+    std::fs::write(&file, documented).expect("write");
+    git(&rig.cwd, &["-c", "core.hooksPath=/dev/null", "commit", "-q", "-am", "docs"]);
+    git(&rig.cwd, &["checkout", "-q", "-"]);
+    std::fs::write(rig.cwd.join("b.txt"), "x\n").expect("write");
+    git(&rig.cwd, &["add", "b.txt"]);
+    git(&rig.cwd, &["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "other"]);
+    git(&rig.cwd, &["merge", "-q", "--no-commit", "--no-ff", "feature"]);
+    assert_eq!(std::fs::read_to_string(&file).expect("read"), documented);
+    let out = rig.bash(Some("mg"), "true");
+    assert!(out.is_empty(), "{out}");
+    assert_eq!(std::fs::read_to_string(&file).expect("read"), documented);
+    let again = rig.bash(Some("mg"), "python3 -c pass");
+    assert!(again.is_empty(), "{again}");
+    assert_eq!(std::fs::read_to_string(&file).expect("read"), documented);
+}
+
+#[test]
+fn a_docstring_written_by_a_command_is_reported_never_cut_on_disk() {
+    let rig = Rig::new("disk-docs");
+    let file = rig.cwd.join("d.py");
+    let text = format!("def f():\n    \"\"\"{}\"\"\"\n    return 1\n", "x".repeat(95));
+    std::fs::write(&file, &text).expect("write");
+    let out = after_trimming(&rig, "claude", "printf x > d.py");
+    assert!(out.contains("\"decision\":\"block\""), "{out}");
+    assert_eq!(std::fs::read_to_string(&file).expect("read"), text);
+}
+
+#[test]
 fn a_partial_edit_is_refused_not_trimmed() {
     let dir = temp_dir("trim-other");
     let all = dir.join("a.py");

@@ -150,14 +150,21 @@ pub(crate) fn widen_with_head(changes: &mut [Change], base: &Path) {
             continue;
         }
         let path = changes::resolve(base, &change.file);
-        let post::Head::Found(mut text) = post::head_text(&path, deadline) else {
-            continue;
-        };
-        if change.file.to_ascii_lowercase().ends_with(".ipynb") {
-            match changes::notebook_text(&text) {
-                Some(code) => text = code,
-                None => continue,
+        let mut texts: Vec<String> = Vec::new();
+        for rev in ["HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"] {
+            if let post::Head::Found(found) = post::rev_text(&path, rev, deadline) {
+                texts.push(found);
             }
+        }
+        if texts.is_empty() {
+            continue;
+        }
+        if change.file.to_ascii_lowercase().ends_with(".ipynb") {
+            let codes: Vec<String> = texts.iter().filter_map(|found| changes::notebook_text(found)).collect();
+            if codes.len() != texts.len() {
+                continue;
+            }
+            texts = codes;
         }
         let mut merged = change.baseline.clone().unwrap_or_else(|| comment_lines(&change.old, lang));
         let mut held: HashMap<String, usize> = HashMap::new();
@@ -165,8 +172,15 @@ pub(crate) fn widen_with_head(changes: &mut [Change], base: &Path) {
             *held.entry(line.clone()).or_insert(0) += 1;
         }
         let mut wanted: HashMap<String, usize> = HashMap::new();
-        for line in comment_lines(&text, lang) {
-            *wanted.entry(line).or_insert(0) += 1;
+        for text in &texts {
+            let mut here: HashMap<String, usize> = HashMap::new();
+            for line in comment_lines(text, lang) {
+                *here.entry(line).or_insert(0) += 1;
+            }
+            for (line, count) in here {
+                let slot = wanted.entry(line).or_insert(0);
+                *slot = (*slot).max(count);
+            }
         }
         for (line, count) in wanted {
             for _ in held.get(&line).copied().unwrap_or(0)..count {

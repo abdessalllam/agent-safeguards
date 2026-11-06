@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{Map, Value};
 
 use crate::changes::{read_source, resolve, MAX_OLD_FILE};
-use crate::decision::{comment_lines, evaluate, evaluate_after, trimmed, Change};
+use crate::decision::{comment_lines, evaluate, evaluate_after, trimmed_with, Change};
 use crate::git::{drop_marked, inside_repository, run_git};
 use crate::languages::language_for_file;
 use crate::session::{content_hash, identity, seen_of, Ledger};
@@ -171,7 +171,7 @@ fn trim_on_disk(change: &Change, cwd: &Path, ledger: &Ledger) -> Option<String> 
     if !inside || !meta.is_file() {
         return None;
     }
-    let cut = trimmed(change)?;
+    let cut = trimmed_with(change, false)?;
     if fs::read(path).ok()? != change.new.as_bytes() {
         return None;
     }
@@ -621,13 +621,17 @@ fn absent(stderr: &str, dir: &Path) -> bool {
 }
 
 pub(crate) fn head_text(path: &Path, deadline: Instant) -> Head {
+    rev_text(path, "HEAD", deadline)
+}
+
+pub(crate) fn rev_text(path: &Path, rev: &str, deadline: Instant) -> Head {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|name| name.to_str())) else {
         return Head::Unavailable;
     };
     if !inside_repository(dir) {
         return Head::Missing;
     }
-    let spec = format!("HEAD:./{name}");
+    let spec = format!("{rev}:./{name}");
     let Some(ran) = run_git(dir, &["show", &spec], None, deadline) else {
         return Head::Unavailable;
     };
