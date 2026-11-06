@@ -178,7 +178,21 @@ pub fn glob_walk(
     glob_walk_inner(base, parts, matches, visits, &context)
 }
 
+thread_local! {
+    static WALK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn glob_walk_inner(
+    base: &str,
+    parts: &[String],
+    matches: &mut Vec<String>,
+    visits: &mut usize,
+    context: &GlobWalkContext<'_>,
+) -> Result<(), GlobError> {
+    guard_common::depth::with_depth(&WALK_DEPTH, 978, || glob_walk_level(base, parts, matches, visits, context))
+}
+
+fn glob_walk_level(
     base: &str,
     parts: &[String],
     matches: &mut Vec<String>,
@@ -244,13 +258,15 @@ pub enum GlobToken {
     Star,
     Question,
     Literal(char),
-    Set(Regex),
+    Set(guard_common::pyengine::PyRegex),
 }
 
-fn class_fragment(fragment: &str) -> String {
-    fragment
-        .replace(r"\U0010ffff", r"\u{10ffff}")
-        .replace(r"\x80", r"\u{80}")
+fn python_escape(character: char) -> String {
+    if "()[]{}?*+-|^$\\.&~# \t\n\r\x0b\x0c".contains(character) {
+        format!("\\{character}")
+    } else {
+        character.to_string()
+    }
 }
 
 pub fn glob_tokens(pattern: &str) -> Result<Vec<GlobToken>, GlobError> {
@@ -308,7 +324,7 @@ pub fn glob_tokens(pattern: &str) -> Result<Vec<GlobToken>, GlobError> {
                                 consts::posix_class(&name)
                             };
                             if let Some(value) = value {
-                                members.push_str(&class_fragment(value));
+                                members.push_str(value);
                                 position = end.saturating_add(2);
                                 continue;
                             }
@@ -317,20 +333,16 @@ pub fn glob_tokens(pattern: &str) -> Result<Vec<GlobToken>, GlobError> {
                     if ch == '-' {
                         members.push('-')
                     } else {
-                        members.push_str(&regex::escape(&ch.to_string()))
+                        members.push_str(&python_escape(ch))
                     }
                     position = position.saturating_add(1);
                 }
                 if position >= chars.len() {
                     tokens.push(GlobToken::Literal(character));
                 } else {
-                    while let Some(at) = members.find("--") {
-                        let replacement = if at == 0 { at } else { at.saturating_add(1) };
-                        members.replace_range(replacement..replacement.saturating_add(1), r"\x2d");
-                    }
-                    let source = format!("\u{005b}{}{}]", if negate { "^" } else { "" }, members);
+                    let source = format!("[{}{}]", if negate { "^" } else { "" }, members);
                     tokens.push(GlobToken::Set(
-                        guard_common::pyre::new(&format!(r"\A(?:{source})\z")).map_err(|_| GlobError::Regex)?,
+                        guard_common::pyengine::PyRegex::new(&source).map_err(|_| GlobError::Regex)?,
                     ));
                     index = position;
                 }
@@ -347,7 +359,7 @@ pub fn glob_token_matches(token: &GlobToken, character: char) -> Result<bool, Gl
         GlobToken::Star => Err(GlobError::Attribute),
         GlobToken::Question => Ok(true),
         GlobToken::Literal(value) => Ok(*value == character),
-        GlobToken::Set(pattern) => Ok(pattern.is_match(&character.to_string())),
+        GlobToken::Set(pattern) => Ok(pattern.fullmatch_chars(&[character]).is_some()),
     }
 }
 

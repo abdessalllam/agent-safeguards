@@ -50,6 +50,7 @@ struct Flags {
     verbose: bool,
 }
 
+#[derive(Clone, Debug)]
 pub struct PyRegex {
     root: Node,
     groups: usize,

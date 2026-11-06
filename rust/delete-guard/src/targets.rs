@@ -287,7 +287,7 @@ pub fn location_path(raw: &str, verb: &str, strict: bool) -> Result<String, Glob
             return Err(GlobError::Value(
                 "An IPv4 address cannot be in brackets".to_owned(),
             ));
-        } else if host.parse::<Ipv6Addr>().is_err() {
+        } else if scoped_ipv6_is_invalid(host) {
             return Err(GlobError::Value(format!(
                 "'{host}' does not appear to be an IPv4 or IPv6 address"
             )));
@@ -306,6 +306,14 @@ pub fn location_path(raw: &str, verb: &str, strict: bool) -> Result<String, Glob
     } else {
         Ok(raw.to_owned())
     }
+}
+
+fn scoped_ipv6_is_invalid(host: &str) -> bool {
+    let (address, scope) = match host.split_once('%') {
+        Some((address, scope)) => (address, Some(scope)),
+        None => (host, None),
+    };
+    scope.is_some_and(|scope| scope.is_empty() || scope.contains('%')) || address.parse::<Ipv6Addr>().is_err()
 }
 
 pub fn in_trash(path: &str) -> bool {

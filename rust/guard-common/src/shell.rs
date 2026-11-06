@@ -778,7 +778,7 @@ fn rstrip_space_tab(text: &str) -> &str {
 
 // Python treats U+001C..=U+001F as whitespace, including the redirect marker.
 fn python_isspace(ch: char) -> bool {
-    ch.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&ch)
+    crate::pychars::is_space(ch)
 }
 
 fn python_strip(text: &str) -> &str {
@@ -1258,7 +1258,15 @@ fn closing_backtick_chars(chars: &[char], start: usize) -> usize {
     chars.len()
 }
 
+thread_local! {
+    static SUBSTITUTION_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn command_substitutions_chars(chars: &[char]) -> Vec<String> {
+    crate::depth::with_depth(&SUBSTITUTION_DEPTH, 995, || command_substitutions_level(chars))
+}
+
+fn command_substitutions_level(chars: &[char]) -> Vec<String> {
     let mut bodies = Vec::new();
     let length = chars.len();
     let mut quote: Option<char> = None;
@@ -1449,7 +1457,7 @@ fn letter_range(start: &str, end: &str, step: &str) -> Result<Option<Vec<String>
 fn py_isdigit(text: &str) -> bool {
     let mut seen = false;
     for ch in text.chars() {
-        if ch.to_digit(10).is_none() {
+        if crate::pychars::decimal_value(ch).is_none() {
             return false;
         }
         seen = true;
@@ -1498,11 +1506,7 @@ fn directory_choice<'a>(base: &str, names: &'a [String]) -> Option<&'a str> {
 fn split_attached(option: &str) -> Option<String> {
     if option.starts_with("--") {
         let value = option.split_once('=').map(|(_, value)| value)?;
-        if value.is_empty() {
-            None
-        } else {
-            Some(value.to_string())
-        }
+        Some(value.to_string())
     } else {
         let rest: String = option.chars().skip(1).collect();
         let (_, value) = rest.split_once('S')?;
@@ -1751,7 +1755,7 @@ fn parse_int(text: &str) -> Option<Big> {
     }
     let mut d = Vec::new();
     for ch in chars.iter().skip(start) {
-        d.push(u8::try_from(ch.to_digit(10)?).ok()?);
+        d.push(u8::try_from(crate::pychars::decimal_value(*ch)?).ok()?);
     }
     d.reverse();
     let d = normalize_digits(d);
@@ -1796,6 +1800,22 @@ mod tests {
         normalize_command, option_names, split_options, strip_wrappers_with_directory,
         unquoted_lines, unquoted_text, HereDocument, ASSIGNMENT, DURATION, HEREDOC_FORBIDDEN,
     };
+
+    #[test]
+    fn an_empty_long_split_string_does_not_take_the_next_word() {
+        let words: Vec<String> = ["env", "--split-string=", "rm -rf /"].map(String::from).to_vec();
+        let (rest, _) = strip_wrappers_with_directory(&words, &std::collections::HashSet::<&str>::new()).expect("strip");
+        assert_eq!(rest, vec!["rm -rf /".to_owned()]);
+    }
+
+    #[test]
+    fn brace_ranges_read_unicode_decimal_digits_like_python() {
+        assert_eq!(expand_braces("{1..\u{662}}"), Ok(Some(vec!["2".to_owned(), "1".to_owned()])));
+        assert_eq!(
+            expand_braces("{\u{661}..\u{662}}"),
+            Ok(Some(vec!["2".to_owned(), "1".to_owned()]))
+        );
+    }
     use std::collections::HashSet;
 
     fn owned(words: &[&str]) -> Vec<String> {

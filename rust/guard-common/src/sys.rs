@@ -182,8 +182,8 @@ fn join_realpath(
     seen: &mut HashMap<String, Option<String>>,
     depth: usize,
 ) -> (String, bool) {
-    if depth > 256 {
-        return (join_paths(&[&path, rest]), false);
+    if depth > 960 {
+        std::panic::panic_any(crate::depth::RecursionLimit);
     }
     if rest.starts_with('/') {
         rest = rest.get(1..).unwrap_or("");

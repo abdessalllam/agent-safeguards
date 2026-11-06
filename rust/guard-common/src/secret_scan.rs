@@ -242,14 +242,7 @@ re!(separators_re, r"[-_/.+:]+");
 
 /// Python `isdigit` is narrower than `char::is_numeric` (fractions, roman numerals) and wider than ASCII.
 fn py_isdigit(ch: char) -> bool {
-    if ch.is_ascii_digit() {
-        return true;
-    }
-    ch.is_numeric()
-        && !matches!(
-            ch,
-            '\u{00BC}'..='\u{00BE}' | '\u{2150}'..='\u{215F}' | '\u{2160}'..='\u{2188}'
-        )
+    crate::pychars::is_digit(ch)
 }
 
 fn py_isupper(value: &str) -> bool {
@@ -315,7 +308,7 @@ pub fn ascending_run(value: &str, length: usize) -> bool {
     };
     let mut run = 1usize;
     for current in chars {
-        if (current as u32) == (previous as u32).saturating_add(1) && current.is_alphanumeric() {
+        if (current as u32) == (previous as u32).saturating_add(1) && crate::pychars::is_alnum(current) {
             run = run.saturating_add(1);
         } else {
             run = 1;
@@ -522,7 +515,7 @@ pub fn plausible_value(label: &str, value: &str) -> Result<bool, PyErr> {
     }
     if value
         .chars()
-        .any(|ch| py_isdigit(ch) || ch.is_uppercase() || !ch.is_alphanumeric())
+        .any(|ch| py_isdigit(ch) || ch.is_uppercase() || !crate::pychars::is_alnum(ch))
     {
         return Ok(true);
     }

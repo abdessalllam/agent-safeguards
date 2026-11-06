@@ -61,7 +61,7 @@ for _ in range(300):
     record("remote_literal", [value], lambda v=value: GUARD._remote_literal(v), quoted=[value])
     record("quoted_literal_words", [value], lambda v=value: sorted(GUARD._quoted_literal_words(v)))
 
-for value in ["file:/tmp/a", "file:///tmp/a", "FILE://localhost/tmp/a%20b", "file://other/tmp/a", "sftp://host/a", "trash:/a", "TRASH:/a", "abc:/x", "file:/tmp/%FF", "file:/tmp/a?x#y", "file:///tmp/%C3%A9", "file:/tmp/a%2Fb", "file:/tmp/a\nb", "file:/tmp/a\tb", "file://[bad/path", "file://[bad]/path", "file://[127.0.0.1]/x", "file://[v.bad]/x", "file://[v1.a]/x", "file://[V1.a]/x", "sftp://[bad/path", "file://／localhost/tmp", "sftp://？host/x", "file://a'／b/x", "relative/path", "", "file:/"]:
+for value in ["file:/tmp/a", "file:///tmp/a", "FILE://localhost/tmp/a%20b", "file://other/tmp/a", "sftp://host/a", "trash:/a", "TRASH:/a", "abc:/x", "file:/tmp/%FF", "file:/tmp/a?x#y", "file:///tmp/%C3%A9", "file:/tmp/a%2Fb", "file:/tmp/a\nb", "file:/tmp/a\tb", "file://[bad/path", "file://[bad]/path", "file://[127.0.0.1]/x", "file://[v.bad]/x", "file://[::1%eth0]/x", "file://[::1%25eth0]/x", "file://[::1%]/x", "file://[::1%a%b]/x", "file://[fe80::1%en0]/tmp/a", "file://[1.2.3.4%eth0]/x", "file://[v1.a]/x", "file://[V1.a]/x", "sftp://[bad/path", "file://／localhost/tmp", "sftp://？host/x", "file://a'／b/x", "relative/path", "", "file:/"]:
     for strict in [False, True]:
         record("location_path", [value, "rm", strict], lambda v=value, s=strict: GUARD._location_path(v, "rm", strict=s))
         record("location_path", [value, "rm", strict], lambda v=value, s=strict: GUARD._location_path(v, "rm", strict=s), remote=("/tmp",))

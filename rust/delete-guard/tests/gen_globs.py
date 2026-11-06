@@ -111,3 +111,20 @@ with EXHAUSTIVE.open("w", encoding="utf-8") as output:
                 result = None
                 error = type(exception).__name__
             output.write(pattern.encode("utf-8").hex() + "\t" + json.dumps([result, error], separators=(",", ":")) + "\n")
+
+with EXHAUSTIVE.open("a", encoding="utf-8") as output:
+    import random as _random
+
+    rng = _random.Random(0x6106)
+    longer = ["[z-z--c]", "[--a]", "[a--]", "[!--]", "[^-a-]", "[a-z-0]", "[[:alpha:]-z]", "[]-a]", "[a-\\]]"]
+    for _ in range(30000):
+        longer.append("".join(rng.choice("[]!^-az0:\\*?é") for _ in range(rng.randint(5, 12))))
+    for pattern in longer:
+        try:
+            tokens = GUARD._glob_tokens(pattern)
+            result = [GUARD._glob_match(tokens, name) for name in ("", "a", "0", "]", "é")]
+            error = None
+        except Exception as exception:
+            result = None
+            error = type(exception).__name__
+        output.write(pattern.encode("utf-8").hex() + "\t" + json.dumps([result, error], separators=(",", ":")) + "\n")

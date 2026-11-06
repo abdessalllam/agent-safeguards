@@ -631,7 +631,15 @@ pub fn device_redirect_hint(text: &str) -> bool {
     false
 }
 
+thread_local! {
+    static CHECK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn check_command(command: &str, cwd: Option<&str>) -> Result<(), Stop> {
+    guard_common::depth::with_depth(&CHECK_DEPTH, 245, || check_command_level(command, cwd))
+}
+
+fn check_command_level(command: &str, cwd: Option<&str>) -> Result<(), Stop> {
     let command_owned = if command.contains("<<") {
         without_text_heredocs(command)
     } else {

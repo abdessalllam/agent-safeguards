@@ -101,41 +101,51 @@ pub fn run(command: &[String], cwd: &str, timeout: u64) -> Option<ProcessResult>
     let stdout = child.stdout.take()?;
     let stderr = child.stderr.take()?;
     // A reader per pipe, otherwise a full stderr buffer stalls the child before stdout is drained.
-    let stdout_thread = thread::spawn(move || read_pipe(stdout));
-    let stderr_thread = thread::spawn(move || read_pipe(stderr));
+    let (sender, receiver) = std::sync::mpsc::channel::<(bool, Vec<u8>)>();
+    let out_sender = sender.clone();
+    thread::spawn(move || {
+        let _ = out_sender.send((true, read_pipe(stdout)));
+    });
+    thread::spawn(move || {
+        let _ = sender.send((false, read_pipe(stderr)));
+    });
     let deadline = Instant::now() + Duration::from_secs(timeout);
+    let (mut stdout_bytes, mut stderr_bytes, mut status) = (None, None, None);
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout_bytes = stdout_thread.join().ok()?;
-                let stderr_bytes = stderr_thread.join().ok()?;
-                if stdout_bytes.len() > MAX_OUTPUT_BYTES || stderr_bytes.len() > MAX_OUTPUT_BYTES {
-                    return None;
-                }
-                return Some(ProcessResult {
-                    returncode: status_code(status),
-                    stdout: stdout_bytes,
-                    stderr: stderr_bytes,
-                });
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stdout_thread.join();
-                    let _ = stderr_thread.join();
-                    return None;
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                return None;
+        while let Ok((is_stdout, bytes)) = receiver.try_recv() {
+            if is_stdout {
+                stdout_bytes = Some(bytes);
+            } else {
+                stderr_bytes = Some(bytes);
             }
         }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(found)) => status = Some(found),
+                Ok(None) => {}
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+        if let (Some(stdout_bytes), Some(stderr_bytes), Some(status)) = (&stdout_bytes, &stderr_bytes, status) {
+            if stdout_bytes.len() > MAX_OUTPUT_BYTES || stderr_bytes.len() > MAX_OUTPUT_BYTES {
+                return None;
+            }
+            return Some(ProcessResult {
+                returncode: status_code(status),
+                stdout: stdout_bytes.clone(),
+                stderr: stderr_bytes.clone(),
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -226,5 +236,17 @@ mod tests {
         } else {
             assert!(!values.contains_key("SSH_AUTH_SOCK"));
         }
+    }
+
+    #[test]
+    fn a_descendant_holding_the_pipe_ends_at_the_deadline() {
+        let started = Instant::now();
+        let result = run(
+            &["/bin/sh".to_owned(), "-c".to_owned(), "/bin/sleep 3 & exit 0".to_owned()],
+            "/",
+            1,
+        );
+        assert!(result.is_none());
+        assert!(started.elapsed().as_millis() < 2500);
     }
 }

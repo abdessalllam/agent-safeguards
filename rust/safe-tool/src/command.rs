@@ -273,7 +273,15 @@ pub fn names_non_template_data_env(lowered: &str) -> bool {
     false
 }
 
+thread_local! {
+    static COMMAND_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn sensitive_command(command: &str, data_heredocs: bool) -> Result<bool, EmbeddedNul> {
+    guard_common::depth::with_depth(&COMMAND_DEPTH, 330, || sensitive_command_level(command, data_heredocs))
+}
+
+fn sensitive_command_level(command: &str, data_heredocs: bool) -> Result<bool, EmbeddedNul> {
     if command.chars().count() > shell::MAX_COMMAND_CHARS {
         return Ok(true);
     }

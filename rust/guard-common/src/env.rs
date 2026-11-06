@@ -19,7 +19,7 @@ pub fn is_truthy(value: &str) -> bool {
     // Python `str.strip`/`lower` are Unicode-aware. `trim`/`to_lowercase` follow Rust's
     // whitespace and casefold tables, which differ for a few non-ASCII characters.
     matches!(
-        value.trim().to_lowercase().as_str(),
+        crate::pychars::strip(value).to_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
 }

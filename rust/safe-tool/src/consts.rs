@@ -85,7 +85,7 @@ pub const HOOK_BUDGET_SECONDS: f64 = 3.0;
 const PROXY_PREFIX_SRC: &str = "\\brtk\\s+proxy\\b";
 pub static PROXY_PREFIX: LazyLock<Regex> = LazyLock::new(|| compile(PROXY_PREFIX_SRC));
 
-const EVENT_PATTERN_SRC: &str = "\"hook_event_name\"\\s*:\\s*\"(PreToolUse|PostToolUse|SessionStart)\"";
+const EVENT_PATTERN_SRC: &str = "\"hook_event_name\"[\\t\\n\\x0b\\x0c\\r ]*:[\\t\\n\\x0b\\x0c\\r ]*\"(PreToolUse|PostToolUse|SessionStart)\"";
 pub static EVENT_PATTERN: LazyLock<regex::bytes::Regex> = LazyLock::new(|| match regex::bytes::Regex::new(EVENT_PATTERN_SRC) {
     Ok(compiled) => compiled,
     Err(error) => panic!("constant pattern failed to compile: {error}"),
@@ -368,10 +368,6 @@ const LOCAL_ONLY_ENTRY_SRC: &str = "[A-Za-z0-9._][A-Za-z0-9._/-]*";
 pub static LOCAL_ONLY_ENTRY: LazyLock<Regex> = LazyLock::new(|| compile(LOCAL_ONLY_ENTRY_SRC));
 pub static LOCAL_ONLY_ENTRY_FULL: LazyLock<Regex> = LazyLock::new(|| compile(&format!(r"\A(?:{LOCAL_ONLY_ENTRY_SRC})\z")));
 
-static HIST_CORE: LazyLock<Regex> = LazyLock::new(|| compile("(?i)(?:^|[\\s\\\"'=:(<>|;&/{`])(?:\\.(?P<name>zsh_history|bash_history|sh_history|history|zhistory|python_history|psql_history|mysql_history|sqlite_history|node_repl_history|irb_history|rediscli_history|dbshell|viminfo|lesshst|Rhistory)|\\.(?P<folder>zsh_sessions|bash_sessions|local/share/fish|local/state/zsh|local/share/zsh|cache/zsh|local/share/atuin))"));
-static HIST_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:(?i)(?:^|[\\s\\\"'=:(<>|;&/{`])(?:\\.(?P<name>zsh_history|bash_history|sh_history|history|zhistory|python_history|psql_history|mysql_history|sqlite_history|node_repl_history|irb_history|rediscli_history|dbshell|viminfo|lesshst|Rhistory)|\\.(?P<folder>zsh_sessions|bash_sessions|local/share/fish|local/state/zsh|local/share/zsh|cache/zsh|local/share/atuin)))\\z"));
-static FILE_CORE: LazyLock<Regex> = LazyLock::new(|| compile("(?i)(?:^|[\\s\\\"'=:(<>|;&/{`])(?:\\.(?P<rc>zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|login|logout|kshrc|cshrc|tcshrc)(?P<rc_end>[^A-Za-z0-9_]|$)|\\.(?P<folder>zsh|zprezto/runcoms|oh-my-zsh/custom|config/fish|config/zsh|config/bash)/|(?P<system>(?:/private)?/etc/(?:zshrc|zprofile|zshenv|zlogin|zlogout|profile|bashrc|bash\\.bashrc|environment)|(?:/private)?/etc/(?:zsh|bash|profile\\.d)/)|\\.(?P<folder2>zsh|zprezto/runcoms|oh-my-zsh/custom|config/fish|config/zsh|config/bash)(?P<f2_end>/|[\\s\\\"';&|()<>`]|$)|\\.(?P<hname>zsh_history|bash_history|sh_history|history|zhistory|python_history|psql_history|mysql_history|sqlite_history|node_repl_history|irb_history|rediscli_history|dbshell|viminfo|lesshst|Rhistory)(?P<hn_end>[^A-Za-z0-9_]|$)|\\.(?P<hfolder>zsh_sessions|bash_sessions|local/share/fish|local/state/zsh|local/share/zsh|cache/zsh|local/share/atuin)(?P<hf_end>/|[\\s\\\"';&|()<>`]|$))"));
-static FILE_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:(?i)(?:^|[\\s\\\"'=:(<>|;&/{`])(?:\\.(?P<rc>zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|login|logout|kshrc|cshrc|tcshrc)(?P<rc_end>[^A-Za-z0-9_]|$)|\\.(?P<folder>zsh|zprezto/runcoms|oh-my-zsh/custom|config/fish|config/zsh|config/bash)/|(?P<system>(?:/private)?/etc/(?:zshrc|zprofile|zshenv|zlogin|zlogout|profile|bashrc|bash\\.bashrc|environment)|(?:/private)?/etc/(?:zsh|bash|profile\\.d)/)|\\.(?P<folder2>zsh|zprezto/runcoms|oh-my-zsh/custom|config/fish|config/zsh|config/bash)(?P<f2_end>/|[\\s\\\"';&|()<>`]|$)|\\.(?P<hname>zsh_history|bash_history|sh_history|history|zhistory|python_history|psql_history|mysql_history|sqlite_history|node_repl_history|irb_history|rediscli_history|dbshell|viminfo|lesshst|Rhistory)(?P<hn_end>[^A-Za-z0-9_]|$)|\\.(?P<hfolder>zsh_sessions|bash_sessions|local/share/fish|local/state/zsh|local/share/zsh|cache/zsh|local/share/atuin)(?P<hf_end>/|[\\s\\\"';&|()<>`]|$)))\\z"));
 static BLOB_CORE: LazyLock<Regex> = LazyLock::new(|| compile("[A-Za-z0-9_./~^@+-]{0,200}:[^\\s/]\\S{0,499}"));
 static BLOB_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:[A-Za-z0-9_./~^@+-]{0,200}:[^\\s/]\\S{0,499})\\z"));
 static PIPE_CORE: LazyLock<Regex> = LazyLock::new(|| compile("\\||`|\\$\\(|[<>]\\("));
@@ -384,10 +380,6 @@ static UN_A_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A-i?regex\\b\\z"
 static UN_B_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A[ \\t](?:-not|-or|-o|!)\\z"));
 static JQ_CORE: LazyLock<Regex> = LazyLock::new(|| compile("(?:\\$ENV|env|strenv)\\b"));
 static JQ_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:(?:\\$ENV|env|strenv)\\b)\\z"));
-static REMOTE_CORE: LazyLock<Regex> = LazyLock::new(|| compile("(?i)/etc/(?:shadow|gshadow|sudoers|ssh/ssh_host|ssl/private)|/root(?:/|\\b)|~root|/proc/|\\.ssh(?:/|\\b)|\\.git-credentials|\\.docker/config|\\.kube/|\\.aws/|\\.gnupg|/\\.config/"));
-static REMOTE_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:(?i)/etc/(?:shadow|gshadow|sudoers|ssh/ssh_host|ssl/private)|/root(?:/|\\b)|~root|/proc/|\\.ssh(?:/|\\b)|\\.git-credentials|\\.docker/config|\\.kube/|\\.aws/|\\.gnupg|/\\.config/)\\z"));
-static URL_CORE: LazyLock<Regex> = LazyLock::new(|| compile("(?i)[a-z][a-z0-9+.-]*://[^\\s\\\"'<>`]+"));
-static URL_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:(?i)[a-z][a-z0-9+.-]*://[^\\s\\\"'<>`]+)\\z"));
 static BARE_CORE: LazyLock<Regex> = LazyLock::new(|| compile("(\\d{1,3}(?:\\.\\d{1,3}){3})"));
 static BARE_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(\\d{1,3}(?:\\.\\d{1,3}){3})\\z"));
 static EMU_CORE: LazyLock<Regex> = LazyLock::new(|| compile("10\\.0\\.(?:2\\.\\d{1,3}|3\\.2)"));
@@ -397,8 +389,6 @@ static PRIV4_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:(?:10(?:\\.
 static IPV4_WITH: LazyLock<Regex> = LazyLock::new(|| compile("(\\d{1,3}(?:\\.\\d{1,3}){3})(?::\\d{1,5})?"));
 static IPV4_SHORT: LazyLock<Regex> = LazyLock::new(|| compile("(\\d{1,3}(?:\\.\\d{1,3}){3})"));
 static IPV4_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(\\d{1,3}(?:\\.\\d{1,3}){3})(?::\\d{1,5})?\\z"));
-static LABEL_CORE: LazyLock<Regex> = LazyLock::new(|| compile("(?i)\\b(?:inet|ipv4 address(?: for [^\\s:]{1,32})?|ip address(?:es)?|public ip|external ip|server ip|remote ip)\\b(?:[ \\t]{0,16}[:=][ \\t]{0,16}|[ \\t]{1,16})(\\d{1,3}(?:\\.\\d{1,3}){3})"));
-static LABEL_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:(?i)\\b(?:inet|ipv4 address(?: for [^\\s:]{1,32})?|ip address(?:es)?|public ip|external ip|server ip|remote ip)\\b(?:[ \\t]{0,16}[:=][ \\t]{0,16}|[ \\t]{1,16})(\\d{1,3}(?:\\.\\d{1,3}){3}))\\z"));
 static SENSITIVE_CORE: LazyLock<Regex> = LazyLock::new(|| compile("(?:^|[\\s\\\"'=:(<>|;&/])(?:\\.pgpass|\\.my\\.cnf|\\.git-credentials|\\.vault-token|\\.dev\\.vars|\\.envrc|id_(?:rsa|dsa|ecdsa|ed25519)(?:_[a-z0-9]+)?|credentials\\.json|secrets?\\.(?:json|ya?ml|toml)|service[-_]account[^\\s\\\"'|;&<>()=:/]{0,256}\\.json|kubeconfig|terraform\\.tfstate(?:\\.backup)?|[^\\s\\\"'|;&<>()=:/]{0,256}\\.(?:pem|key|p12|pfx|jks|keystore|p8|tfstate|tfvars))"));
 static SENSITIVE_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:(?:^|[\\s\\\"'=:(<>|;&/])(?:\\.pgpass|\\.my\\.cnf|\\.git-credentials|\\.vault-token|\\.dev\\.vars|\\.envrc|id_(?:rsa|dsa|ecdsa|ed25519)(?:_[a-z0-9]+)?|credentials\\.json|secrets?\\.(?:json|ya?ml|toml)|service[-_]account[^\\s\\\"'|;&<>()=:/]{0,256}\\.json|kubeconfig|terraform\\.tfstate(?:\\.backup)?|[^\\s\\\"'|;&<>()=:/]{0,256}\\.(?:pem|key|p12|pfx|jks|keystore|p8|tfstate|tfvars)))\\z"));
 static GIT_CORE: LazyLock<Regex> = LazyLock::new(|| compile("/\\.config/git/config|/\\.git/config|/\\.gitconfig|(?:^|[\\s\\\"'=:(<>|;&/])\\.config/git/config|(?:^|[\\s\\\"'=:(<>|;&/])\\.git/config|(?:^|[\\s\\\"'=:(<>|;&/])\\.gitconfig"));
@@ -407,8 +397,6 @@ static PATH_CORE: LazyLock<Regex> = LazyLock::new(|| compile("/\\.aws/credential
 static PATH_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:/\\.aws/credentials|/\\.config/gh/hosts\\.yml|/\\.config/git/config|/\\.docker/config\\.json|/\\.git/config|/\\.git/objects/|/\\.gnupg/|/\\.kube/config|/\\.netrc|/\\.npmrc|/\\.pypirc|/\\.ssh/|/\\.gitconfig|(?:^|[\\s\\\"'=:(<>|;&])\\.aws/credentials|(?:^|[\\s\\\"'=:(<>|;&])\\.config/gh/hosts\\.yml|(?:^|[\\s\\\"'=:(<>|;&])\\.config/git/config|(?:^|[\\s\\\"'=:(<>|;&])\\.docker/config\\.json|(?:^|[\\s\\\"'=:(<>|;&])\\.git/config|(?:^|[\\s\\\"'=:(<>|;&])\\.git/objects/|(?:^|[\\s\\\"'=:(<>|;&])\\.gnupg/|(?:^|[\\s\\\"'=:(<>|;&])\\.kube/config|(?:^|[\\s\\\"'=:(<>|;&])\\.netrc|(?:^|[\\s\\\"'=:(<>|;&])\\.npmrc|(?:^|[\\s\\\"'=:(<>|;&])\\.pypirc|(?:^|[\\s\\\"'=:(<>|;&])\\.ssh/|(?:^|[\\s\\\"'=:(<>|;&])\\.gitconfig)\\z"));
 static IPV6_CORE: LazyLock<Regex> = LazyLock::new(|| compile("((?:[0-9A-Fa-f]{0,4}:){2,7}(?:\\d{1,3}(?:\\.\\d{1,3}){3}|[0-9A-Fa-f]{0,4})(?:%[A-Za-z0-9_.-]{1,32})?)(?:$|[^\\w:.]|\\.(?:$|[^\\w]))"));
 static IPV6_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:(?:[0-9A-Fa-f]{0,4}:){2,7}(?:\\d{1,3}(?:\\.\\d{1,3}){3}|[0-9A-Fa-f]{0,4})(?:%[A-Za-z0-9_.-]{1,32})?)\\z"));
-static PRIV6_CORE: LazyLock<Regex> = LazyLock::new(|| compile("(?i)((?:fe80|f[cd][0-9a-f]{2}|[23][0-9a-f]{3})(?:(?::[0-9a-f]{1,4}){7}|(?::[0-9a-f]{1,4}){0,6}::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,5})?|(?::[0-9a-f]{1,4}){5}:\\d{1,3}(?:\\.\\d{1,3}){3}|(?::[0-9a-f]{1,4}){0,4}::(?:[0-9a-f]{1,4}:){0,3}\\d{1,3}(?:\\.\\d{1,3}){3}))(?:$|[^\\w:])"));
-static PRIV6_FULL: LazyLock<Regex> = LazyLock::new(|| compile("(?i)\\A(?:(?:fe80|f[cd][0-9a-f]{2}|[23][0-9a-f]{3})(?:(?::[0-9a-f]{1,4}){7}|(?::[0-9a-f]{1,4}){0,6}::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,5})?|(?::[0-9a-f]{1,4}){5}:\\d{1,3}(?:\\.\\d{1,3}){3}|(?::[0-9a-f]{1,4}){0,4}::(?:[0-9a-f]{1,4}:){0,3}\\d{1,3}(?:\\.\\d{1,3}){3}))\\z"));
 static USER_BRACKET: LazyLock<Regex> = LazyLock::new(|| compile("[A-Za-z0-9._%+-]{1,64}@\\[((?:[0-9A-Fa-f]{0,4}:){2,7}(?:\\d{1,3}(?:\\.\\d{1,3}){3}|[0-9A-Fa-f]{0,4})(?:%[A-Za-z0-9_.-]{1,32})?)\\]"));
 static USER_PLAIN: LazyLock<Regex> = LazyLock::new(|| compile("[A-Za-z0-9._%+-]{1,64}@((?:[0-9A-Fa-f]{0,4}:){2,7}(?:\\d{1,3}(?:\\.\\d{1,3}){3}|[0-9A-Fa-f]{0,4})(?:%[A-Za-z0-9_.-]{1,32})?)(?:$|[^\\w:.]|\\.(?:$|[^\\w]))"));
 static USER_BRACKET_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A[A-Za-z0-9._%+-]{1,64}@\\[((?:[0-9A-Fa-f]{0,4}:){2,7}(?:\\d{1,3}(?:\\.\\d{1,3}){3}|[0-9A-Fa-f]{0,4})(?:%[A-Za-z0-9_.-]{1,32})?)\\]\\z"));
@@ -447,11 +435,7 @@ fn prefix_has(class: &regex::Regex, text: &str, index: usize) -> bool {
 }
 
 static WORD_DOT: LazyLock<regex::Regex> = LazyLock::new(|| compile(r"\A[\w.]\z"));
-static WORD_DOT_DASH: LazyLock<regex::Regex> = LazyLock::new(|| compile(r"\A[\w.-]\z"));
 static WORD_COLON_DOT: LazyLock<regex::Regex> = LazyLock::new(|| compile(r"\A[\w:.]\z"));
-static WORD_COLON: LazyLock<regex::Regex> = LazyLock::new(|| compile(r"\A[\w:]\z"));
-static SCHEME_CHAR: LazyLock<regex::Regex> = LazyLock::new(|| compile(r"(?i)\A[a-z0-9+.-]\z"));
-static NAME_END_CHAR: LazyLock<regex::Regex> = LazyLock::new(|| compile(r#"\A[\s\"';&|()<>`]\z"#));
 static WS_COLON: LazyLock<regex::Regex> = LazyLock::new(|| compile(r"\A\s*:"));
 static IPV4_TAIL: LazyLock<regex::Regex> = LazyLock::new(|| compile(r"\A(?:\w|\.\w)"));
 static PRIV4_TAIL: LazyLock<regex::Regex> = LazyLock::new(|| compile(r"\A(?:\w|\.\d)"));
@@ -471,11 +455,6 @@ static LOGIN_FORBIDDEN: LazyLock<regex::Regex> =
     LazyLock::new(|| compile(r"\Alocalhost\b|127\.|\[?::1\b"));
 static LOGIN_FORBIDDEN_SHORT: LazyLock<regex::Regex> =
     LazyLock::new(|| compile(r"\Alocalhost\b|127\."));
-static DOC_PREFIX: LazyLock<regex::Regex> = LazyLock::new(|| compile(r"(?i)\A2001:0?db8:"));
-
-fn ascii_word(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
-}
 
 fn ascii_file_tail(ch: char) -> bool {
     ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-'
@@ -565,54 +544,6 @@ fn match_of(hits: Vec<Found>) -> Option<Found> {
     }
 }
 
-fn name_end_ok(text: &str, end: usize) -> bool {
-    match char_at(text, end) {
-        None => true,
-        Some('/') => true,
-        Some(ch) => class_has(&NAME_END_CHAR, ch),
-    }
-}
-
-fn alnum_boundary(text: &str, end: usize) -> bool {
-    match char_at(text, end) {
-        None => true,
-        Some(ch) => !ascii_word(ch),
-    }
-}
-
-fn accept_hist(text: &str, caps: &Captures<'_>) -> bool {
-    if caps.name("name").is_some() {
-        alnum_boundary(text, caps.get(0).map(|item| item.end()).unwrap_or(0))
-    } else {
-        name_end_ok(text, caps.get(0).map(|item| item.end()).unwrap_or(0))
-    }
-}
-
-fn file_span(caps: &Captures<'_>) -> Option<(usize, usize)> {
-    let whole = caps.get(0)?;
-    let mut end = whole.end();
-    for name in ["rc_end", "hn_end", "f2_end", "hf_end"] {
-        if let Some(extra) = caps.name(name) {
-            if extra.start() != extra.end() {
-                end = extra.start();
-            }
-        }
-    }
-    Some((whole.start(), end))
-}
-
-fn accept_file(text: &str, caps: &Captures<'_>) -> bool {
-    if caps.name("system").is_none() {
-        return true;
-    }
-    let end = caps.get(0).map(|item| item.end()).unwrap_or(0);
-    let whole = caps.get(0).map(|item| item.as_str()).unwrap_or("");
-    if whole.ends_with('/') {
-        return true;
-    }
-    alnum_boundary(text, end)
-}
-
 fn accept_pipe(text: &str, caps: &Captures<'_>) -> bool {
     let Some(whole) = caps.get(0) else {
         return false;
@@ -642,30 +573,6 @@ fn accept_jq(text: &str, caps: &Captures<'_>) -> bool {
         }
     }
     !prefix_has(&WS_COLON, text, whole.end())
-}
-
-fn accept_remote(text: &str, caps: &Captures<'_>) -> bool {
-    let Some(whole) = caps.get(0) else {
-        return false;
-    };
-    if whole.as_str().to_lowercase().ends_with("~root") {
-        if let Some(ch) = char_at(text, whole.end()) {
-            if class_has(&WORD_DOT_DASH, ch) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn accept_url(text: &str, caps: &Captures<'_>) -> bool {
-    let Some(whole) = caps.get(0) else {
-        return false;
-    };
-    match prev_char(text, whole.start()) {
-        None => true,
-        Some(ch) => !class_has(&SCHEME_CHAR, ch),
-    }
 }
 
 fn prev_word_dot(text: &str, start: usize) -> bool {
@@ -702,16 +609,6 @@ fn accept_priv4(text: &str, caps: &Captures<'_>) -> bool {
     accept_emu(text, caps)
 }
 
-fn accept_label(text: &str, caps: &Captures<'_>) -> bool {
-    let Some(whole) = caps.get(0) else {
-        return false;
-    };
-    match char_at(text, whole.end()) {
-        Some(ch) => !class_has(&WORD_DOT, ch),
-        None => true,
-    }
-}
-
 fn accept_sensitive(text: &str, caps: &Captures<'_>) -> bool {
     let Some(whole) = caps.get(0) else {
         return false;
@@ -737,19 +634,6 @@ fn accept_ipv6(text: &str, caps: &Captures<'_>) -> bool {
     };
     match prev_char(text, body.start()) {
         Some(ch) => !class_has(&WORD_COLON_DOT, ch),
-        None => true,
-    }
-}
-
-fn accept_priv6(text: &str, caps: &Captures<'_>) -> bool {
-    let Some(body) = caps.get(1) else {
-        return false;
-    };
-    if DOC_PREFIX.is_match(body.as_str()) {
-        return false;
-    }
-    match prev_char(text, body.start()) {
-        Some(ch) => !class_has(&WORD_COLON, ch),
         None => true,
     }
 }
@@ -950,11 +834,11 @@ fn find_user(text: &str) -> Vec<Found> {
 }
 
 fn find_hist(text: &str) -> Vec<Found> {
-    scan(text, &HIST_CORE, accept_hist, whole_span, |_| empty_groups())
+    engine_find(&HISTORY_ENGINE, text)
 }
 
 fn find_file(text: &str) -> Vec<Found> {
-    scan(text, &FILE_CORE, accept_file, file_span, |_| empty_groups())
+    engine_find(&FILE_ENGINE, text)
 }
 
 
@@ -993,6 +877,42 @@ fn engine_full(engine: &guard_common::pyengine::PyRegex, text: &str) -> Option<F
     engine.fullmatch_chars(&chars).map(|hit| engine_found(text, &hit, &starts))
 }
 
+static HISTORY_ENGINE_SRC: &str = r#"(?i)(?:^|[\s\"'=:(<>|;&/{`])(?:\.(?:zsh_history|bash_history|sh_history|history|zhistory|python_history|psql_history|mysql_history|sqlite_history|node_repl_history|irb_history|rediscli_history|dbshell|viminfo|lesshst|Rhistory)(?![A-Za-z0-9_])|\.(?:zsh_sessions|bash_sessions|local/share/fish|local/state/zsh|local/share/zsh|cache/zsh|local/share/atuin)(?=/|[\s\"';&|()<>`]|$))"#;
+
+static HISTORY_ENGINE: LazyLock<guard_common::pyengine::PyRegex> = LazyLock::new(|| {
+    guard_common::pyengine::PyRegex::new(HISTORY_ENGINE_SRC).unwrap_or_else(|_| std::process::abort())
+});
+
+static FILE_ENGINE_SRC: &str = r#"(?i)(?:^|[\s\"'=:(<>|;&/{`])(?:\.(?:zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|login|logout|kshrc|cshrc|tcshrc)(?![A-Za-z0-9_])|\.(?:zsh|zprezto/runcoms|oh-my-zsh/custom|config/fish|config/zsh|config/bash)/|(?:/private)?/etc/(?:zshrc|zprofile|zshenv|zlogin|zlogout|profile|bashrc|bash\.bashrc|environment)(?![A-Za-z0-9_])|(?:/private)?/etc/(?:zsh|bash|profile\.d)/|\.(?:zsh|zprezto/runcoms|oh-my-zsh/custom|config/fish|config/zsh|config/bash)(?=/|[\s\"';&|()<>`]|$)|\.(?:zsh_history|bash_history|sh_history|history|zhistory|python_history|psql_history|mysql_history|sqlite_history|node_repl_history|irb_history|rediscli_history|dbshell|viminfo|lesshst|Rhistory)(?![A-Za-z0-9_])|\.(?:zsh_sessions|bash_sessions|local/share/fish|local/state/zsh|local/share/zsh|cache/zsh|local/share/atuin)(?=/|[\s\"';&|()<>`]|$))"#;
+
+static FILE_ENGINE: LazyLock<guard_common::pyengine::PyRegex> = LazyLock::new(|| {
+    guard_common::pyengine::PyRegex::new(FILE_ENGINE_SRC).unwrap_or_else(|_| std::process::abort())
+});
+
+static REMOTE_ENGINE_SRC: &str = r#"(?i)/etc/(?:shadow|gshadow|sudoers|ssh/ssh_host|ssl/private)|/root(?:/|\b)|~root(?![\w.-])|/proc/|\.ssh(?:/|\b)|\.git-credentials|\.docker/config|\.kube/|\.aws/|\.gnupg|/\.config/"#;
+
+static REMOTE_ENGINE: LazyLock<guard_common::pyengine::PyRegex> = LazyLock::new(|| {
+    guard_common::pyengine::PyRegex::new(REMOTE_ENGINE_SRC).unwrap_or_else(|_| std::process::abort())
+});
+
+static URL_ENGINE_SRC: &str = r#"(?i)(?i)(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s\"'<>`]+"#;
+
+static URL_ENGINE: LazyLock<guard_common::pyengine::PyRegex> = LazyLock::new(|| {
+    guard_common::pyengine::PyRegex::new(URL_ENGINE_SRC).unwrap_or_else(|_| std::process::abort())
+});
+
+static LABEL_ENGINE_SRC: &str = r#"(?i)(?i)\b(?:inet|ipv4 address(?: for [^\s:]{1,32})?|ip address(?:es)?|public ip|external ip|server ip|remote ip)\b(?:[ \t]{0,16}[:=][ \t]{0,16}|[ \t]{1,16})(\d{1,3}(?:\.\d{1,3}){3})(?![\w.])"#;
+
+static LABEL_ENGINE: LazyLock<guard_common::pyengine::PyRegex> = LazyLock::new(|| {
+    guard_common::pyengine::PyRegex::new(LABEL_ENGINE_SRC).unwrap_or_else(|_| std::process::abort())
+});
+
+static PRIV6_ENGINE_SRC: &str = r#"(?i)(?<![\w:])(?!2001:0?db8:)(?:fe80|f[cd][0-9a-f]{2}|[23][0-9a-f]{3})(?:(?::[0-9a-f]{1,4}){7}|(?::[0-9a-f]{1,4}){0,6}::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,5})?|(?::[0-9a-f]{1,4}){5}:\d{1,3}(?:\.\d{1,3}){3}|(?::[0-9a-f]{1,4}){0,4}::(?:[0-9a-f]{1,4}:){0,3}\d{1,3}(?:\.\d{1,3}){3})(?![\w:])"#;
+
+static PRIV6_ENGINE: LazyLock<guard_common::pyengine::PyRegex> = LazyLock::new(|| {
+    guard_common::pyengine::PyRegex::new(PRIV6_ENGINE_SRC).unwrap_or_else(|_| std::process::abort())
+});
+
 fn find_source(text: &str) -> Vec<Found> {
     engine_find(&SOURCE_ENGINE, text)
 }
@@ -1014,11 +934,11 @@ fn find_jq(text: &str) -> Vec<Found> {
 }
 
 fn find_remote(text: &str) -> Vec<Found> {
-    scan(text, &REMOTE_CORE, accept_remote, whole_span, |_| empty_groups())
+    engine_find(&REMOTE_ENGINE, text)
 }
 
 fn find_url(text: &str) -> Vec<Found> {
-    scan(text, &URL_CORE, accept_url, whole_span, |_| empty_groups())
+    engine_find(&URL_ENGINE, text)
 }
 
 fn find_bare(text: &str) -> Vec<Found> {
@@ -1034,7 +954,7 @@ fn find_priv4(text: &str) -> Vec<Found> {
 }
 
 fn find_label(text: &str) -> Vec<Found> {
-    scan(text, &LABEL_CORE, accept_label, whole_span, |caps| one_group(caps, 1))
+    engine_find(&LABEL_ENGINE, text)
 }
 
 const SECRET_FILE_ALTERNATIVES: [(&str, usize); 13] = [
@@ -1086,15 +1006,17 @@ fn sensitive_end(text: &str, start: usize, first_end: usize) -> Option<usize> {
     }
     for name_start in name_starts {
         for (alternative, reach) in SECRET_FILE_NAMES.iter() {
-            let mut end = name_start.saturating_add(*reach).min(text.len());
-            while end > name_start {
-                if text.is_char_boundary(end)
-                    && alternative.is_match(&text[name_start..end])
-                    && accept_sensitive_end(text, end)
-                {
+            let ends: Vec<usize> = text[name_start..]
+                .char_indices()
+                .map(|(offset, _)| name_start + offset)
+                .skip(1)
+                .chain(std::iter::once(text.len()))
+                .take(*reach)
+                .collect();
+            for end in ends.into_iter().rev() {
+                if alternative.is_match(&text[name_start..end]) && accept_sensitive_end(text, end) {
                     return Some(end);
                 }
-                end -= 1;
             }
         }
     }
@@ -1143,7 +1065,7 @@ fn find_ipv6(text: &str) -> Vec<Found> {
 }
 
 fn find_priv6(text: &str) -> Vec<Found> {
-    scan(text, &PRIV6_CORE, accept_priv6, body_span, |_| empty_groups())
+    engine_find(&PRIV6_ENGINE, text)
 }
 
 fn find_login(text: &str) -> Vec<Found> {
@@ -1199,23 +1121,10 @@ macro_rules! expose {
 }
 
 fn full_hist(text: &str) -> Option<Found> {
-    full_simple(&HIST_FULL, text, accept_hist)
+    engine_full(&HISTORY_ENGINE, text)
 }
 fn full_file(text: &str) -> Option<Found> {
-    let caps = FILE_FULL.captures(text)?;
-    if !accept_file(text, &caps) {
-        return None;
-    }
-    let (start, end) = file_span(&caps)?;
-    if start == 0 && end == text.len() {
-        Some(Found {
-            start,
-            end,
-            groups: empty_groups(),
-        })
-    } else {
-        None
-    }
+    engine_full(&FILE_ENGINE, text)
 }
 fn full_source(text: &str) -> Option<Found> {
     engine_full(&SOURCE_ENGINE, text)
@@ -1233,10 +1142,10 @@ fn full_jq(text: &str) -> Option<Found> {
     full_simple(&JQ_FULL, text, accept_jq)
 }
 fn full_remote(text: &str) -> Option<Found> {
-    full_simple(&REMOTE_FULL, text, accept_remote)
+    engine_full(&REMOTE_ENGINE, text)
 }
 fn full_url(text: &str) -> Option<Found> {
-    full_simple(&URL_FULL, text, accept_url)
+    engine_full(&URL_ENGINE, text)
 }
 fn full_bare(text: &str) -> Option<Found> {
     full_groups(&BARE_FULL, text, accept_bare, |caps| one_group(caps, 1))
@@ -1248,7 +1157,7 @@ fn full_priv4(text: &str) -> Option<Found> {
     full_simple(&PRIV4_FULL, text, accept_priv4)
 }
 fn full_label(text: &str) -> Option<Found> {
-    full_groups(&LABEL_FULL, text, accept_label, |caps| one_group(caps, 1))
+    engine_full(&LABEL_ENGINE, text)
 }
 fn full_sensitive(text: &str) -> Option<Found> {
     full_simple(&SENSITIVE_FULL, text, accept_sensitive)
@@ -1263,13 +1172,7 @@ fn full_ipv6(text: &str) -> Option<Found> {
     full_simple(&IPV6_FULL, text, |_, _| true)
 }
 fn full_priv6(text: &str) -> Option<Found> {
-    full_simple(&PRIV6_FULL, text, |text, caps| {
-        let _ = text;
-        match caps.get(1) {
-            Some(body) => !DOC_PREFIX.is_match(body.as_str()),
-            None => !DOC_PREFIX.is_match(caps.get(0).map(|item| item.as_str()).unwrap_or("")),
-        }
-    })
+    engine_full(&PRIV6_ENGINE, text)
 }
 fn full_login(text: &str) -> Option<Found> {
     full_simple(&LOGIN_FULL, text, accept_login)

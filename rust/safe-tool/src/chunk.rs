@@ -48,7 +48,7 @@ pub fn sensitive_chunk(raw_words: &[String]) -> Result<bool, EmbeddedNul> {
         )?);
     }
     if consts::in_trace_commands(executable)
-        && paths::traces_commands(executable, normalized.get(1..).unwrap_or(&[]))
+        && paths::traces_commands(executable, words.get(1..).unwrap_or(&[]))
     {
         return Ok(true);
     }
