@@ -2170,6 +2170,35 @@ fn what_the_eighteenth_review_found_is_refused_or_kept() {
 }
 
 #[test]
+fn what_the_twenty_first_review_found_is_refused_or_kept() {
+    let dir = temp_dir("trim-twentyone");
+    let state = temp_dir("trim-twentyone-state");
+    let not_cut = |name: &str, text: &str| {
+        let verdict = trimming(None, None, "Write", written(&dir.join(name), text), Provider::Claude);
+        assert!(!matches!(verdict, Verdict::Trimmed { .. }), "{name} was trimmed");
+    };
+    let path = dir.join("a.py");
+    let first = trimming(Some(&state), Some("t21"), "Write", written(&path, "# one\n# two\nx = 1\n"), Provider::Claude);
+    assert!(matches!(first, Verdict::Allow));
+    std::fs::write(&path, "# one\n# two\nx = 1\n").expect("write");
+    let again = json!({ "file_path": path.to_string_lossy(), "old_string": "# one\n# two\nx = 1", "new_string": "# three\n# four\n# one\n# two\nx = 1" });
+    let (input, _) = cut(trimming(Some(&state), Some("t21"), "Edit", again, Provider::Claude));
+    assert_eq!(input["new_string"], "# one\n# two\nx = 1");
+    not_cut("i2.swift", "let s = #\"\"\"\nquote \"\"\" in text\n// one\n// two\n// three\n// four\n\"\"\"#\nlet x = 1\n");
+    not_cut("i3.swift", "let s = #\"\"\"\n\"\"\"\n\"\"\"#\n// one\n// two\n// three\n// four\nlet x = 1\n");
+    not_cut("i4.kt", "val s = \"\"\"\n${\"\"\"\n// one\n// two\n// three\n// four\n\"\"\"}\n\"\"\"\nval x = 1\n");
+    not_cut("i7.kt", "val a = \"\\${\"\n// one\n// two\n// three\n// four\nval x = 1\n");
+    let slash = "val slash = \"\"\"\\\"\"\"\n// one\n// two\n// three\n// four\nval x = 1\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("i5.kt"), slash), Provider::Claude));
+    assert_eq!(input["content"], "val slash = \"\"\"\\\"\"\"\n// one\n// two\nval x = 1\n");
+    let region = "fun f() {\n// region setup\n// one\n// two\n// endregion\nval x = 1\n}\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("i6.kt"), region), Provider::Claude));
+    assert_eq!(input["content"], "fun f() {\n// region setup\n// endregion\nval x = 1\n}\n");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
 fn harmless_look_alikes_do_not_stop_a_trim_and_a_huge_file_is_trimmed_quickly() {
     let dir = temp_dir("trim-alike");
     let shift = "n = 1 << 4\n# one\n# two\n# three\n# four\nx = 1\n";

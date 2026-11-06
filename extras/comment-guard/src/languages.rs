@@ -24,6 +24,7 @@ pub struct Language {
     pub escape: char,
     pub markup: bool,
     pub trim: bool,
+    pub raw_triple: bool,
 }
 
 const C_BLOCKS: &[(&str, &str)] = &[("/*", "*/")];
@@ -55,6 +56,7 @@ const BASE: Language = Language {
     escape: '\\',
     markup: false,
     trim: false,
+    raw_triple: false,
 };
 
 pub const HASH: Language = Language { line: &["#"], ..BASE };
@@ -81,6 +83,7 @@ pub const RUST: Language = Language {
 };
 pub const TEXT: Language = Language { line: &["//"], block: C_BLOCKS, triple: TEXT_BLOCKS, trim: true, ..BASE };
 pub const SCALA: Language = Language { trim: false, ..TEXT };
+pub const KOTLIN: Language = Language { raw_triple: true, ..TEXT };
 pub const SWIFT: Language = Language {
     line: &["//"],
     block: C_BLOCKS,
@@ -169,8 +172,8 @@ const TABLE: &[(&str, Language)] = &[
     ("ts", SCRIPT),
     ("tsx", JSX),
     ("java", TEXT),
-    ("kt", TEXT),
-    ("kts", TEXT),
+    ("kt", KOTLIN),
+    ("kts", KOTLIN),
     ("scala", SCALA),
     ("swift", SWIFT),
     ("dart", GROOVY),

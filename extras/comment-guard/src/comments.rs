@@ -302,10 +302,16 @@ fn line_directive(text: &str) -> bool {
     !last.is_empty() && last.chars().all(|c| c.is_ascii_digit()) && pieces.next().is_some()
 }
 
+fn region_marker(text: &str) -> bool {
+    let word: String = text.chars().take_while(char::is_ascii_alphabetic).collect();
+    word.eq_ignore_ascii_case("region") || word.eq_ignore_ascii_case("endregion")
+}
+
 pub fn protected(text: &str) -> bool {
     EXEMPT.iter().any(|(prefix, kind)| !matches!(kind, Tail::Options) && starts_ignore_case(text, prefix))
         || PROTECTED.iter().any(|prefix| starts_ignore_case(text, prefix))
         || line_directive(text)
+        || region_marker(text)
 }
 
 const DOC_ATTRIBUTES: [&str; 3] = ["@doc", "@moduledoc", "@typedoc"];
@@ -384,6 +390,14 @@ fn is_exempt(text: &str) -> bool {
     EXEMPT.iter().any(|(prefix, kind)| {
         starts_ignore_case(text, prefix) && text.get(prefix.len()..).is_some_and(|tail| directive_tail(*kind, tail))
     })
+}
+
+fn triple_end(lang: Language, text: &str, delim: &str) -> Option<usize> {
+    if lang.raw_triple {
+        text.find(delim)
+    } else {
+        find_unescaped(text, delim)
+    }
 }
 
 fn find_unescaped(text: &str, needle: &str) -> Option<usize> {
@@ -689,7 +703,7 @@ impl<'a> Scan<'a> {
     }
 
     fn in_triple(&mut self, trimmed: &'a str, delim: &'static str, doc: bool) -> LineKind<'a> {
-        let closed = find_unescaped(trimmed, delim);
+        let closed = triple_end(self.lang, trimmed, delim);
         if closed.is_some() {
             self.state = State::Code;
         }
@@ -839,7 +853,7 @@ impl<'a> Scan<'a> {
                 break;
             };
             if let Some(delim) = lang.triple.iter().copied().find(|delim| rest.starts_with(*delim)) {
-                match rest.get(delim.len()..).and_then(|tail| find_unescaped(tail, delim)) {
+                match rest.get(delim.len()..).and_then(|tail| triple_end(lang, tail, delim)) {
                     Some(end) => {
                         let consumed = end.saturating_add(delim.len().saturating_mul(2));
                         at = at.saturating_add(consumed);

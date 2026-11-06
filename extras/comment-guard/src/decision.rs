@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::comments::{body, protected, scan, LineKind};
-use crate::languages::{language_for_text, Language, CLIKE, GO, RUST, SCRIPT, SHELL};
+use crate::languages::{language_for_text, Language, CLIKE, GO, KOTLIN, RUST, SCRIPT, SHELL, SWIFT};
 use crate::locale::message;
 
 pub const MAX_LINES: usize = 2;
@@ -340,6 +340,35 @@ fn directive_shaped(line: &str) -> bool {
     !word.is_empty() && text.get(word.len()..).is_some_and(|rest| rest.trim_start().starts_with([':', '=']))
 }
 
+fn kotlin_nested_raw(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    while let Some(found) = text.get(at..).and_then(|rest| rest.find("${")) {
+        let start = at.saturating_add(found).saturating_add(2);
+        let mut depth = 1usize;
+        let mut closed = false;
+        for (offset, byte) in bytes.iter().enumerate().skip(start).take(4096) {
+            match byte {
+                b'{' => depth = depth.saturating_add(1),
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        closed = true;
+                        break;
+                    }
+                }
+                b'"' if bytes.get(offset..offset.saturating_add(3)) == Some(b"\"\"\"".as_slice()) => return true,
+                _ => {}
+            }
+        }
+        if !closed {
+            return true;
+        }
+        at = start;
+    }
+    false
+}
+
 fn jsx_like(text: &str) -> bool {
     text.lines().any(|line| !line.trim_start().starts_with("//") && (line.contains("</") || line.contains("/>")))
 }
@@ -359,6 +388,8 @@ fn risky(text: &str, lang: Language) -> bool {
         || (lang == RUST && text.lines().any(raw_string_open))
         || (lang == CLIKE && (text.contains("R\"") || text.contains("@\"")))
         || (lang == GO && text.contains("\"C\""))
+        || (lang == SWIFT && text.contains("#\""))
+        || (lang == KOTLIN && kotlin_nested_raw(text))
         || (lang == SCRIPT && (nested_template(text) || jsx_like(text)))
 }
 
@@ -371,19 +402,20 @@ pub fn trimmed(change: &Change) -> Option<Trimmed> {
         return None;
     }
     let mut pool: HashMap<&str, usize> = HashMap::new();
-    match &change.baseline {
-        Some(lines) => {
-            for line in lines {
-                *pool.entry(line.as_str()).or_insert(0) += 1;
-            }
+    if let Some(lines) = &change.baseline {
+        for line in lines {
+            *pool.entry(line.as_str()).or_insert(0) += 1;
         }
-        None => {
-            for kind in scan(&change.old, lang) {
-                if let LineKind::Comment(line) | LineKind::Also(line) = kind {
-                    *pool.entry(line).or_insert(0) += 1;
-                }
-            }
+    }
+    let mut carried: HashMap<&str, usize> = HashMap::new();
+    for kind in scan(&change.old, lang) {
+        if let LineKind::Comment(line) | LineKind::Also(line) = kind {
+            *carried.entry(line).or_insert(0) += 1;
         }
+    }
+    for (line, count) in carried {
+        let slot = pool.entry(line).or_insert(0);
+        *slot = (*slot).max(count);
     }
     let mut scanner = scan(&change.new, lang);
     let mut fresh: Vec<(usize, &str)> = Vec::new();
