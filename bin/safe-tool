@@ -1539,6 +1539,30 @@ def _heredoc_views(command: str) -> tuple[str, str]:
     return "".join(code), "".join(view)
 
 
+def _tokenize_with_loose_bodies(code: str) -> list[list[str]]:
+    shell: list[str] = []
+    bodies: list[str] = []
+    position = 0
+    for document in heredocs(code):
+        if not document.quoted:
+            return []
+        if document.body_start < position:
+            continue
+        shell.append(code[position : document.body_start])
+        bodies.append(code[document.body_start : document.end])
+        position = document.end
+    if not bodies:
+        return []
+    shell.append(code[position:])
+    chunks = _tokenize("".join(shell))
+    if not chunks:
+        return []
+    for body in bodies:
+        for line in body.split("\n"):
+            chunks.extend(_tokenize(line))
+    return chunks
+
+
 # Text that is run as a command by something else (a substitution, a string given to eval or `bash -c`) is checked
 # whole: whether a here-document in it is data depends on the command around it, which is only known at the top level.
 def _sensitive_command(command: str, data_heredocs: bool = True) -> bool:
@@ -1557,7 +1581,7 @@ def _sensitive_command(command: str, data_heredocs: bool = True) -> bool:
         return True
     if re.search(r"(?<![\w.-])\.env(?!\.(?:dist|example|sample|template)\b)(?:\b|$)", lowered):
         return True
-    chunks = _tokenize(code)
+    chunks = _tokenize(code) or _tokenize_with_loose_bodies(code)
     if not chunks or any(_sensitive_chunk(chunk) for chunk in chunks):
         return True
     if CONFIG_ENVIRONMENT.search(lowered) and any(_runs_git_config(chunk) for chunk in chunks):
