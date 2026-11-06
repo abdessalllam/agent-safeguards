@@ -2,7 +2,45 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::io::Error;
 use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+
+fn open_at(
+    directory: Option<&OwnedFd>,
+    name: &str,
+    flags: libc::c_int,
+    mode: libc::c_uint,
+) -> std::io::Result<OwnedFd> {
+    let c_name = CString::new(name).map_err(|_| Error::from(std::io::ErrorKind::InvalidInput))?;
+    let base = directory.map_or(libc::AT_FDCWD, |descriptor| descriptor.as_raw_fd());
+    loop {
+        // SAFETY: c_name is NUL-terminated and base is an open directory descriptor or AT_FDCWD.
+        let raw = unsafe { libc::openat(base, c_name.as_ptr(), flags | libc::O_CLOEXEC, mode) };
+        if raw >= 0 {
+            // SAFETY: openat returned a new descriptor that nothing else owns.
+            return Ok(unsafe { OwnedFd::from_raw_fd(raw) });
+        }
+        let error = Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Python `_open_without_symlinks`: read-write open that follows no link.
+pub fn open_without_symlinks(path: &str) -> std::io::Result<std::fs::File> {
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let Some((last, folders)) = parts.split_last() else {
+        return Err(Error::from(std::io::ErrorKind::InvalidInput));
+    };
+    let directory_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+    let mut directory = open_at(None, "/", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    for part in folders {
+        directory = open_at(Some(&directory), part, directory_flags, 0)?;
+    }
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW;
+    open_at(Some(&directory), last, flags, 0o600).map(std::fs::File::from)
+}
 
 pub fn new_session(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
@@ -314,7 +352,10 @@ pub(crate) fn path_bytes_lossy(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{access_executable, dirname, getuid, passwd_home, realpath, try_realpath, EmbeddedNul};
+    use super::{
+        access_executable, dirname, getuid, open_without_symlinks, passwd_home, realpath, try_realpath,
+        EmbeddedNul,
+    };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -396,6 +437,40 @@ mod tests {
         for (index, (left, right)) in actual.iter().zip(expected.split('\n')).enumerate() {
             assert_eq!(left, right, "{:?}", samples[index]);
         }
+    }
+
+    #[test]
+    fn open_without_symlinks_refuses_links_and_keeps_content() {
+        use std::io::{Read, Write};
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let base = std::path::PathBuf::from(realpath(&std::env::temp_dir().to_string_lossy()))
+            .join(format!("guard-common-nofollow-{stamp}"));
+        let real = base.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let file = real.join("exclude");
+        let text = |path: &std::path::Path| path.to_string_lossy().into_owned();
+        let mut created = open_without_symlinks(&text(&file)).unwrap();
+        created.write_all(b"kept").unwrap();
+        drop(created);
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        let mut again = open_without_symlinks(&text(&file)).unwrap();
+        let mut content = String::new();
+        again.read_to_string(&mut content).unwrap();
+        assert_eq!(content, "kept");
+        assert!(open_without_symlinks(&text(&link.join("exclude"))).is_err());
+        let final_link = real.join("pointer");
+        std::os::unix::fs::symlink(&file, &final_link).unwrap();
+        assert!(open_without_symlinks(&text(&final_link)).is_err());
+        assert!(open_without_symlinks("/").is_err());
+        assert!(open_without_symlinks("").is_err());
+        assert!(open_without_symlinks("/tmp/a\0b").is_err());
+        let _ = fs::remove_file(&final_link);
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_dir(&real);
+        let _ = fs::remove_dir(&base);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 import itertools
+from pathlib import Path
 import sys
 
-sys.path.insert(0, "/Users/prince/Documents/agent-safeguards/lib")
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib"))
 from agent_safeguards import common
 
 FORBIDDEN_ALPHABET = list("${}()[]'\"`<>a_1\n ")
