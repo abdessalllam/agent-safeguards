@@ -64,21 +64,32 @@ pub fn getuid() -> u32 {
 
 /// Home directory from the passwd database, or `None` when the lookup fails.
 pub fn passwd_home(uid: u32) -> Option<String> {
+    passwd_dir(|pwd, buffer, size, result| {
+        unsafe { libc::getpwuid_r(uid, pwd, buffer, size, result) }
+    })
+}
+
+pub fn passwd_home_by_name(name: &str) -> Result<Option<String>, EmbeddedNul> {
+    let c_name = CString::new(name).map_err(|_| EmbeddedNul)?;
+    Ok(passwd_dir(|pwd, buffer, size, result| {
+        unsafe { libc::getpwnam_r(c_name.as_ptr(), pwd, buffer, size, result) }
+    }))
+}
+
+fn passwd_dir(
+    lookup: impl Fn(*mut libc::passwd, *mut libc::c_char, usize, *mut *mut libc::passwd) -> libc::c_int,
+) -> Option<String> {
     let mut capacity = passwd_buffer_size();
     loop {
         let mut buffer = vec![0u8; capacity];
         let mut pwd = MaybeUninit::<libc::passwd>::uninit();
         let mut result: *mut libc::passwd = std::ptr::null_mut();
-        // SAFETY: buffer is writable for `capacity` bytes and outlives the copy of pw_dir below.
-        let rc = unsafe {
-            libc::getpwuid_r(
-                uid,
-                pwd.as_mut_ptr(),
-                buffer.as_mut_ptr() as *mut libc::c_char,
-                buffer.len(),
-                &mut result,
-            )
-        };
+        let rc = lookup(
+            pwd.as_mut_ptr(),
+            buffer.as_mut_ptr() as *mut libc::c_char,
+            buffer.len(),
+            &mut result,
+        );
         if rc == libc::ERANGE {
             capacity = capacity.saturating_mul(2);
             if capacity > 1_048_576 {
@@ -89,7 +100,7 @@ pub fn passwd_home(uid: u32) -> Option<String> {
         if rc != 0 || result.is_null() {
             return None;
         }
-        // SAFETY: a null result was rejected, so getpwuid_r initialized `pwd`.
+        // SAFETY: a null result was rejected, so the lookup initialized `pwd`.
         let pwd = unsafe { pwd.assume_init() };
         if pwd.pw_dir.is_null() {
             return None;
@@ -353,8 +364,8 @@ pub(crate) fn path_bytes_lossy(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        access_executable, dirname, getuid, open_without_symlinks, passwd_home, realpath, try_realpath,
-        EmbeddedNul,
+        access_executable, dirname, getuid, open_without_symlinks, passwd_home, passwd_home_by_name,
+        realpath, try_realpath, EmbeddedNul,
     };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -471,6 +482,18 @@ mod tests {
         let _ = fs::remove_file(&link);
         let _ = fs::remove_dir(&real);
         let _ = fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn passwd_home_by_name_matches_python() {
+        let expected = python(
+            "import pwd,sys; sys.stdout.write(pwd.getpwnam(sys.argv[1]).pw_dir)",
+            "root",
+        );
+        assert_eq!(passwd_home_by_name("root"), Ok(Some(expected)));
+        assert_eq!(passwd_home_by_name("no-such-account-b2x"), Ok(None));
+        assert_eq!(passwd_home_by_name(""), Ok(None));
+        assert_eq!(passwd_home_by_name("a\0b"), Err(EmbeddedNul));
     }
 
     #[test]
