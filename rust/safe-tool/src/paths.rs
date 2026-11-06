@@ -261,9 +261,7 @@ pub fn traces_commands(executable: &str, arguments: &[String]) -> bool {
         {
             break;
         }
-        if consts::TRACE_OPTION
-            .find(argument)
-            .is_some_and(|hit| hit.start() == 0 && hit.end() == argument.len())
+        if consts::TRACE_OPTION_FULL.is_match(argument)
         {
             return true;
         }

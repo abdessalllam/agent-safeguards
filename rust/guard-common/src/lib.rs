@@ -4,6 +4,7 @@ pub mod emit;
 pub mod env;
 pub mod locale;
 pub mod overrides;
+pub mod pyengine;
 pub mod pyglob;
 pub mod pyre;
 pub mod secret_scan;

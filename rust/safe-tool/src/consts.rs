@@ -124,6 +124,7 @@ pub static DEFINITION_PARAMETER_PATTERN: LazyLock<Regex> = LazyLock::new(|| comp
 
 const SHELL_COMMAND_OPTION_SRC: &str = "-[A-Za-z]*c[A-Za-z]*";
 pub static SHELL_COMMAND_OPTION: LazyLock<Regex> = LazyLock::new(|| compile(SHELL_COMMAND_OPTION_SRC));
+pub static SHELL_COMMAND_OPTION_FULL: LazyLock<Regex> = LazyLock::new(|| compile(&format!(r"\A(?:{SHELL_COMMAND_OPTION_SRC})\z")));
 
 pub const STARTUP_RC_NAMES: &str = "zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|login|logout|kshrc|cshrc|tcshrc";
 pub const STARTUP_HISTORY_NAMES: &str = "zsh_history|bash_history|sh_history|history|zhistory|python_history|psql_history|mysql_history|sqlite_history|node_repl_history|irb_history|rediscli_history|dbshell|viminfo|lesshst|Rhistory";
@@ -163,9 +164,11 @@ pub static HEREDOC_DATA_COMMANDS: &[&str] = &["cat", "diff", "gh", "grep", "jq",
 pub const MAX_HEREDOC_LINE_CHARS: usize = 4096;
 const SYSTEM_COMMAND_PATH_SRC: &str = "(?:/usr/bin/|/bin/|/usr/local/bin/|/opt/[a-z]+/bin/)?[a-z]+";
 pub static SYSTEM_COMMAND_PATH: LazyLock<Regex> = LazyLock::new(|| compile(SYSTEM_COMMAND_PATH_SRC));
+pub static SYSTEM_COMMAND_PATH_FULL: LazyLock<Regex> = LazyLock::new(|| compile(&format!(r"\A(?:{SYSTEM_COMMAND_PATH_SRC})\z")));
 
 const JQ_PROGRAM_FILE_SRC: &str = "-[A-Za-z]*f[A-Za-z]*|--from-file|--run[a-z-]*";
 pub static JQ_PROGRAM_FILE: LazyLock<Regex> = LazyLock::new(|| compile(JQ_PROGRAM_FILE_SRC));
+pub static JQ_PROGRAM_FILE_FULL: LazyLock<Regex> = LazyLock::new(|| compile(&format!(r"\A(?:{JQ_PROGRAM_FILE_SRC})\z")));
 
 pub static HEREDOC_ARGUMENT_COMMANDS: &[(&str, &[&str])] = &[("gh", &["issue", "pr", "release"])];
 pub static GH_TEXT_OPTIONS: &[&str] = &["--body", "--notes", "--title", "-b", "-n", "-t"];
@@ -237,6 +240,7 @@ pub static HAS_KEY_STARTUP_PATTERN: LazyLock<Regex> = LazyLock::new(|| compile(H
 
 const TRACE_OPTION_SRC: &str = "-[A-Za-z]*[vx][A-Za-z]*|--(?:verbose|xtrace)";
 pub static TRACE_OPTION: LazyLock<Regex> = LazyLock::new(|| compile(TRACE_OPTION_SRC));
+pub static TRACE_OPTION_FULL: LazyLock<Regex> = LazyLock::new(|| compile(&format!(r"\A(?:{TRACE_OPTION_SRC})\z")));
 
 pub static TRACE_OPTION_NAMES: &[&str] = &["sourcetrace", "verbose", "xtrace"];
 pub static TRACE_COMMANDS: &[&str] = &["ash", "bash", "dash", "ksh", "ksh93", "mksh", "set", "setopt", "sh", "shopt", "yash", "zsh"];
@@ -269,6 +273,7 @@ pub fn in_compound_words(word: &str) -> bool {
 pub static STARTUP_KEY_FILES: &[&str] = &[".zshrc", ".zshenv", ".zprofile", ".bashrc", ".bash_profile", ".profile"];
 const KEY_NAME_PATTERN_SRC: &str = "[A-Za-z_][A-Za-z0-9_]*";
 pub static KEY_NAME_PATTERN: LazyLock<Regex> = LazyLock::new(|| compile(KEY_NAME_PATTERN_SRC));
+pub static KEY_NAME_PATTERN_FULL: LazyLock<Regex> = LazyLock::new(|| compile(&format!(r"\A(?:{KEY_NAME_PATTERN_SRC})\z")));
 
 const KEY_ASSIGNMENT_PATTERN_SRC: &str = "[ \\t]*(?:(?:export|readonly|declare|typeset)[ \\t]+(?:-[A-Za-z]+[ \\t]+)*)?([A-Za-z_][A-Za-z0-9_]*)=(.*)";
 pub static KEY_ASSIGNMENT_PATTERN: LazyLock<Regex> = LazyLock::new(|| compile(KEY_ASSIGNMENT_PATTERN_SRC));
@@ -361,13 +366,12 @@ pub static SAFE_ENV_KEYS: &[&str] = &["SSH_AUTH_SOCK", "TERM"];
 pub static DEFAULT_LOCAL_ONLY: &[&str] = &["CLAUDE.local.md"];
 const LOCAL_ONLY_ENTRY_SRC: &str = "[A-Za-z0-9._][A-Za-z0-9._/-]*";
 pub static LOCAL_ONLY_ENTRY: LazyLock<Regex> = LazyLock::new(|| compile(LOCAL_ONLY_ENTRY_SRC));
+pub static LOCAL_ONLY_ENTRY_FULL: LazyLock<Regex> = LazyLock::new(|| compile(&format!(r"\A(?:{LOCAL_ONLY_ENTRY_SRC})\z")));
 
 static HIST_CORE: LazyLock<Regex> = LazyLock::new(|| compile("(?i)(?:^|[\\s\\\"'=:(<>|;&/{`])(?:\\.(?P<name>zsh_history|bash_history|sh_history|history|zhistory|python_history|psql_history|mysql_history|sqlite_history|node_repl_history|irb_history|rediscli_history|dbshell|viminfo|lesshst|Rhistory)|\\.(?P<folder>zsh_sessions|bash_sessions|local/share/fish|local/state/zsh|local/share/zsh|cache/zsh|local/share/atuin))"));
 static HIST_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:(?i)(?:^|[\\s\\\"'=:(<>|;&/{`])(?:\\.(?P<name>zsh_history|bash_history|sh_history|history|zhistory|python_history|psql_history|mysql_history|sqlite_history|node_repl_history|irb_history|rediscli_history|dbshell|viminfo|lesshst|Rhistory)|\\.(?P<folder>zsh_sessions|bash_sessions|local/share/fish|local/state/zsh|local/share/zsh|cache/zsh|local/share/atuin)))\\z"));
 static FILE_CORE: LazyLock<Regex> = LazyLock::new(|| compile("(?i)(?:^|[\\s\\\"'=:(<>|;&/{`])(?:\\.(?P<rc>zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|login|logout|kshrc|cshrc|tcshrc)(?P<rc_end>[^A-Za-z0-9_]|$)|\\.(?P<folder>zsh|zprezto/runcoms|oh-my-zsh/custom|config/fish|config/zsh|config/bash)/|(?P<system>(?:/private)?/etc/(?:zshrc|zprofile|zshenv|zlogin|zlogout|profile|bashrc|bash\\.bashrc|environment)|(?:/private)?/etc/(?:zsh|bash|profile\\.d)/)|\\.(?P<folder2>zsh|zprezto/runcoms|oh-my-zsh/custom|config/fish|config/zsh|config/bash)(?P<f2_end>/|[\\s\\\"';&|()<>`]|$)|\\.(?P<hname>zsh_history|bash_history|sh_history|history|zhistory|python_history|psql_history|mysql_history|sqlite_history|node_repl_history|irb_history|rediscli_history|dbshell|viminfo|lesshst|Rhistory)(?P<hn_end>[^A-Za-z0-9_]|$)|\\.(?P<hfolder>zsh_sessions|bash_sessions|local/share/fish|local/state/zsh|local/share/zsh|cache/zsh|local/share/atuin)(?P<hf_end>/|[\\s\\\"';&|()<>`]|$))"));
 static FILE_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:(?i)(?:^|[\\s\\\"'=:(<>|;&/{`])(?:\\.(?P<rc>zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|login|logout|kshrc|cshrc|tcshrc)(?P<rc_end>[^A-Za-z0-9_]|$)|\\.(?P<folder>zsh|zprezto/runcoms|oh-my-zsh/custom|config/fish|config/zsh|config/bash)/|(?P<system>(?:/private)?/etc/(?:zshrc|zprofile|zshenv|zlogin|zlogout|profile|bashrc|bash\\.bashrc|environment)|(?:/private)?/etc/(?:zsh|bash|profile\\.d)/)|\\.(?P<folder2>zsh|zprezto/runcoms|oh-my-zsh/custom|config/fish|config/zsh|config/bash)(?P<f2_end>/|[\\s\\\"';&|()<>`]|$)|\\.(?P<hname>zsh_history|bash_history|sh_history|history|zhistory|python_history|psql_history|mysql_history|sqlite_history|node_repl_history|irb_history|rediscli_history|dbshell|viminfo|lesshst|Rhistory)(?P<hn_end>[^A-Za-z0-9_]|$)|\\.(?P<hfolder>zsh_sessions|bash_sessions|local/share/fish|local/state/zsh|local/share/zsh|cache/zsh|local/share/atuin)(?P<hf_end>/|[\\s\\\"';&|()<>`]|$)))\\z"));
-static SOURCE_CORE: LazyLock<Regex> = LazyLock::new(|| compile("(?i)(?:^|[;&|({\\n`]|\\x01)[ \\t]*(?:(?:if|then|elif|else|do|while|until|time|!)[ \\t]+)*(?:source|\\.)[ \\t]+[\\x01\\\"']?[^\\s\\\"';&|()<>`]*(?:\\.(?P<rc>zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|login|logout|kshrc|cshrc|tcshrc)|\\.(?P<folder>zsh|zprezto/runcoms|oh-my-zsh/custom|config/fish|config/zsh|config/bash)/|(?P<sysf>(?:/private)?/etc/(?:zshrc|zprofile|zshenv|zlogin|zlogout|profile|bashrc|bash\\.bashrc|environment))|(?P<sysd>(?:/private)?/etc/(?:zsh|bash|profile\\.d)/))(?P<rest>[^\\s\\\"';&|()<>`]*)[\\\"']?"));
-static SOURCE_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:(?i)(?:^|[;&|({\\n`]|\\x01)[ \\t]*(?:(?:if|then|elif|else|do|while|until|time|!)[ \\t]+)*(?:source|\\.)[ \\t]+[\\x01\\\"']?[^\\s\\\"';&|()<>`]*(?:\\.(?P<rc>zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|login|logout|kshrc|cshrc|tcshrc)|\\.(?P<folder>zsh|zprezto/runcoms|oh-my-zsh/custom|config/fish|config/zsh|config/bash)/|(?P<sysf>(?:/private)?/etc/(?:zshrc|zprofile|zshenv|zlogin|zlogout|profile|bashrc|bash\\.bashrc|environment))|(?P<sysd>(?:/private)?/etc/(?:zsh|bash|profile\\.d)/))(?P<rest>[^\\s\\\"';&|()<>`]*)[\\\"']?)\\z"));
 static BLOB_CORE: LazyLock<Regex> = LazyLock::new(|| compile("[A-Za-z0-9_./~^@+-]{0,200}:[^\\s/]\\S{0,499}"));
 static BLOB_FULL: LazyLock<Regex> = LazyLock::new(|| compile("\\A(?:[A-Za-z0-9_./~^@+-]{0,200}:[^\\s/]\\S{0,499})\\z"));
 static PIPE_CORE: LazyLock<Regex> = LazyLock::new(|| compile("\\||`|\\$\\(|[<>]\\("));
@@ -607,20 +611,6 @@ fn accept_file(text: &str, caps: &Captures<'_>) -> bool {
         return true;
     }
     alnum_boundary(text, end)
-}
-
-fn accept_source(text: &str, caps: &Captures<'_>) -> bool {
-    let _ = text;
-    if caps.name("folder").is_some() || caps.name("sysd").is_some() {
-        return true;
-    }
-    match caps.name("rest").map(|item| item.as_str()) {
-        Some(rest) => match rest.chars().next() {
-            Some(ch) => !ascii_word(ch),
-            None => true,
-        },
-        None => true,
-    }
 }
 
 fn accept_pipe(text: &str, caps: &Captures<'_>) -> bool {
@@ -967,8 +957,44 @@ fn find_file(text: &str) -> Vec<Found> {
     scan(text, &FILE_CORE, accept_file, file_span, |_| empty_groups())
 }
 
+
+static SOURCE_ENGINE_SRC: &str = r#"(?i)(?:^|[;&|({\n`]|\x01)[ \t]*(?:(?:if|then|elif|else|do|while|until|time|!)[ \t]+)*(?:source|\.)[ \t]+[\x01\"']?[^\s\"';&|()<>`]*(?:\.(?:zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|login|logout|kshrc|cshrc|tcshrc)(?![A-Za-z0-9_])|\.(?:zsh|zprezto/runcoms|oh-my-zsh/custom|config/fish|config/zsh|config/bash)/|(?:/private)?/etc/(?:zshrc|zprofile|zshenv|zlogin|zlogout|profile|bashrc|bash\.bashrc|environment)(?![A-Za-z0-9_])|(?:/private)?/etc/(?:zsh|bash|profile\.d)/)[^\s\"';&|()<>`]*[\"']?"#;
+
+static SOURCE_ENGINE: LazyLock<guard_common::pyengine::PyRegex> = LazyLock::new(|| {
+    guard_common::pyengine::PyRegex::new(SOURCE_ENGINE_SRC).unwrap_or_else(|_| std::process::abort())
+});
+
+fn engine_found(text: &str, hit: &guard_common::pyengine::PyMatch, chars: &[usize]) -> Found {
+    let bytes = |index: usize| chars.get(index).copied().unwrap_or(text.len());
+    Found {
+        start: bytes(hit.start),
+        end: bytes(hit.end),
+        groups: hit
+            .groups
+            .iter()
+            .map(|group| group.map(|(from, to)| text[bytes(from)..bytes(to)].to_owned()))
+            .collect(),
+    }
+}
+
+fn char_starts(text: &str) -> Vec<usize> {
+    text.char_indices().map(|(index, _)| index).chain(std::iter::once(text.len())).collect()
+}
+
+fn engine_find(engine: &guard_common::pyengine::PyRegex, text: &str) -> Vec<Found> {
+    let chars: Vec<char> = text.chars().collect();
+    let starts = char_starts(text);
+    engine.find_iter_chars(&chars).iter().map(|hit| engine_found(text, hit, &starts)).collect()
+}
+
+fn engine_full(engine: &guard_common::pyengine::PyRegex, text: &str) -> Option<Found> {
+    let chars: Vec<char> = text.chars().collect();
+    let starts = char_starts(text);
+    engine.fullmatch_chars(&chars).map(|hit| engine_found(text, &hit, &starts))
+}
+
 fn find_source(text: &str) -> Vec<Found> {
-    scan(text, &SOURCE_CORE, accept_source, whole_span, |_| empty_groups())
+    engine_find(&SOURCE_ENGINE, text)
 }
 
 fn find_blob(text: &str) -> Vec<Found> {
@@ -1192,7 +1218,7 @@ fn full_file(text: &str) -> Option<Found> {
     }
 }
 fn full_source(text: &str) -> Option<Found> {
-    full_simple(&SOURCE_FULL, text, accept_source)
+    engine_full(&SOURCE_ENGINE, text)
 }
 fn full_blob(text: &str) -> Option<Found> {
     full_simple(&BLOB_FULL, text, |_, _| true)
