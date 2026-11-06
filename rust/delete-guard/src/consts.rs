@@ -1,5 +1,5 @@
-use std::collections::{HashSet, BTreeSet};
-use std::sync::LazyLock;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
 
 use regex::{Captures, Regex};
 use serde_json::{json, Value};
@@ -394,7 +394,26 @@ pub fn git_path() -> Option<&'static str> {
     CACHE.as_deref()
 }
 
+pub fn max_trash_scan() -> usize {
+    guard_common::overrides::number("MAX_TRASH_SCAN").map_or(MAX_TRASH_SCAN, |value| value as usize)
+}
+
+pub fn max_matches() -> usize {
+    guard_common::overrides::number("MAX_MATCHES").map_or(MAX_MATCHES, |value| value as usize)
+}
+
+pub fn glob_visits() -> usize {
+    guard_common::overrides::number("GLOB_VISITS").map_or(GLOB_VISITS, |value| value as usize)
+}
+
 pub fn temp_roots() -> &'static [String] {
+    if let Some(roots) = guard_common::overrides::list("TEMP_ROOTS") {
+        static LEAKED: LazyLock<Mutex<HashMap<Vec<String>, &'static [String]>>> = LazyLock::new(Default::default);
+        let mut leaked = LEAKED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        return leaked
+            .entry(roots)
+            .or_insert_with_key(|key| Box::leak(key.clone().into_boxed_slice()));
+    }
     static CACHE: LazyLock<Vec<String>> = LazyLock::new(|| {
         let mut paths = Vec::new();
         for path in ["/tmp", "/private/tmp", "/var/tmp", "/var/folders", "/private/var/folders"] {

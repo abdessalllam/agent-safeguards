@@ -13,3 +13,6 @@ path = "src/main.rs"
 serde_json.workspace = true
 regex.workspace = true
 guard-common.workspace = true
+
+[dev-dependencies]
+guard-common = { workspace = true, features = ["test-overrides"] }

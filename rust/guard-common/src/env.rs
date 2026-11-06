@@ -1,6 +1,7 @@
-use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
-use crate::sys;
+use crate::{overrides, sys};
 
 pub const DEFAULT_LOCALE: &str = "en";
 
@@ -64,7 +65,16 @@ pub fn home_directory() -> String {
 }
 
 pub fn user_home() -> &'static str {
-    PATHS.user_home.as_str()
+    match overrides::string("USER_HOME") {
+        Some(value) => leaked(value),
+        None => PATHS.user_home.as_str(),
+    }
+}
+
+fn leaked(value: String) -> &'static str {
+    static CACHE: LazyLock<Mutex<HashMap<String, &'static str>>> = LazyLock::new(Default::default);
+    let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.entry(value).or_insert_with_key(|key| Box::leak(key.clone().into_boxed_str()))
 }
 
 pub fn plugin_root() -> &'static str {

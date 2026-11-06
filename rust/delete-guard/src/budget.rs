@@ -70,7 +70,7 @@ impl Budget {
 }
 
 pub fn hook_budget_seconds() -> f64 {
-    HOOK_BUDGET_SECONDS
+    guard_common::overrides::number("HOOK_BUDGET_SECONDS").unwrap_or(HOOK_BUDGET_SECONDS)
 }
 
 pub fn with_output_lock<T>(body: impl FnOnce() -> T) -> T {

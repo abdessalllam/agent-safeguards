@@ -25,7 +25,21 @@ thread_local! {
 }
 
 pub fn ps_target() -> String {
+    if let Some(value) = guard_common::overrides::list("_PS_TARGET").and_then(|items| items.into_iter().next()) {
+        return value;
+    }
     PS_TARGET_CELL.with(|cell| cell.borrow().clone())
+}
+
+pub fn rtk_path() -> Option<String> {
+    match guard_common::overrides::nullable_string("RTK_PATH") {
+        Some(value) => value,
+        None => RTK_PATH.clone(),
+    }
+}
+
+pub fn hook_budget_seconds() -> f64 {
+    guard_common::overrides::number("HOOK_BUDGET_SECONDS").unwrap_or(HOOK_BUDGET_SECONDS)
 }
 
 pub fn set_ps_target(value: &str) {
