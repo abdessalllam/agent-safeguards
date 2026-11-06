@@ -95,13 +95,21 @@ pub fn access_executable(path: &str) -> bool {
     unsafe { libc::access(c_path.as_ptr(), libc::X_OK) == 0 }
 }
 
-/// Python `os.path.realpath`: resolve links, keep a missing tail, and do not fail.
-pub fn realpath(path: &str) -> String {
+/// Python raises `ValueError` from `os.path.realpath` for a path with a NUL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmbeddedNul;
+
+/// Python `os.path.realpath`: resolve links and keep a missing tail.
+pub fn try_realpath(path: &str) -> Result<String, EmbeddedNul> {
     if path.bytes().any(|byte| byte == 0) {
-        return path.to_owned();
+        return Err(EmbeddedNul);
     }
     let (resolved, _) = join_realpath(String::new(), path, &mut HashMap::new(), 0);
-    abspath(&resolved)
+    Ok(abspath(&resolved))
+}
+
+pub fn realpath(path: &str) -> String {
+    try_realpath(path).unwrap_or_else(|_| path.to_owned())
 }
 
 pub(crate) fn dirname(path: &str) -> String {
@@ -144,7 +152,7 @@ fn join_realpath(
             } else {
                 let (head, tail) = split_path(&path);
                 if tail == ".." {
-                    path = join_paths(&[&path, "..", ".."]);
+                    path = join_paths(&[head, "..", ".."]);
                 } else {
                     path = head.to_owned();
                 }
@@ -306,7 +314,7 @@ pub(crate) fn path_bytes_lossy(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{access_executable, dirname, getuid, passwd_home, realpath};
+    use super::{access_executable, dirname, getuid, passwd_home, realpath, try_realpath, EmbeddedNul};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -360,6 +368,42 @@ mod tests {
         fs::set_permissions(&path, perms).unwrap();
         assert!(!access_executable(&path.to_string_lossy()));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn realpath_of_dot_dot_sequences_matches_python() {
+        let pieces = ["..", ".", "a", "src", ""];
+        let mut samples: Vec<String> = vec![String::new()];
+        let mut layer: Vec<Vec<&str>> = vec![Vec::new()];
+        for _ in 0..6 {
+            let mut next = Vec::new();
+            for parts in &layer {
+                for piece in pieces {
+                    let mut longer = parts.clone();
+                    longer.push(piece);
+                    samples.push(longer.join("/"));
+                    samples.push(format!("/{}", longer.join("/")));
+                    next.push(longer);
+                }
+            }
+            layer = next;
+        }
+        let expected = python(
+            "import os,sys; sys.stdout.write('\\n'.join(os.path.realpath(p) for p in sys.argv[1].split('\\n')))",
+            &samples.join("\n"),
+        );
+        let actual: Vec<String> = samples.iter().map(|sample| realpath(sample)).collect();
+        for (index, (left, right)) in actual.iter().zip(expected.split('\n')).enumerate() {
+            assert_eq!(left, right, "{:?}", samples[index]);
+        }
+    }
+
+    #[test]
+    fn realpath_with_a_nul_fails_like_python() {
+        for sample in ["\0", "a\0", "/\0", "/nonexistent/a\0b", "a/\0", "/tmp/\0/x", "x\0/..", "..\0"] {
+            assert_eq!(try_realpath(sample), Err(EmbeddedNul), "{sample:?}");
+        }
+        assert_eq!(try_realpath("/tmp"), Ok(realpath("/tmp")));
     }
 
     #[test]
