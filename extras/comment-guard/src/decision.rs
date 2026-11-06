@@ -283,7 +283,8 @@ fn nested_template(text: &str) -> bool {
         let mut closed = false;
         let mut quote: Option<u8> = None;
         let mut escaped = false;
-        for byte in bytes.iter().skip(start).take(4096) {
+        let mut previous = b' ';
+        for (offset, byte) in bytes.iter().enumerate().skip(start).take(4096) {
             if let Some(open) = quote {
                 if escaped {
                     escaped = false;
@@ -297,7 +298,10 @@ fn nested_template(text: &str) -> bool {
                 continue;
             }
             match byte {
-                b'"' | b'\'' => quote = Some(*byte),
+                b'"' | b'\'' => {
+                    quote = Some(*byte);
+                    previous = *byte;
+                }
                 b'{' => depth = depth.saturating_add(1),
                 b'}' => {
                     depth = depth.saturating_sub(1);
@@ -306,8 +310,17 @@ fn nested_template(text: &str) -> bool {
                         break;
                     }
                 }
-                b'`' | b'/' => return true,
+                b'`' => return true,
+                b'/' => {
+                    let division = previous.is_ascii_alphanumeric() || matches!(previous, b'_' | b'$' | b')' | b']');
+                    if !division || matches!(bytes.get(offset.saturating_add(1)), Some(b'/' | b'*')) {
+                        return true;
+                    }
+                }
                 _ => {}
+            }
+            if !byte.is_ascii_whitespace() {
+                previous = *byte;
             }
         }
         if !closed {
