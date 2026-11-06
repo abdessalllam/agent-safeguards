@@ -2079,7 +2079,7 @@ fn comments_that_cannot_be_cut_safely_are_still_refused() {
         let verdict = trimming(None, None, "Write", written(&dir.join(name), text), Provider::Claude);
         assert!(matches!(verdict, Verdict::Deny(_)), "{name} was trimmed or allowed");
     };
-    refuse("a.py", "def f():\n    \"\"\"\n    one\n    two\n    three\n    four\n    \"\"\"\n    return 1\n");
+    refuse("a.py", "x = f(\n    \"\"\"\n    one\n    two\n    three\n    four\n    \"\"\"\n)\n");
     refuse("b.py", "a = 1  # one\nb = 2  # two\nc = 3  # three\nd = 4  # four\n");
     refuse("c.c", "/*\none\ntwo\nthree\nfour\n*/\nint a;\n");
     refuse("d.html", "// one\n// two\n// three\n// four\n<p>hi</p>\n");
@@ -2492,6 +2492,326 @@ fn a_file_a_command_wrote_loses_its_extra_comment_lines() {
     assert!(text.contains("\"decision\":\"block\""), "{text}");
     assert_eq!(std::fs::read_to_string(&script).expect("read"), "$a = 1\n# a\n# b\n# c\n# d\n");
     let _ = std::fs::remove_dir_all(&outside);
+}
+
+fn q3(text: &str) -> String {
+    format!("\"\"\"{text}\"\"\"")
+}
+
+#[test]
+fn a_docstring_over_the_limit_is_left_out_and_the_code_around_it_is_written() {
+    let dir = temp_dir("trim-doc");
+    let path = dir.join("a.py");
+    let long = "x".repeat(95);
+    let module = format!("{}\nimport os\n\nx = 1\n", q3(&format!("Generates {long}")));
+    let (input, note) = cut(trimming(None, None, "Write", written(&path, &module), Provider::Claude));
+    assert_eq!(input["content"], "import os\n\nx = 1\n");
+    assert!(note.contains("1 new comment line(s)") && !note.contains("pass"), "{note}");
+    let many = "def f():\n    \"\"\"One.\n\n    Two.\n    Three.\n    \"\"\"\n    return 1\n";
+    let (input, note) = cut(trimming(None, None, "Write", written(&path, many), Provider::Claude));
+    assert_eq!(input["content"], "def f():\n    return 1\n");
+    assert!(note.contains("3 new comment line(s)"), "{note}");
+    let fine = format!("def f():\n    {}\n    return 1\n", q3("One line."));
+    assert!(matches!(trimming(None, None, "Write", written(&path, &fine), Provider::Claude), Verdict::Allow));
+    let trailing = format!("def f():  # why\n    {}\n    return 1\n", q3(&long));
+    let (input, _) = cut(trimming(None, None, "Write", written(&path, &trailing), Provider::Claude));
+    assert_eq!(input["content"], "def f():  # why\n    return 1\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_docstring_that_is_a_whole_block_is_replaced_by_pass() {
+    let dir = temp_dir("trim-doc-pass");
+    let path = dir.join("a.py");
+    let long = "x".repeat(95);
+    let write = |text: &str| cut(trimming(None, None, "Write", written(&path, text), Provider::Claude));
+    let (input, note) = write(&format!("class E(Exception):\n    {}\n\n\nx = 1\n", q3(&long)));
+    assert_eq!(input["content"], "class E(Exception):\n    pass\n\n\nx = 1\n");
+    assert!(note.contains("replaced by `pass`"), "{note}");
+    let (input, _) = write(&format!("def f():\n    {}\n", q3(&long)));
+    assert_eq!(input["content"], "def f():\n    pass\n");
+    let (input, _) = write("class E(Exception):\n    \"\"\"One.\n    Two.\n    Three.\n    \"\"\"\n");
+    assert_eq!(input["content"], "class E(Exception):\n    pass\n");
+    let (input, _) = write(&format!("if a:\n    {}\nelse:\n    b = 1\n", q3(&long)));
+    assert_eq!(input["content"], "if a:\n    pass\nelse:\n    b = 1\n");
+    let (input, _) = write(&format!("def f():  # why:\n    {}\nx = 1\n", q3(&long)));
+    assert_eq!(input["content"], "def f():  # why:\n    pass\nx = 1\n");
+    let (input, _) = write(&format!("class E(Exception):\r\n    {}\r\n", q3(&long)));
+    assert_eq!(input["content"], "class E(Exception):\r\n    pass\r\n");
+    let (input, _) = write(&format!("def f():\n    {}\n    {}\n", q3(&long), q3(&long)));
+    assert_eq!(input["content"], "def f():\n    pass\n");
+    let (input, _) = write(&format!("def f():\n    # a\n    {}\n    # b\n    x = 1\n", q3(&long)));
+    assert_eq!(input["content"], "def f():\n    # a\n    # b\n    x = 1\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_docstring_in_an_edit_is_cut_inside_its_replacement() {
+    let dir = temp_dir("trim-doc-edit");
+    let path = dir.join("a.py");
+    let long = "x".repeat(95);
+    std::fs::write(&path, "class E(Exception):\n    pass\n\nx = 1\n").expect("write");
+    let sole = json!({
+        "file_path": path.to_string_lossy(),
+        "old_string": "class E(Exception):\n    pass",
+        "new_string": format!("class E(Exception):\n    {}", q3(&long)),
+    });
+    let (input, _) = cut(trimming(None, None, "Edit", sole, Provider::Claude));
+    assert_eq!(input["new_string"], "class E(Exception):\n    pass");
+    std::fs::write(&path, "def f():\n    return 1\n").expect("write");
+    let ahead = json!({
+        "file_path": path.to_string_lossy(),
+        "old_string": "def f():\n",
+        "new_string": "def f():\n    \"\"\"One.\n    Two.\n    Three.\n    \"\"\"\n",
+    });
+    let (input, _) = cut(trimming(None, None, "Edit", ahead, Provider::Claude));
+    assert_eq!(input["new_string"], "def f():\n");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n def f():\n+    \"\"\"One.\n+    Two.\n+    Three.\n+    \"\"\"\n     return 1\n*** End Patch\n",
+        path.display()
+    );
+    let (input, _) = cut(trimming(None, None, "apply_patch", json!({ "command": patch }), Provider::Codex));
+    assert_eq!(
+        input["command"],
+        format!("*** Begin Patch\n*** Update File: {}\n@@\n def f():\n     return 1\n*** End Patch\n", path.display())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_docstring_that_cannot_be_cut_safely_is_still_refused() {
+    let dir = temp_dir("trim-doc-refused");
+    let path = dir.join("a.py");
+    let long = "x".repeat(95);
+    let refused = |tool: &str, input: Value, provider: Provider| {
+        assert!(denied(&trimming(None, None, tool, input, provider)), "{tool} was not refused");
+    };
+    let write = |text: &str| written(&path, text);
+    refused("Write", write("x = foo(\n    \"\"\"One.\n    Two.\n    Three.\n    \"\"\"\n)\n"), Provider::Claude);
+    refused("Write", write(&format!("{} + x\n", q3(&long))), Provider::Claude);
+    refused("Write", write(&format!("{}  # note\n", q3(&long))), Provider::Claude);
+    std::fs::write(&path, "def f():\n    \"\"\"Short.\n\n    More.\n    \"\"\"\n    return 1\n").expect("write");
+    let longer = json!({
+        "file_path": path.to_string_lossy(),
+        "old_string": "    More.",
+        "new_string": format!("    {long}"),
+    });
+    refused("Edit", longer, Provider::Claude);
+    std::fs::write(&path, "class E(Exception):\n    pass\n").expect("write");
+    let multi = json!({ "file_path": path.to_string_lossy(), "edits": [
+        { "old_string": "    pass", "new_string": format!("    {}", q3(&long)) },
+    ] });
+    refused("MultiEdit", multi, Provider::Claude);
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@ class E(Exception):\n-    pass\n+    {}\n*** End Patch\n",
+        path.display(),
+        q3(&long)
+    );
+    refused("apply_patch", json!({ "command": patch }), Provider::Codex);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn what_the_docstring_review_found_is_refused_or_cut_safely() {
+    let dir = temp_dir("trim-doc-review");
+    let path = dir.join("a.py");
+    let long = "x".repeat(95);
+    let write = |text: &str| trimming(None, None, "Write", written(&path, text), Provider::Claude);
+    assert!(denied(&write(&format!("{}; values = [\n    {}\n]\n", q3("Short."), q3(&long)))));
+    assert!(denied(&write(&format!("\"\"\"Short.\nmore\"\"\"; values = (\n    {},\n)\n", q3(&long)))));
+    assert!(denied(&write(&format!("{} + [\n    {}\n]\n", q3("Short."), q3(&long)))));
+    std::fs::write(&path, "\"\"\"\nSPDX-License-Identifier: MIT\n\"\"\"\nx = 1\n").expect("write");
+    let licence = format!("\"\"\"\nSPDX-License-Identifier: MIT\n{long}\n\"\"\"\nx = 1\n");
+    assert!(denied(&write(&licence)));
+    let (input, _) = cut(write(&format!("class C:\n    def f(\n):\n        {}\n    x = 1\n", q3(&long))));
+    assert_eq!(input["content"], "class C:\n    def f(\n):\n        pass\n    x = 1\n");
+    let (input, _) = cut(write(&format!("class C:\n    if (a and\nb):\n        {}\n    x = 1\n", q3(&long))));
+    assert_eq!(input["content"], "class C:\n    if (a and\nb):\n        pass\n    x = 1\n");
+    let (input, _) = cut(write(&format!("def f():\n\u{0c}    {}\n", q3(&long))));
+    assert_eq!(input["content"], "def f():\n\u{0c}    pass\n");
+    std::fs::write(&path, "x = 1\r\ndef f():\r\n    pass\r\ny = 2\r\n").expect("write");
+    let sole = json!({ "file_path": path.to_string_lossy(), "old_string": "    pass", "new_string": format!("    {}", q3(&long)) });
+    let (input, _) = cut(trimming(None, None, "Edit", sole, Provider::Claude));
+    assert_eq!(input["new_string"], "    pass");
+    std::fs::write(&path, "def f():\r\n    return 1\r\n").expect("write");
+    let many = json!({
+        "file_path": path.to_string_lossy(),
+        "old_string": "def f():",
+        "new_string": "def f():\r\n    \"\"\"One.\r\n    Two.\r\n    Three.\r\n    \"\"\"",
+    });
+    let (input, _) = cut(trimming(None, None, "Edit", many, Provider::Claude));
+    assert_eq!(input["new_string"], "def f():");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn what_the_second_docstring_review_found_is_refused() {
+    let dir = temp_dir("trim-doc-review2");
+    let path = dir.join("a.py");
+    let long = "x".repeat(95);
+    let write = |text: &str| trimming(None, None, "Write", written(&path, text), Provider::Claude);
+    let reused = format!("items = [\n    f\"{{\"]\"}}\" +\n    {}\n]\n", q3(&long));
+    assert!(denied(&write(&reused)));
+    let nested = format!("items = [\n    f'{{x['a']}}' +\n    {}\n]\n", q3(&long));
+    assert!(denied(&write(&nested)));
+    let plain = format!("name = f\"{{a['b']}}\"\ndef f():\n    {}\n    return 1\n", q3(&long));
+    let (input, _) = cut(write(&plain));
+    assert_eq!(input["content"], "name = f\"{a['b']}\"\ndef f():\n    return 1\n");
+    std::fs::write(&path, "def f():\n    \"\"\"Keep this.\"\"\"\n    return 1\n").expect("write");
+    let grown = format!("def f():\n    \"\"\"Keep this.\n    {long}\n    \"\"\"\n    return 1\n");
+    assert!(denied(&write(&grown)));
+    let marker = format!("\"\"\"\nCode generated by example; DO NOT EDIT.\n{long}\n\"\"\"\nx = 1\n");
+    std::fs::remove_file(&path).expect("remove");
+    assert!(denied(&write(&marker)));
+    comment_guard::limits::set_remove(true);
+    assert!(denied(&write(&marker)));
+    let vim = format!("\"\"\"\nvim: set ts=4\n{long}\n\"\"\"\nx = 1\n");
+    assert!(denied(&write(&vim)));
+    comment_guard::limits::set_remove(false);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn what_the_third_docstring_review_found_is_refused() {
+    let dir = temp_dir("trim-doc-review3");
+    let path = dir.join("a.py");
+    let long = "x".repeat(95);
+    let write = |text: &str| trimming(None, None, "Write", written(&path, text), Provider::Claude);
+    let brace = format!("items = [\n    f\"{{'}}' + \"]\"}}\" +\n    {}\n]\n", q3(&long));
+    assert!(denied(&write(&brace)));
+    let joined = format!("items = [\n    f\"{{'}}' + \"]\"}}\"\n    {}\n]\n", q3(&long));
+    assert!(denied(&write(&joined)));
+    let spec = format!("items = [\n    f\"{{x:{{w}}}}\" +\n    {}\n]\n", q3(&long));
+    assert!(!matches!(write(&spec), Verdict::Trimmed { .. }));
+    let fine = format!("name = f\"{{a['b']}} {{{{c}}}}\"\ndef f():\n    {}\n    return 1\n", q3(&long));
+    let (input, _) = cut(write(&fine));
+    assert_eq!(input["content"], "name = f\"{a['b']}\"\ndef f():\n    return 1\n".replace("{a['b']}", "{a['b']} {{c}}"));
+    std::fs::write(&path, "def f():\n    \"\"\"Keep this.\"\"\"\n    return 1\n").expect("write");
+    let grown = format!("def f():\n    {}\n    return 1\n", q3(&format!("Keep this. {long}")));
+    assert!(denied(&write(&grown)));
+    let reworded = format!("def f():\n    {}\n    return 1\n", q3(&long));
+    assert!(denied(&write(&reworded)));
+    for header in ["def f(): # rationale", "def f( ):", "def f(\n):", "def  f ():", "async def f():"] {
+        let formatted = format!("{header}\n    {}\n    return 1\n", q3(&format!("Keep this. {long}")));
+        assert!(denied(&write(&formatted)), "{header}");
+    }
+    let backslash = format!("items = [\n    rf\"\\{{ \"]\" }}\" +\n    {}\n]\n", q3(&long));
+    assert!(denied(&write(&backslash)));
+    let plain_backslash = backslash.replace("rf\"", "f\"");
+    assert!(denied(&write(&plain_backslash)));
+    let named = format!("name = f\"\\N{{DASH}} {{a}}\"\ndef h():\n    {}\n    return 1\n", q3(&long));
+    let (input, _) = cut(write(&named));
+    assert_eq!(input["content"], "name = f\"\\N{DASH} {a}\"\ndef h():\n    return 1\n");
+    let moved = format!("def g():\n    {}\n    return 1\n", q3(&long));
+    let (input, _) = cut(write(&moved));
+    assert_eq!(input["content"], "def g():\n    return 1\n");
+    std::fs::remove_file(&path).expect("remove");
+    for prefix in ["r", "R", "u", "U", "b"] {
+        comment_guard::limits::set_remove(true);
+        let marked = format!("{prefix}{}\nx = 1\n", q3(&format!("Code generated by example; DO NOT EDIT. {long}")));
+        assert!(denied(&write(&marked)), "{prefix}");
+        comment_guard::limits::set_remove(false);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn what_the_fifth_docstring_review_found_is_refused() {
+    let dir = temp_dir("trim-doc-review5");
+    let path = dir.join("a.py");
+    let long = "x".repeat(95);
+    let write = |text: &str| trimming(None, None, "Write", written(&path, text), Provider::Claude);
+    let template = format!("items = [\n    str(t\"{{\"]\"}}\") +\n    {}\n]\n", q3(&long));
+    assert!(denied(&write(&template)));
+    let grown = |header: &str| format!("{header}\n    {}\n    return 1\n", q3(&format!("Keep this. {long}")));
+    std::fs::write(&path, "def f():\n    \"\"\"Keep this.\"\"\"\n    return 1\n").expect("write");
+    for header in ["def\tf():", "async\tdef f():", "def\u{0c}f():", "def f ( ) :"] {
+        assert!(denied(&write(&grown(header))), "{header:?}");
+    }
+    std::fs::write(&path, "def f(): \"\"\"Keep this.\"\"\"\n").expect("write");
+    assert!(denied(&write(&grown("def f():"))));
+    std::fs::write(&path, "def f():\n    \"Keep this.\"\n    return 1\n").expect("write");
+    assert!(denied(&write(&grown("def f():"))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn what_the_sixth_docstring_review_found_is_kept_apart() {
+    let dir = temp_dir("trim-doc-review6");
+    let path = dir.join("a.py");
+    let long = "x".repeat(95);
+    let write = |text: &str| trimming(None, None, "Write", written(&path, text), Provider::Claude);
+    std::fs::write(&path, "def f():\n    \"Old.\"\n    return 1\n").expect("write");
+    let grown = format!("def f():\n    {}\n    return 1\n", q3(&format!("Old. {long}")));
+    assert!(denied(&write(&grown)));
+    std::fs::write(&path, "def f():\n    \"Keep this.\"\n    return 1\n").expect("write");
+    let upper = format!("def f():\n    {}\n    return 1\n", q3(&format!("KEEP THIS. {long}")));
+    assert!(denied(&write(&upper)));
+    let wrapped = format!("def f():\n    \"\"\"Keep\n    this.\n    {long}\n    \"\"\"\n    return 1\n");
+    assert!(denied(&write(&wrapped)));
+    std::fs::write(&path, "MESSAGE = \"cached result\"\n").expect("write");
+    let fresh = "MESSAGE = \"cached result\"\n\ndef f():\n    \"\"\"Return the cached result.\n    More.\n    Again.\n    \"\"\"\n    return MESSAGE\n";
+    let (input, _) = cut(write(fresh));
+    assert_eq!(input["content"], "MESSAGE = \"cached result\"\n\ndef f():\n    return MESSAGE\n");
+    let old = "class A:\n    def f(self):\n        \"\"\"Existing A documentation.\"\"\"\n        return 1\n";
+    std::fs::write(&path, old).expect("write");
+    let both = format!("{old}\nclass B:\n    def f(self):\n        {}\n        return 2\n", q3(&long));
+    let (input, _) = cut(write(&both));
+    assert_eq!(input["content"], format!("{old}\nclass B:\n    def f(self):\n        return 2\n"));
+    let same = format!("class A:\n    def f(self):\n        {}\n        return 1\n", q3(&format!("Existing A documentation. {long}")));
+    assert!(denied(&write(&same)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn what_the_seventh_docstring_review_found_is_handled() {
+    let dir = temp_dir("trim-doc-review7");
+    let path = dir.join("a.py");
+    let long = "x".repeat(95);
+    let write = |text: &str| trimming(None, None, "Write", written(&path, text), Provider::Claude);
+    let grown = |header: &str, pad: &str| format!("{header}\n{pad}{}\n{pad}return 1\n", q3(&format!("Keep this. {long}")));
+    std::fs::write(&path, "def f():\n    (\"Keep this.\")\n    return 1\n").expect("write");
+    assert!(denied(&write(&grown("def f():", "    "))));
+    std::fs::write(&path, "if True:\n    def f():\n        \"Keep this.\"\n        return 1\n").expect("write");
+    let moved = format!(
+        "class Unrelated:\n    pass\n\nif True:\n    def f():\n        {}\n        return 1\n",
+        q3(&format!("Keep this. {long}"))
+    );
+    assert!(denied(&write(&moved)));
+    std::fs::write(&path, "def f\\\n():\n    \"Keep this.\"\n    return 1\n").expect("write");
+    assert!(denied(&write(&grown("def f():", "    "))));
+    std::fs::write(&path, "def f(x: \"str\"):\n    return x\n").expect("write");
+    let fresh = format!("def f(x: \"str\"):\n    {}\n    return x\n", q3(&long));
+    let (input, _) = cut(write(&fresh));
+    assert_eq!(input["content"], "def f(x: \"str\"):\n    return x\n");
+    std::fs::write(&path, "def f(x={\"a\": \"b\"}):\n    return x\n").expect("write");
+    let dict = format!("def f(x={{\"a\": \"b\"}}):\n    {}\n    return x\n", q3(&long));
+    let (input, _) = cut(write(&dict));
+    assert_eq!(input["content"], "def f(x={\"a\": \"b\"}):\n    return x\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_remove_mode_drops_every_new_comment_of_a_call_over_the_limit() {
+    let dir = temp_dir("trim-remove");
+    let path = dir.join("a.py");
+    let text = "# a1\n# a2\n# a3\nx = 1\n";
+    comment_guard::limits::set_remove(true);
+    let (input, note) = cut(trimming(None, None, "Write", written(&path, text), Provider::Claude));
+    assert_eq!(input["content"], "x = 1\n");
+    assert!(note.contains("3 new comment line(s)"), "{note}");
+    let long = "x".repeat(95);
+    let mixed = format!("# a1\n{}\nx = 1\n# a2\n# a3\n", q3("Short."));
+    let (input, _) = cut(trimming(None, None, "Write", written(&path, &mixed), Provider::Claude));
+    assert_eq!(input["content"], "x = 1\n");
+    let within = "# a1\n# a2\nx = 1\n";
+    assert!(matches!(trimming(None, None, "Write", written(&path, within), Provider::Claude), Verdict::Allow));
+    let (input, _) = cut(trimming(None, None, "Write", written(&path, &format!("def f():\n    {}\n", q3(&long))), Provider::Claude));
+    assert_eq!(input["content"], "def f():\n    pass\n");
+    comment_guard::limits::set_remove(false);
+    let (input, _) = cut(trimming(None, None, "Write", written(&path, text), Provider::Claude));
+    assert_eq!(input["content"], "# a1\n# a2\nx = 1\n");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

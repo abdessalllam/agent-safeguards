@@ -696,7 +696,8 @@ fn a_non_utf8_argument_prints_the_usage_and_exits_two() {
 fn hook_with(envs: &[(&str, &str)], config: Option<&str>, content: &str) -> String {
     use std::io::Write;
     use std::process::Stdio;
-    let dir = temp_dir("tuning");
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = temp_dir(&format!("tuning-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     if let Some(text) = config {
         let folder = dir.join("agent-safeguards");
         std::fs::create_dir_all(&folder).expect("folder");

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ops::RangeInclusive;
 use std::sync::OnceLock;
 
@@ -29,6 +30,23 @@ pub fn configure(limits: Limits) {
 
 pub fn current() -> Limits {
     CURRENT.get().copied().unwrap_or_default()
+}
+
+thread_local! {
+    // Per thread so a test can switch the mode without touching the others.
+    static REMOVE: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn set_remove(on: bool) {
+    REMOVE.with(|flag| flag.set(on));
+}
+
+pub fn kept_lines() -> usize {
+    if REMOVE.with(Cell::get) {
+        0
+    } else {
+        current().lines
+    }
 }
 
 fn number(text: &str, range: &RangeInclusive<usize>) -> Option<usize> {

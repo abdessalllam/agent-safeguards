@@ -262,6 +262,7 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
 pub struct Trimmed {
     pub text: String,
     pub dropped: HashSet<usize>,
+    pub swapped: HashMap<usize, String>,
     pub removed: Vec<String>,
 }
 
@@ -395,9 +396,253 @@ fn fstring_triple(text: &str) -> bool {
         text.match_indices(delim).any(|(at, _)| {
             let head = text.get(..at).unwrap_or("");
             let run: String = head.chars().rev().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
-            run.len() <= 3 && run.chars().all(|c| "rRbBuUfF".contains(c)) && run.chars().any(|c| matches!(c, 'f' | 'F'))
+            run.len() <= 3 && run.chars().all(|c| "rRbBuUfFtT".contains(c)) && run.chars().any(|c| matches!(c, 'f' | 'F' | 't' | 'T'))
         })
     })
+}
+
+fn is_ident(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn has_f_prefix(bytes: &[u8], open: usize) -> bool {
+    string_prefix(bytes, open).0
+}
+
+fn string_prefix(bytes: &[u8], open: usize) -> (bool, bool) {
+    let mut start = open;
+    while start > 0 && open.saturating_sub(start) < 2 {
+        let Some(byte) = bytes.get(start.saturating_sub(1)) else {
+            break;
+        };
+        if !matches!(byte, b'r' | b'R' | b'f' | b'F' | b't' | b'T') {
+            break;
+        }
+        start = start.saturating_sub(1);
+    }
+    let prefix = bytes.get(start..open).unwrap_or(&[]);
+    let bounded = start == 0 || bytes.get(start.saturating_sub(1)).is_some_and(|byte| !is_ident(*byte));
+    let formatted = bounded && prefix.iter().any(|byte| matches!(byte, b'f' | b'F' | b't' | b'T'));
+    (formatted, prefix.iter().any(|byte| matches!(byte, b'r' | b'R')))
+}
+
+fn interpolation_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut index = start;
+    while let Some(&current) = bytes.get(index) {
+        match current {
+            b'\n' | b'\\' | b'#' => return None,
+            b'\'' | b'"' => index = literal_end(bytes, index)?,
+            b'(' | b'[' | b'{' => {
+                depth = depth.saturating_add(1);
+                index = index.saturating_add(1);
+            }
+            b')' | b']' => {
+                depth = depth.checked_sub(1)?;
+                index = index.saturating_add(1);
+            }
+            b'}' if depth == 0 => return Some(index.saturating_add(1)),
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                index = index.saturating_add(1);
+            }
+            b':' if depth == 0 => return spec_end(bytes, index.saturating_add(1)),
+            _ => index = index.saturating_add(1),
+        }
+    }
+    None
+}
+
+fn spec_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start;
+    while let Some(&current) = bytes.get(index) {
+        match current {
+            b'\n' => return None,
+            b'{' => index = interpolation_end(bytes, index.saturating_add(1))?,
+            b'}' => return Some(index.saturating_add(1)),
+            _ => index = index.saturating_add(1),
+        }
+    }
+    None
+}
+
+fn literal_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let quote = *bytes.get(open)?;
+    let after = open.saturating_add(1);
+    if bytes.get(after) == Some(&quote) && bytes.get(after.saturating_add(1)) == Some(&quote) {
+        return None;
+    }
+    let (formatted, raw) = string_prefix(bytes, open);
+    let mut index = after;
+    while let Some(&current) = bytes.get(index) {
+        match current {
+            b'\\' if formatted => {
+                let next = bytes.get(index.saturating_add(1));
+                let named = !raw && next == Some(&b'N') && bytes.get(index.saturating_add(2)) == Some(&b'{');
+                if named {
+                    let close = bytes.get(index..)?.iter().position(|byte| *byte == b'}')?;
+                    index = index.saturating_add(close).saturating_add(1);
+                } else if next == Some(&b'{') {
+                    index = index.saturating_add(1);
+                } else {
+                    index = index.saturating_add(2);
+                }
+            }
+            b'\\' => index = index.saturating_add(2),
+            b'\n' => return None,
+            _ if current == quote => return Some(index.saturating_add(1)),
+            b'{' if formatted => {
+                if bytes.get(index.saturating_add(1)) == Some(&b'{') {
+                    index = index.saturating_add(2);
+                } else {
+                    index = interpolation_end(bytes, index.saturating_add(1))?;
+                }
+            }
+            _ => index = index.saturating_add(1),
+        }
+    }
+    None
+}
+
+fn first_quote_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let quote = *bytes.get(open)?;
+    let mut index = open.saturating_add(1);
+    while let Some(&current) = bytes.get(index) {
+        match current {
+            b'\\' => index = index.saturating_add(2),
+            b'\n' => return None,
+            _ if current == quote => return Some(index.saturating_add(1)),
+            _ => index = index.saturating_add(1),
+        }
+    }
+    None
+}
+
+fn fstring_misread(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(open, byte)| {
+        matches!(byte, b'"' | b'\'') && has_f_prefix(bytes, open) && {
+            let plain = first_quote_end(bytes, open);
+            plain.is_some() && plain != literal_end(bytes, open)
+        }
+    })
+}
+
+fn header_key(head: &str) -> String {
+    let code = head.split('#').next().unwrap_or("");
+    let mut words = code.split_whitespace().peekable();
+    if words.peek() == Some(&"async") {
+        words.next();
+    }
+    if let Some(word) = words.next().filter(|word| matches!(*word, "def" | "class")) {
+        let rest = words.next().unwrap_or("");
+        let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        return format!("{word} {name}");
+    }
+    code.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn is_def_key(key: &str) -> bool {
+    key.starts_with("def ") || key.starts_with("class ")
+}
+
+fn header_path(lines: &[&str], logical: &[usize], start: usize) -> String {
+    let mut parts = vec![header_key(lines.get(start).map_or("", |line| line.trim()))];
+    let mut indent = lines.get(start).map_or(0, |line| indent_of(line));
+    for index in (0..start).rev() {
+        if logical.get(index).copied() != Some(index) {
+            continue;
+        }
+        let Some(line) = lines.get(index).filter(|line| code_line(line)) else {
+            continue;
+        };
+        let key = header_key(line.trim());
+        if indent_of(line) < indent {
+            indent = indent_of(line);
+            if is_def_key(&key) {
+                parts.push(key);
+            }
+        }
+    }
+    parts.reverse();
+    parts.join(">")
+}
+
+fn anchor_of(lines: &[&str], logical: &[usize], first: usize) -> String {
+    let found = (0..first).rev().find(|index| lines.get(*index).is_some_and(|line| code_line(line)));
+    let Some(index) = found else {
+        return String::new();
+    };
+    let start = logical.get(index).copied().unwrap_or(index);
+    header_path(lines, logical, start)
+}
+
+fn starts_with_quote(line: &str) -> bool {
+    let bare = line.trim_start_matches(|c: char| c == '(' || c.is_whitespace());
+    bare.trim_start_matches(|c: char| "rRuUbBfF".contains(c)).starts_with(['"', '\''])
+}
+
+fn has_inline_string(line: &str) -> bool {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut skip = false;
+    for (at, ch) in line.char_indices() {
+        if skip {
+            skip = false;
+            continue;
+        }
+        match (quote, ch) {
+            (Some(_), '\\') => skip = true,
+            (Some(open), _) if ch == open => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, '(' | '[' | '{') => depth = depth.saturating_add(1),
+            (None, ')' | ']' | '}') => depth = depth.saturating_sub(1),
+            (None, ':') if depth == 0 => {
+                return starts_with_quote(line.get(at.saturating_add(1)..).unwrap_or("").trim_start());
+            }
+            (None, '#') => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn doc_anchors(old: &str, lang: Language) -> HashSet<String> {
+    let lines: Vec<&str> = old.split('\n').collect();
+    let mut logical: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut found = HashSet::new();
+    let mut scanner = scan(old, lang);
+    while scanner.next().is_some() {
+        let index = scanner.line_index();
+        while logical.len() <= index {
+            let start = if scanner.starts_logical() { index } else { logical.last().copied().unwrap_or(0) };
+            logical.push(start);
+        }
+        if scanner.doc_start() {
+            found.insert(anchor_of(&lines, &logical, index));
+        }
+    }
+    for (index, line) in lines.iter().enumerate() {
+        if logical.get(index).copied() != Some(index) || !code_line(line) {
+            continue;
+        }
+        if starts_with_quote(line.trim()) {
+            found.insert(anchor_of(&lines, &logical, index));
+        } else if is_def_key(&header_key(line.trim())) && has_inline_string(line) {
+            found.insert(header_path(&lines, &logical, index));
+        }
+    }
+    found
+}
+
+fn doc_text(line: &str) -> &str {
+    let text = line.trim();
+    let bare = text.trim_start_matches(|c: char| "rRuUbBfF".contains(c));
+    let opened = ["\"\"\"", "'''"].iter().find_map(|delim| bare.strip_prefix(delim));
+    let text = opened.unwrap_or(text);
+    let closed = ["\"\"\"", "'''"].iter().find_map(|delim| text.strip_suffix(delim));
+    closed.unwrap_or(text).trim()
 }
 
 fn jsx_like(text: &str) -> bool {
@@ -421,8 +666,98 @@ fn risky(text: &str, lang: Language) -> bool {
         || (lang == GO && text.contains("\"C\""))
         || (lang == SWIFT && (text.contains("#\"") || nested_triple(text, "\\(", b'(', b')')))
         || (lang == KOTLIN && nested_triple(text, "${", b'{', b'}'))
-        || (lang == PYTHON && fstring_triple(text))
+        || (lang == PYTHON && (fstring_triple(text) || fstring_misread(text)))
         || (lang == SCRIPT && (nested_template(text) || jsx_like(text)))
+}
+
+struct Piece {
+    first: usize,
+    last: usize,
+    shown: Vec<String>,
+    cost: usize,
+    fine: bool,
+    docstring: bool,
+}
+
+struct OpenDoc {
+    first: usize,
+    shown: Vec<String>,
+    fine: bool,
+    fresh: bool,
+    statement: bool,
+}
+
+fn fits(line: &str) -> bool {
+    history_marker(body(line)).is_none() && line.chars().count() <= limits::current().line_chars
+}
+
+fn code_line(line: &str) -> bool {
+    let text = line.trim();
+    !text.is_empty() && !text.starts_with('#')
+}
+
+fn indent_of(line: &str) -> usize {
+    let mut column = 0usize;
+    for ch in line.chars() {
+        match ch {
+            ' ' => column = column.saturating_add(1),
+            '\t' => column = (column / 8).saturating_add(1).saturating_mul(8),
+            '\x0c' => column = 0,
+            _ => break,
+        }
+    }
+    column
+}
+
+fn delimiter_only(line: &str) -> bool {
+    let bare = line.trim_start_matches(|c: char| "rRuUbBfF".contains(c));
+    bare == "\"\"\"" || bare == "'''"
+}
+
+fn opens_block(line: &str) -> bool {
+    let code = line.trim_end();
+    code.ends_with(':')
+        || code
+            .match_indices('#')
+            .any(|(at, _)| line.get(..at).is_some_and(|head| head.trim_end().ends_with(':')))
+}
+
+// A docstring that is the only statement of its block cannot just be removed: the block
+// would be empty. Over-reading a header here only adds a harmless `pass`.
+fn needs_pass(
+    lines: &[&str],
+    logical: &[usize],
+    gone: &HashSet<usize>,
+    standing: &HashMap<usize, String>,
+    piece: &Piece,
+) -> bool {
+    let mut head = None;
+    for index in (0..piece.first).rev() {
+        if standing.contains_key(&index) {
+            return false;
+        }
+        if gone.contains(&index) {
+            continue;
+        }
+        if lines.get(index).is_some_and(|line| code_line(line)) {
+            head = Some(index);
+            break;
+        }
+    }
+    let Some(head) = head.filter(|index| lines.get(*index).is_some_and(|line| opens_block(line))) else {
+        return false;
+    };
+    let opener = logical.get(head).copied().unwrap_or(head);
+    let base = lines.get(opener).map_or(0, |line| indent_of(line));
+    for index in piece.last.saturating_add(1)..lines.len() {
+        if gone.contains(&index) {
+            continue;
+        }
+        if let Some(line) = lines.get(index).filter(|line| code_line(line)) {
+            return indent_of(line) <= base;
+        }
+    }
+    true
 }
 
 pub fn trimmed(change: &Change) -> Option<Trimmed> {
@@ -449,57 +784,125 @@ pub fn trimmed(change: &Change) -> Option<Trimmed> {
         let slot = pool.entry(line).or_insert(0);
         *slot = (*slot).max(count);
     }
+    let anchors = if lang.docstring { doc_anchors(&change.old, lang) } else { HashSet::new() };
+    let old_unclear = lang.docstring && (change.old.contains("\\\n") || change.old.contains("\\\r"));
+    let lines: Vec<&str> = change.new.split('\n').collect();
+    let mut logical: Vec<usize> = Vec::with_capacity(lines.len());
     let mut scanner = scan(&change.new, lang);
-    let mut fresh: Vec<(usize, &str)> = Vec::new();
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut open: Option<OpenDoc> = None;
     while let Some(kind) = scanner.next() {
-        let (line, same_line) = match kind {
-            LineKind::Comment(line) => (line, false),
-            LineKind::Also(line) => (line, true),
-            LineKind::Other => continue,
+        let index = scanner.line_index();
+        while logical.len() <= index {
+            let start = if scanner.starts_logical() { index } else { logical.last().copied().unwrap_or(0) };
+            logical.push(start);
+        }
+        if scanner.doc_start() {
+            open = Some(OpenDoc {
+                first: index,
+                shown: Vec::new(),
+                fine: true,
+                fresh: !anchors.contains(&anchor_of(&lines, &logical, index)),
+                statement: scanner.at_statement(),
+            });
+        }
+        let found = match kind {
+            LineKind::Comment(line) => Some((line, false)),
+            LineKind::Also(line) => Some((line, true)),
+            LineKind::Other => None,
         };
-        let kept = match pool.get_mut(line) {
-            Some(count) if *count > 0 => {
-                *count -= 1;
-                true
+        if found.is_none() {
+            let raw = lines.get(index).map_or("", |line| line.trim());
+            if let Some(doc) = open.as_mut().filter(|_| !raw.is_empty() && !delimiter_only(raw)) {
+                doc.fresh = false;
             }
-            _ => false,
-        };
-        let guarded = protected(body(line)) || (scanner.line_index() < 3 && directive_shaped(line));
-        if !kept && !same_line && scanner.standalone() && !guarded {
-            fresh.push((scanner.line_index(), line));
+        }
+        if let Some((line, same_line)) = found {
+            let kept = match pool.get_mut(line) {
+                Some(count) if *count > 0 => {
+                    *count -= 1;
+                    true
+                }
+                _ => false,
+            };
+            if let Some(doc) = open.as_mut() {
+                let text = doc_text(line);
+                doc.fresh &= !kept && !protected(body(line)) && !protected(text);
+                doc.fine &= fits(line);
+                doc.shown.push(line.trim().to_owned());
+            } else {
+                let guarded = protected(body(line)) || (scanner.line_index() < 3 && directive_shaped(line));
+                if !kept && !same_line && scanner.standalone() && !guarded {
+                    pieces.push(Piece {
+                        first: index,
+                        last: index,
+                        shown: vec![line.trim().to_owned()],
+                        cost: 1,
+                        fine: fits(line),
+                        docstring: false,
+                    });
+                }
+            }
+        }
+        if scanner.doc_end() {
+            if let Some(doc) = open.take() {
+                if doc.fresh && !old_unclear && doc.statement && scanner.doc_pure() && !doc.shown.is_empty() {
+                    pieces.push(Piece {
+                        first: doc.first,
+                        last: index,
+                        cost: doc.shown.len(),
+                        shown: doc.shown,
+                        fine: doc.fine,
+                        docstring: true,
+                    });
+                }
+            }
         }
     }
-    if scanner.uncertain() || fresh.is_empty() {
+    if scanner.uncertain() || pieces.is_empty() {
         return None;
     }
-    let lines: Vec<&str> = change.new.split('\n').collect();
-    for keep in (0..=limits::current().lines).rev() {
+    for keep in (0..=limits::kept_lines()).rev() {
         let mut kept = 0usize;
-        let mut dropped: HashSet<usize> = HashSet::new();
-        for (index, line) in &fresh {
-            let fine = history_marker(body(line)).is_none() && line.chars().count() <= limits::current().line_chars;
-            if kept < keep && fine {
-                kept = kept.saturating_add(1);
+        let mut cut: Vec<&Piece> = Vec::new();
+        for piece in &pieces {
+            if piece.fine && kept.saturating_add(piece.cost) <= keep {
+                kept = kept.saturating_add(piece.cost);
             } else {
-                dropped.insert(*index);
+                cut.push(piece);
             }
         }
-        if dropped.is_empty() {
+        if cut.is_empty() {
             continue;
+        }
+        let mut gone: HashSet<usize> = HashSet::new();
+        for piece in &cut {
+            gone.extend(piece.first..=piece.last);
+        }
+        let mut standing: HashMap<usize, String> = HashMap::new();
+        for piece in cut.iter().filter(|piece| piece.docstring) {
+            if needs_pass(&lines, &logical, &gone, &standing, piece) {
+                let line = lines.get(piece.first)?;
+                let pad: String = line.chars().take_while(|c| matches!(c, ' ' | '\t' | '\x0c')).collect();
+                gone.remove(&piece.first);
+                standing.insert(piece.first, format!("{pad}pass"));
+            }
         }
         let text = lines
             .iter()
             .enumerate()
-            .filter(|(index, _)| !dropped.contains(index))
-            .map(|(_, line)| *line)
-            .collect::<Vec<&str>>()
+            .filter(|(index, _)| !gone.contains(index))
+            .map(|(index, line)| match standing.get(&index) {
+                Some(stand_in) if line.ends_with('\r') => format!("{stand_in}\r"),
+                Some(stand_in) => stand_in.clone(),
+                None => (*line).to_owned(),
+            })
+            .collect::<Vec<String>>()
             .join("\n");
         let trial = Change { new: text.clone(), ..change.clone() };
         if evaluate(std::slice::from_ref(&trial)).is_none() {
-            let mut order: Vec<&usize> = dropped.iter().collect();
-            order.sort();
-            let removed = order.into_iter().filter_map(|index| lines.get(*index)).map(|line| line.trim().to_owned()).collect();
-            return Some(Trimmed { text, dropped, removed });
+            let removed = cut.iter().flat_map(|piece| piece.shown.iter().cloned()).collect();
+            return Some(Trimmed { text, dropped: gone, swapped: standing, removed });
         }
     }
     None

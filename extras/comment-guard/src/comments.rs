@@ -589,6 +589,17 @@ pub struct Scan<'a> {
     consumed: usize,
     standalone: bool,
     uncertain: bool,
+    depth: u32,
+    line_depth: u32,
+    line_open: bool,
+    doc: DocEdge,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DocEdge {
+    start: bool,
+    end: bool,
+    pure: bool,
 }
 
 pub fn scan(text: &str, lang: Language) -> Scan<'_> {
@@ -601,6 +612,10 @@ pub fn scan(text: &str, lang: Language) -> Scan<'_> {
         consumed: 0,
         standalone: false,
         uncertain: false,
+        depth: 0,
+        line_depth: 0,
+        line_open: false,
+        doc: DocEdge::default(),
     }
 }
 
@@ -611,6 +626,7 @@ impl<'a> Iterator for Scan<'a> {
         loop {
             if let Some(text) = self.extra.pop_front() {
                 self.standalone = false;
+                self.doc = DocEdge::default();
                 if is_exempt(body(text)) || (self.lang.sentinel && is_sentinel(text)) {
                     continue;
                 }
@@ -619,6 +635,9 @@ impl<'a> Iterator for Scan<'a> {
             let line = self.lines.next()?;
             self.consumed = self.consumed.saturating_add(1);
             self.standalone = false;
+            self.doc = DocEdge::default();
+            self.line_depth = self.depth;
+            self.line_open = !matches!(self.state, State::Code);
             return Some(match self.classify(line) {
                 LineKind::Comment(text) if is_exempt(body(text)) || (self.lang.sentinel && is_sentinel(text)) => {
                     LineKind::Other
@@ -640,6 +659,28 @@ impl<'a> Scan<'a> {
 
     pub fn uncertain(&self) -> bool {
         self.uncertain
+    }
+
+    // The three docstring edges and the bracket depth are kept apart from `standalone`
+    // because a docstring is one multi-line statement that is cut as a whole.
+    pub fn doc_start(&self) -> bool {
+        self.doc.start
+    }
+
+    pub fn doc_end(&self) -> bool {
+        self.doc.end
+    }
+
+    pub fn doc_pure(&self) -> bool {
+        self.doc.pure
+    }
+
+    pub fn at_statement(&self) -> bool {
+        self.line_depth == 0
+    }
+
+    pub fn starts_logical(&self) -> bool {
+        self.line_depth == 0 && !self.line_open
     }
 
     fn classify(&mut self, line: &'a str) -> LineKind<'a> {
@@ -717,6 +758,12 @@ impl<'a> Scan<'a> {
             self.state = State::Code;
         }
         if doc {
+            if let Some(end) = closed {
+                let tail = trimmed.get(end.saturating_add(delim.len())..);
+                self.doc.end = true;
+                self.doc.pure = tail.is_some_and(|rest| rest.trim().is_empty());
+                self.follow_doc(tail);
+            }
             return if trimmed == delim {
                 LineKind::Other
             } else {
@@ -816,9 +863,15 @@ impl<'a> Scan<'a> {
             .copied()
             .find(|delim| stripped.starts_with(*delim))?;
         let after = stripped.get(delim.len()..)?;
+        let leading = from.len() == trimmed.len() && self.lang.docstring;
         match find_unescaped(after, delim) {
             Some(end) => {
                 let content = after.get(..end).unwrap_or("");
+                if leading {
+                    let tail = after.get(end.saturating_add(delim.len())..);
+                    self.doc = DocEdge { start: true, end: true, pure: tail.is_some_and(|rest| rest.trim().is_empty()) };
+                    self.follow_doc(tail);
+                }
                 Some(if content.trim().is_empty() {
                     LineKind::Other
                 } else {
@@ -827,12 +880,22 @@ impl<'a> Scan<'a> {
             }
             None => {
                 self.state = State::Triple { delim, doc: true };
+                if leading {
+                    self.doc.start = true;
+                }
                 Some(if after.trim().is_empty() {
                     LineKind::Other
                 } else {
                     LineKind::Comment(trimmed)
                 })
             }
+        }
+    }
+
+    fn follow_doc(&mut self, tail: Option<&'a str>) {
+        if let Some(rest) = tail.filter(|rest| !rest.trim().is_empty()) {
+            let mut ignored: Vec<&'a str> = Vec::new();
+            self.scan_code(rest, Some(b'"'), &mut ignored);
         }
     }
 
@@ -951,6 +1014,13 @@ impl<'a> Scan<'a> {
                     previous = Some(b')');
                     significant = previous;
                     continue;
+                }
+            }
+            if lang.docstring {
+                match first {
+                    '(' | '[' | '{' => self.depth = self.depth.saturating_add(1),
+                    ')' | ']' | '}' => self.depth = self.depth.saturating_sub(1),
+                    _ => {}
                 }
             }
             previous = rest.as_bytes().first().copied();

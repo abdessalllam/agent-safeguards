@@ -184,7 +184,7 @@ fn trim_on_disk(change: &Change, cwd: &Path, ledger: &Ledger) -> Option<String> 
     }
     let comments = comment_lines(&cut.text, lang);
     ledger.accept(&identity(path), &[seen_of(&cut.text, &comments)]);
-    Some(crate::trimmed_note("comment_guard.trimmed_after", &change.file, &cut.removed))
+    Some(crate::trimmed_note("comment_guard.trimmed_after", &change.file, &cut.removed, cut.swapped.len()))
 }
 
 fn command_of(payload: &Map<String, Value>) -> &str {

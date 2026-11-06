@@ -105,6 +105,13 @@ fn trimming_enabled() -> bool {
     !switch_file().is_some_and(|path| path.with_file_name("comment-guard-refuse").exists())
 }
 
+fn removing_comments() -> bool {
+    if let Ok(value) = std::env::var("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM") {
+        return value.trim().eq_ignore_ascii_case("remove");
+    }
+    switch_file().is_some_and(|path| path.with_file_name("comment-guard-remove").exists())
+}
+
 fn guard_enabled() -> bool {
     if let Ok(value) = std::env::var("AGENT_SAFEGUARDS_COMMENT_GUARD") {
         let value = value.trim();
@@ -129,6 +136,7 @@ fn hook(provider: Provider, event: Option<&str>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     limits::configure(load_limits());
+    limits::set_remove(removing_comments());
     let limit = MAX_INPUT.saturating_add(1) as u64;
     let mut stdin = std::io::stdin().lock().take(limit);
     let mut input = String::new();

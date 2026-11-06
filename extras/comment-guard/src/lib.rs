@@ -240,7 +240,7 @@ pub fn judge_in(input: &str, provider: Provider, state: Option<&Path>) -> Verdic
     judge_payload(&payload, provider, state, false)
 }
 
-pub(crate) fn trimmed_note(key: &str, file: &str, removed: &[String]) -> String {
+pub(crate) fn trimmed_note(key: &str, file: &str, removed: &[String], stood_in: usize) -> String {
     let shown: Vec<String> = removed.iter().take(6).map(|line| line.chars().take(70).collect()).collect();
     let mut lines = shown.join(" | ");
     if removed.len() > shown.len() {
@@ -248,10 +248,16 @@ pub(crate) fn trimmed_note(key: &str, file: &str, removed: &[String]) -> String 
     }
     let count = removed.len().to_string();
     let max_lines = limits::current().lines.to_string();
-    message(
+    let note = message(
         key,
         &[("count", count.as_str()), ("file", file), ("lines", lines.as_str()), ("max_lines", max_lines.as_str())],
-    )
+    );
+    if stood_in == 0 {
+        return note;
+    }
+    let blocks = stood_in.to_string();
+    let extra = message("comment_guard.trimmed_pass", &[("count", blocks.as_str()), ("file", file)]);
+    format!("{note} {extra}")
 }
 
 fn try_trim(
@@ -293,7 +299,7 @@ fn try_trim(
     let notes: Vec<String> = changes
         .iter()
         .zip(&cuts)
-        .filter_map(|(change, cut)| cut.as_ref().map(|cut| trimmed_note("comment_guard.trimmed", &change.file, &cut.removed)))
+        .filter_map(|(change, cut)| cut.as_ref().map(|cut| trimmed_note("comment_guard.trimmed", &change.file, &cut.removed, cut.swapped.len())))
         .collect();
     Some(Verdict::Trimmed {
         input: Value::Object(new_input),

@@ -41,15 +41,41 @@ fn removed_ranges(new: &str, cut: &Trimmed) -> Vec<(usize, usize, bool)> {
     out
 }
 
+fn swapped_ranges<'a>(new: &str, cut: &'a Trimmed) -> Vec<(usize, usize, &'a str)> {
+    let mut offset = 0usize;
+    let mut out = Vec::new();
+    for (index, line) in new.split('\n').enumerate() {
+        let from = offset;
+        offset = from.saturating_add(line.len()).saturating_add(1);
+        if let Some(stand_in) = cut.swapped.get(&index) {
+            out.push((from, from.saturating_add(line.trim_end_matches('\r').len()), stand_in.as_str()));
+        }
+    }
+    out
+}
+
 fn region(change: &Change, cut: &Trimmed, start: usize, end: usize) -> Option<String> {
     let mut inside = 0usize;
     for (a, b, last) in removed_ranges(&change.new, cut) {
-        if !((a >= start && b <= end) || (!last && b == end.saturating_add(1) && a > start)) {
+        let crlf = !last
+            && b == end.saturating_add(2)
+            && a > start.saturating_add(1)
+            && change.new.get(end..b) == Some("\r\n")
+            && change.new.get(a.saturating_sub(2)..a) == Some("\r\n");
+        if !((a >= start && b <= end) || (!last && b == end.saturating_add(1) && a > start) || crlf) {
             return None;
         }
         inside = inside.saturating_add(b.saturating_sub(a));
     }
-    cut.text.get(start..end.checked_sub(inside)?).map(str::to_owned)
+    let mut added = 0usize;
+    for (a, b, stand_in) in swapped_ranges(&change.new, cut) {
+        if a < start || b > end {
+            return None;
+        }
+        inside = inside.saturating_add(b.saturating_sub(a));
+        added = added.saturating_add(stand_in.len());
+    }
+    cut.text.get(start..end.checked_sub(inside)?.checked_add(added)?).map(str::to_owned)
 }
 
 fn write_input(input: &Map<String, Value>, change: &Change, cut: &Trimmed) -> Option<Map<String, Value>> {
@@ -103,7 +129,7 @@ fn apply_first(old: &str, edits: &[(String, String)]) -> Option<String> {
 }
 
 fn multi_edit_input(input: &Map<String, Value>, change: &Change, cut: &Trimmed) -> Option<Map<String, Value>> {
-    if change.old.len() > MAX_TRACKED || change.new.len() > MAX_TRACKED {
+    if change.old.len() > MAX_TRACKED || change.new.len() > MAX_TRACKED || !cut.swapped.is_empty() {
         return None;
     }
     let Some(Value::Array(items)) = input.get("edits") else {
@@ -223,6 +249,9 @@ fn patch_input(input: &Map<String, Value>, changes: &[Change], cuts: &[Option<Tr
         let Some(cut) = cut else {
             continue;
         };
+        if !cut.swapped.is_empty() {
+            return None;
+        }
         let lines: Vec<&str> = change.new.split('\n').collect();
         let mut need: HashMap<&str, usize> = HashMap::new();
         for index in &cut.dropped {
