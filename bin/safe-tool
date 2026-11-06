@@ -1132,7 +1132,7 @@ def _sensitive_chunk(raw_words: list[str]) -> bool:
     except UnresolvableCommand:
         return True
     if not words:
-        return True
+        return any(_normalized(word) == "env" for word in raw_words)
     normalized = [_normalized(word) for word in words]
     if normalized[0] == TOOL_NAME:
         return not _is_self(words[0])
