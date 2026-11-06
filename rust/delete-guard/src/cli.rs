@@ -58,7 +58,7 @@ fn emit_stop(key: &str) {
 }
 
 fn parse_payload(raw: &[u8]) -> Option<Value> {
-    if let Ok(value) = serde_json::from_slice(raw) {
+    if let Some(value) = guard_common::pyjson::loads(raw) {
         return Some(value);
     }
     let mut normalized = Vec::with_capacity(raw.len());
@@ -98,7 +98,7 @@ fn parse_payload(raw: &[u8]) -> Option<Value> {
         index = index.saturating_add(1);
     }
     if changed {
-        serde_json::from_slice(&normalized).ok()
+        guard_common::pyjson::loads(&normalized)
     } else {
         None
     }

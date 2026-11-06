@@ -22,28 +22,9 @@ fn scalar_text(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => Some(text.clone()),
         Value::Number(number) => {
-            if let Some(number) = number.as_i64() {
-                Some(number.to_string())
-            } else if let Some(number) = number.as_u64() {
-                Some(number.to_string())
-            } else {
-                let value = number.as_f64()?;
-                let rendered = format!("{value:?}");
-                if let Some(marker) = rendered.find(['e', 'E']) {
-                    let mantissa = rendered.get(..marker).unwrap_or(&rendered);
-                    let exponent = rendered.get(marker.saturating_add(1)..).unwrap_or("");
-                    let (sign, digits) = if let Some(rest) = exponent.strip_prefix('-') {
-                        ("-", rest)
-                    } else {
-                        ("+", exponent.strip_prefix('+').unwrap_or(exponent))
-                    };
-                    let width = digits.len().max(2);
-                    Some(format!("{mantissa}e{sign}{digits:0>width$}"))
-                } else if rendered.contains('.') {
-                    Some(rendered)
-                } else {
-                    Some(format!("{rendered}.0"))
-                }
+            match guard_common::pyjson::integer_text(number) {
+                Some(text) => Some(text),
+                None => Some(guard_common::emit::python_float_repr(number.as_f64()?)),
             }
         }
         _ => None,

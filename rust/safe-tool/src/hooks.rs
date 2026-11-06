@@ -151,16 +151,11 @@ pub fn redact_keys(
 pub fn line_number(value: &Value, default: usize) -> Result<Option<usize>, HookError> {
     match value {
         Value::Null | Value::Bool(_) => Ok(Some(default)),
-        Value::Number(number) => {
-            if let Some(number) = number.as_u64() {
-                let number = usize::try_from(number).unwrap_or(usize::MAX);
-                Ok(Some(if number > 0 { number } else { default }))
-            } else if number.as_i64().is_some() {
-                Ok(Some(default))
-            } else {
-                Ok(None)
-            }
-        }
+        Value::Number(number) => match guard_common::pyjson::integer_text(number) {
+            Some(text) if text.starts_with('-') || text == "0" => Ok(Some(default)),
+            Some(text) => Ok(Some(text.parse::<usize>().unwrap_or(usize::MAX))),
+            None => Ok(None),
+        },
         Value::String(text) => {
             let trimmed = text.trim_matches(py_space);
             if trimmed.is_empty()
@@ -171,7 +166,9 @@ pub fn line_number(value: &Value, default: usize) -> Result<Option<usize>, HookE
             {
                 return Ok(None);
             }
-            if trimmed.chars().count() > 4_300 {
+            if trimmed.chars().count() > 4_300
+                || text.chars().any(|character| ('\u{1c}'..='\u{1f}').contains(&character))
+            {
                 return Err(HookError::Internal);
             }
             let mut value = 0usize;
@@ -388,9 +385,7 @@ pub fn run_hook_bytes(runtime: &str, expected_event: Option<&str>, raw_input: &[
                 return None;
             }
         }
-        serde_json::from_slice::<Value>(raw_input)
-            .ok()
-            .filter(Value::is_object)
+        guard_common::pyjson::loads(raw_input).filter(Value::is_object)
     })();
     let Some(payload) = parsed else {
         fail_closed_unreadable(runtime, raw_input, expected_event);
@@ -409,7 +404,13 @@ pub fn run_hook_bytes(runtime: &str, expected_event: Option<&str>, raw_input: &[
     let outcome = command::run_with_budget(
         consts::hook_budget_seconds(),
         || {
-            error = handle_event(runtime, event, &payload).err();
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle_event(runtime, event, &payload)
+            }));
+            error = match checked {
+                Ok(result) => result.err(),
+                Err(_) => Some(HookError::Internal),
+            };
         },
         move || {
             if !env::fail_open() {
@@ -420,6 +421,9 @@ pub fn run_hook_bytes(runtime: &str, expected_event: Option<&str>, raw_input: &[
                     &on_timeout_payload,
                     "safe_tool.deny.too_slow",
                 );
+            }
+            if END_AT_TIMEOUT.load(Ordering::SeqCst) {
+                std::process::exit(0);
             }
         },
     );
@@ -434,6 +438,9 @@ pub fn run_hook_bytes(runtime: &str, expected_event: Option<&str>, raw_input: &[
     }
     0
 }
+
+// Only the command line sets this: a check blocked in file I/O cannot be interrupted.
+pub static END_AT_TIMEOUT: AtomicBool = AtomicBool::new(false);
 
 pub fn run_hook(runtime: &str, expected_event: Option<&str>) -> i32 {
     let mut raw_input = Vec::new();
@@ -460,7 +467,7 @@ pub fn refuse_unchecked(runtime: &str, event: &str, payload: &Value, reason_key:
 
 pub fn json_payloads(output: &[u8]) -> Option<Vec<Value>> {
     let text = std::str::from_utf8(output).ok()?;
-    if let Ok(value) = serde_json::from_str(text) {
+    if let Some(value) = guard_common::pyjson::loads(text.as_bytes()) {
         return Some(vec![value]);
     }
     let mut payloads = Vec::new();
@@ -481,7 +488,7 @@ pub fn json_payloads(output: &[u8]) -> Option<Vec<Value>> {
         if line.trim_matches(py_space).is_empty() {
             continue;
         }
-        payloads.push(serde_json::from_str(line).ok()?);
+        payloads.push(guard_common::pyjson::loads(line.as_bytes())?);
     }
     (!payloads.is_empty()).then_some(payloads)
 }
@@ -490,7 +497,23 @@ pub fn json_payloads(output: &[u8]) -> Option<Vec<Value>> {
 mod tests {
     use serde_json::json;
 
-    use super::{command_of, content_tool_name, json_payloads, line_number, redact_keys};
+    use super::{command_of, content_tool_name, json_payloads, line_number, redact_keys, HookError};
+
+    #[test]
+    fn python_int_rules_decide_line_numbers() {
+        let number = |text: &str| serde_json::from_str::<serde_json::Value>(text).expect("json");
+        assert!(matches!(line_number(&json!("\u{1c}1"), 1), Err(HookError::Internal)));
+        assert!(matches!(line_number(&json!("2\u{1f}"), 1), Err(HookError::Internal)));
+        assert!(matches!(line_number(&json!(" \u{a0}7\t"), 1), Ok(Some(7))));
+        assert!(matches!(line_number(&json!("x"), 1), Ok(None)));
+        assert!(matches!(line_number(&number("18446744073709551616"), 1), Ok(Some(usize::MAX))));
+        assert!(matches!(line_number(&number("-18446744073709551616"), 4), Ok(Some(4))));
+        assert!(matches!(line_number(&number("-0"), 4), Ok(Some(4))));
+        assert!(matches!(line_number(&number("0"), 4), Ok(Some(4))));
+        assert!(matches!(line_number(&number("1.5"), 4), Ok(None)));
+        assert!(matches!(line_number(&number("5.0"), 4), Ok(None)));
+        assert!(matches!(line_number(&number("1e2"), 4), Ok(None)));
+    }
 
     #[test]
     fn missing_and_non_string_commands_are_absent() {

@@ -96,6 +96,7 @@ fn normalize_nonfinite(raw: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn hook(runtime: &str, expected_event: Option<&str>) -> i32 {
+    hooks::END_AT_TIMEOUT.store(true, std::sync::atomic::Ordering::SeqCst);
     let mut raw = Vec::new();
     let mut input = std::io::stdin().take(hooks::CONTENT_INPUT_BYTES.saturating_add(1) as u64);
     if input.read_to_end(&mut raw).is_err() {

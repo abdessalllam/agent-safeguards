@@ -9,7 +9,7 @@ rust-version = "1.90"
 license = "MIT"
 
 [workspace.dependencies]
-serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
+serde_json = { version = "=1.0.151", default-features = false, features = ["std", "arbitrary_precision", "unbounded_depth"] }
 regex = "=1.13.1"
 libc = "=0.2.190"
 guard-common = { path = "guard-common" }

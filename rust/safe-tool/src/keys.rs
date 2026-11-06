@@ -130,6 +130,31 @@ pub fn apply_line(line: &str, found: &mut HashSet<String>) {
     apply_command(&command, found);
 }
 
+// Python opens the file in text mode, so CR and CRLF end a line like LF does.
+fn read_universal_line(reader: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok((!line.is_empty()).then_some(line));
+        }
+        let Some(at) = buffer.iter().position(|byte| matches!(byte, b'\n' | b'\r')) else {
+            let length = buffer.len();
+            line.extend_from_slice(buffer);
+            reader.consume(length);
+            continue;
+        };
+        let ending = buffer.get(at).copied();
+        line.extend_from_slice(buffer.get(..at).unwrap_or(&[]));
+        reader.consume(at.saturating_add(1));
+        if ending == Some(b'\r') && reader.fill_buf()?.first() == Some(&b'\n') {
+            reader.consume(1);
+        }
+        line.push(b'\n');
+        return Ok(Some(line));
+    }
+}
+
 pub fn keys_set_in(path: &str) -> Result<(HashSet<String>, bool), EmbeddedNul> {
     if path.contains('\0') {
         return Err(EmbeddedNul);
@@ -146,14 +171,11 @@ pub fn keys_set_in(path: &str) -> Result<(HashSet<String>, bool), EmbeddedNul> {
     let mut pending = String::new();
     let mut number = 0usize;
     loop {
-        let mut bytes = Vec::new();
-        let read = match reader.read_until(b'\n', &mut bytes) {
-            Ok(read) => read,
+        let bytes = match read_universal_line(&mut reader) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => break,
             Err(_) => return Ok((HashSet::new(), false)),
         };
-        if read == 0 {
-            break;
-        }
         if number >= consts::MAX_STARTUP_FILE_LINES
             || pending.chars().count() > consts::MAX_STARTUP_LINE_CHARS
         {
@@ -174,6 +196,23 @@ pub fn keys_set_in(path: &str) -> Result<(HashSet<String>, bool), EmbeddedNul> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str, bytes: &[u8]) -> String {
+        let path = std::env::temp_dir().join(format!("keys-newlines-{}-{name}", std::process::id()));
+        std::fs::write(&path, bytes).expect("write fixture");
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn carriage_returns_end_lines_like_python_text_mode() {
+        let crlf = scratch("crlf", b"A=\\\r\n\"\"\r\n");
+        assert_eq!(keys_set_in(&crlf).expect("read"), (HashSet::new(), true));
+        let bare = scratch("bare", b"export A=one\runset A\nB=two\r");
+        let (found, readable) = keys_set_in(&bare).expect("read");
+        assert!(readable && found == HashSet::from(["B".to_owned()]), "{found:?}");
+        let _ = std::fs::remove_file(crlf);
+        let _ = std::fs::remove_file(bare);
+    }
 
     #[test]
     fn assignments_and_unset() {

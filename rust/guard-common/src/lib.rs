@@ -8,6 +8,7 @@ pub mod overrides;
 pub mod pyengine;
 pub mod pychars;
 pub mod pyglob;
+pub mod pyjson;
 pub mod pyre;
 pub mod secret_scan;
 pub mod shell;

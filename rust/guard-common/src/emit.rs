@@ -35,7 +35,7 @@ pub fn decision_value(decision: &str, reason: &str, event: &str) -> Value {
     Value::Object(outer)
 }
 
-pub(crate) fn python_float_repr(value: f64) -> String {
+pub fn python_float_repr(value: f64) -> String {
     if value.is_nan() {
         return "nan".to_owned();
     }
@@ -111,17 +111,9 @@ fn write_value(out: &mut String, value: &Value) {
 }
 
 fn write_number(out: &mut String, number: &Number) {
-    if number.is_i64() {
-        if let Some(value) = number.as_i64() {
-            out.push_str(&value.to_string());
-            return;
-        }
-    }
-    if number.is_u64() {
-        if let Some(value) = number.as_u64() {
-            out.push_str(&value.to_string());
-            return;
-        }
+    if let Some(text) = crate::pyjson::integer_text(number) {
+        out.push_str(&text);
+        return;
     }
     if let Some(value) = number.as_f64() {
         out.push_str(&python_json_float(value));
