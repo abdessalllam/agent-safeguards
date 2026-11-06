@@ -67,7 +67,7 @@ const HARMLESS: &[&str] = &[
     "cd", "pwd", "true", "echo", "ls", "head", "tail", "wc", "grep", "rg", "cut", "uniq", "cat", "test", "[", "sleep",
 ];
 
-enum Head {
+pub(crate) enum Head {
     Found(String),
     Missing,
     Unavailable,
@@ -124,6 +124,10 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger, trim: bool) 
         drop_copies(&mut changes, command, &cwd, since, ledger);
     }
     let mut verdict = evaluate_after(&changes);
+    if verdict.is_some() {
+        crate::widen_with_head(&mut changes, &cwd);
+        verdict = evaluate_after(&changes);
+    }
     if verdict.is_some() {
         drop_marked(&mut changes, &cwd);
         if !born {
@@ -616,7 +620,7 @@ fn absent(stderr: &str, dir: &Path) -> bool {
             && !dir.ancestors().any(|folder| folder.join(".git").exists()))
 }
 
-fn head_text(path: &Path, deadline: Instant) -> Head {
+pub(crate) fn head_text(path: &Path, deadline: Instant) -> Head {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|name| name.to_str())) else {
         return Head::Unavailable;
     };

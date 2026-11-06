@@ -12,7 +12,7 @@ At most one short rationale comment per file, and never narration, history, date
 | --- | --- |
 | New comment lines per file | 2 by default, tunable (counted against the file as the session first saw it, see below) |
 | New comment blocks per file | 1 (a block is a run of adjacent comment lines) |
-| Length of a comment line | 75 characters by default, tunable, counted on the trimmed line |
+| Length of a comment line | 90 characters by default, tunable, counted on the trimmed line |
 | History markers | a date `YYYY-MM-DD`, a decision number such as `D556`, or one of `previously`, `used to`, `no longer`, `was already`, `originally`, `formerly`, `this change`, `as requested` |
 
 A comment already present in the old text is not new, so moving code together with its comment, or editing the code under it, is never refused.
@@ -27,7 +27,7 @@ Languages are chosen by file extension, by whole name (`Makefile`, `Dockerfile`,
 
 ## Tuning the limits
 
-The line count (default 2) and the line length (default 75) can be changed. Put them in the `comment-guard` switch file (see "Turn it on"; an empty file keeps the defaults), one `name = value` per line, `#` starts a note:
+The line count (default 2) and the line length (default 90) can be changed. Put them in the `comment-guard` switch file (see "Turn it on"; an empty file keeps the defaults), one `name = value` per line, `#` starts a note:
 
 ```
 lines = 3

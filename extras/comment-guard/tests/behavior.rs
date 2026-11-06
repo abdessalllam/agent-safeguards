@@ -134,10 +134,10 @@ fn short_decision_lookalikes_are_not_markers() {
 }
 
 #[test]
-fn a_line_of_76_characters_is_denied_and_75_is_allowed() {
-    let long = format!("# {}\n", "a".repeat(74));
+fn a_line_of_91_characters_is_denied_and_90_is_allowed() {
+    let long = format!("# {}\n", "a".repeat(89));
     assert!(denied(&edit("a.py", "", &long)));
-    let fits = format!("# {}\n", "a".repeat(73));
+    let fits = format!("# {}\n", "a".repeat(88));
     assert!(!denied(&edit("a.py", "", &fits)));
 }
 
@@ -509,9 +509,9 @@ fn the_first_violating_path_is_reported_with_its_own_rule() {
 
 #[test]
 fn the_length_limit_counts_characters_not_bytes() {
-    let fits = format!("#{}\n", "\u{e9}".repeat(74));
+    let fits = format!("#{}\n", "\u{e9}".repeat(89));
     assert!(!denied(&edit("a.py", "", &fits)));
-    let long = format!("#{}\n", "\u{e9}".repeat(75));
+    let long = format!("#{}\n", "\u{e9}".repeat(90));
     assert!(denied(&edit("a.py", "", &long)));
 }
 
@@ -744,7 +744,7 @@ fn the_comment_line_limit_can_be_tuned_by_environment_and_file() {
 #[test]
 fn the_comment_line_length_can_be_tuned_by_environment_and_file() {
     let sixty = format!("# {}\nx = 1\n", "a".repeat(58));
-    let ninety = format!("# {}\nx = 1\n", "a".repeat(88));
+    let ninety = format!("# {}\nx = 1\n", "a".repeat(98));
     assert!(hook_with(&[], None, &sixty).is_empty());
     let short = hook_with(&[("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS", "40")], None, &sixty);
     assert!(short.contains("deny") && short.contains("40 characters"), "{short}");
@@ -762,10 +762,10 @@ fn trimming_keeps_as_many_lines_and_characters_as_the_limits_allow() {
     let out: Value = serde_json::from_str(hook_with(&[trim, ("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES", "3")], None, six).trim()).expect("json");
     assert_eq!(out["hookSpecificOutput"]["updatedInput"]["content"], "# c1\n# c2\n# c3\nx = 1\n");
     assert!(out["hookSpecificOutput"]["additionalContext"].as_str().is_some_and(|text| text.contains("3 line(s)")));
-    let wide = format!("# ok\n# {}\nx = 1\n", "a".repeat(80));
+    let wide = format!("# ok\n# {}\nx = 1\n", "a".repeat(98));
     let out: Value = serde_json::from_str(hook_with(&[trim], None, &wide).trim()).expect("json");
     assert_eq!(out["hookSpecificOutput"]["updatedInput"]["content"], "# ok\nx = 1\n");
-    assert!(hook_with(&[trim, ("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS", "100")], None, &wide).is_empty());
+    assert!(hook_with(&[trim, ("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS", "110")], None, &wide).is_empty());
     let mid = format!("# {}\n# ok\nx = 1\n", "a".repeat(58));
     let out: Value = serde_json::from_str(hook_with(&[trim, ("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS", "40")], None, &mid).trim()).expect("json");
     assert_eq!(out["hookSpecificOutput"]["updatedInput"]["content"], "# ok\nx = 1\n");

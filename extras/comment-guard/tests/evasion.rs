@@ -344,6 +344,17 @@ impl Rig {
         String::from_utf8_lossy(&self.feed("PostToolUse", &payload).stdout).into_owned()
     }
 
+    fn pre_write(&self, session: &str, path: &Path, content: &str) -> String {
+        let payload = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": session,
+            "cwd": self.cwd.to_string_lossy(),
+            "tool_name": "Write",
+            "tool_input": { "file_path": path.to_string_lossy(), "content": content },
+        });
+        String::from_utf8_lossy(&self.feed("PreToolUse", &payload).stdout).into_owned()
+    }
+
     fn pre_edit(&self, session: &str, path: &Path, old: &str, new: &str) -> String {
         let payload = json!({
             "hook_event_name": "PreToolUse",
@@ -862,7 +873,7 @@ fn an_existing_long_comment_may_be_reworded_but_a_short_one_may_not_grow_long() 
     std::fs::write(&path, "// short\nconst a = 1;\n").expect("write");
     let grown = write_file(None, None, &path, &format!("{long}const a = 1;\n"));
     assert!(denied(&grown));
-    assert!(reason(&grown).contains("75"));
+    assert!(reason(&grown).contains("90"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1414,6 +1425,72 @@ fn a_tracked_file_is_judged_against_head() {
     std::fs::write(&file, "// old note\n// n1\nfn a() {}\n").expect("write");
     let calm = rig.bash(Some("b6"), &format!("printf x >> {}", file.display()));
     assert!(calm.is_empty(), "{calm}");
+}
+
+#[test]
+fn restoring_the_committed_comments_after_a_merge_is_not_adding_them() {
+    let rig = Rig::new("restore-head");
+    init_repo(&rig.cwd);
+    let long = format!("# {} one", "w".repeat(100));
+    let committed = format!("{long}\n# note two\n# note three\n# note four\n# note five\nx = 1\n");
+    let file = commit_file(&rig.cwd, "a.py", &committed);
+    std::fs::write(&file, "x = 1\n").expect("write");
+    assert!(rig.pre_edit("s", &file, "x = 1", "x = 2").is_empty());
+    let restored = committed.replace("x = 1", "x = 2");
+    let out = rig.pre_write("s", &file, &restored);
+    assert!(out.is_empty(), "{out}");
+    let more = format!("{restored}y = 1\n# fresh one\n# fresh two\n# fresh three\n");
+    let refused = rig.pre_write("s", &file, &more);
+    assert!(refused.contains("deny") && refused.contains("fresh one"), "{refused}");
+    let wide = format!("{restored}# {}\n", "v".repeat(100));
+    let long_out = rig.pre_write("s", &file, &wide);
+    assert!(long_out.contains("longer than 90 characters: # vvvv"), "{long_out}");
+}
+
+#[test]
+fn the_committed_comments_are_known_once_each_and_in_a_notebook_too() {
+    let rig = Rig::new("restore-twice");
+    init_repo(&rig.cwd);
+    let file = commit_file(&rig.cwd, "a.py", "# same\nx = 1\n");
+    assert!(rig.pre_edit("t", &file, "x = 1", "x = 2").is_empty());
+    let out = rig.pre_write("t", &file, "# same\n# same\n# same\n# same\nx = 2\n");
+    assert!(out.contains("deny"), "{out}");
+    let book = |source: &str| {
+        json!({ "cells": [{ "cell_type": "code", "metadata": {}, "source": source, "id": "c0" }], "metadata": {}, "nbformat": 4, "nbformat_minor": 5 }).to_string()
+    };
+    let notebook = commit_file(&rig.cwd, "n.ipynb", &book("x = 1\n# a1\n# a2\n# a3\n# a4"));
+    std::fs::write(&notebook, book("x = 1")).expect("write");
+    let call = |source: &str| {
+        let payload = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "t",
+            "cwd": rig.cwd.to_string_lossy(),
+            "tool_name": "NotebookEdit",
+            "tool_input": { "notebook_path": notebook.to_string_lossy(), "cell_id": "c0", "new_source": source, "edit_mode": "replace" },
+        });
+        String::from_utf8_lossy(&rig.feed("PreToolUse", &payload).stdout).into_owned()
+    };
+    assert!(call("x = 2").is_empty());
+    let restored = call("x = 2\n# a1\n# a2\n# a3\n# a4");
+    assert!(restored.is_empty(), "{restored}");
+    assert!(call("x = 2\n# a1\n# a2\n# a3\n# a4\n# b1\n# b2\n# b3").contains("deny"));
+}
+
+#[test]
+fn a_command_that_restores_the_committed_file_after_a_stash_merge_is_not_reported() {
+    let rig = Rig::new("bash-restore");
+    init_repo(&rig.cwd);
+    let long = format!("# {} one", "w".repeat(100));
+    let committed = format!("{long}\n# note two\n# note three\n# note four\n# note five\nx = 1\n");
+    let file = commit_file(&rig.cwd, "a.py", &committed);
+    std::fs::write(&file, "x = 1\n").expect("write");
+    assert!(rig.bash(Some("pb"), "git stash pop").is_empty());
+    std::fs::write(&file, &committed).expect("write");
+    let out = rig.bash(Some("pb"), &format!("printf x >> {}", file.display()));
+    assert!(out.is_empty(), "{out}");
+    std::fs::write(&file, format!("{committed}# fresh one\n# fresh two\n# fresh three\n")).expect("write");
+    let out = rig.bash(Some("pb"), &format!("printf x >> {}", file.display()));
+    assert!(out.contains("\"decision\":\"block\"") && out.contains("fresh one"), "{out}");
 }
 
 #[test]

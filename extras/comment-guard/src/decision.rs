@@ -71,6 +71,18 @@ struct Aggregate<'a> {
     blocks: usize,
     marker: Option<&'a str>,
     too_long: bool,
+    first: Option<&'a str>,
+    long: Option<&'a str>,
+}
+
+fn excerpt(line: &str) -> String {
+    let text = line.trim();
+    let shown: String = text.chars().take(60).collect();
+    if text.chars().count() > 60 {
+        format!("{shown}...")
+    } else {
+        shown
+    }
 }
 
 pub fn evaluate(changes: &[Change]) -> Option<String> {
@@ -90,6 +102,8 @@ struct Measure<'a> {
     blocks: usize,
     too_long: bool,
     marker: Option<&'a str>,
+    first: Option<&'a str>,
+    long: Option<&'a str>,
 }
 
 fn letters(line: &str) -> usize {
@@ -147,6 +161,8 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
     let mut fresh_lines = 0usize;
     let mut fresh_blocks = 0usize;
     let mut fresh_long = 0usize;
+    let mut first_fresh: Option<&str> = None;
+    let mut first_long: Option<&str> = None;
     let mut fresh_letters = 0usize;
     let mut fresh_blank = 0usize;
     let mut fresh_text: Vec<&str> = Vec::new();
@@ -188,8 +204,10 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
             }
             counted = true;
         }
+        first_fresh.get_or_insert(line);
         if line.chars().count() > max_chars {
             fresh_long = fresh_long.saturating_add(1);
+            first_long.get_or_insert(line);
         }
         fresh_letters = fresh_letters.saturating_add(letters(line));
         fresh_text.push(line);
@@ -236,6 +254,8 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
         blocks: fresh_blocks.min(net).saturating_add(usize::from(change.carry > 0)),
         too_long: fresh_long > removed_long,
         marker,
+        first: first_fresh,
+        long: first_long,
     }
 }
 
@@ -510,6 +530,8 @@ fn evaluate_detail(changes: &[Change]) -> Option<String> {
                     blocks: 0,
                     marker: None,
                     too_long: false,
+                    first: None,
+                    long: None,
                 });
                 let fresh = order.len().saturating_sub(1);
                 index.insert(change.file.as_str(), fresh);
@@ -524,7 +546,9 @@ fn evaluate_detail(changes: &[Change]) -> Option<String> {
         slot.blocks = slot.blocks.saturating_add(measured.blocks);
         if measured.too_long {
             slot.too_long = true;
+            slot.long = slot.long.or(measured.long);
         }
+        slot.first = slot.first.or(measured.first);
         if slot.marker.is_none() {
             slot.marker = measured.marker;
         }
@@ -542,7 +566,7 @@ fn evaluate_detail(changes: &[Change]) -> Option<String> {
             let limit = limits::current().line_chars.to_string();
             let detail = message(
                 "comment_guard.detail.too_long",
-                &[("file", aggregate.file), ("limit", limit.as_str())],
+                &[("file", aggregate.file), ("limit", limit.as_str()), ("line", excerpt(aggregate.long.unwrap_or("")).as_str())],
             );
             return Some(detail);
         }
@@ -557,6 +581,7 @@ fn evaluate_detail(changes: &[Change]) -> Option<String> {
                     ("lines", lines.as_str()),
                     ("blocks", blocks.as_str()),
                     ("max_lines", max_lines.as_str()),
+                    ("line", excerpt(aggregate.first.unwrap_or("")).as_str()),
                 ],
             );
             return Some(detail);

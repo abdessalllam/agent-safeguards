@@ -140,6 +140,43 @@ fn attach_baselines(ledger: &Ledger, changes: &mut [Change], base: &Path) -> Has
     prepared
 }
 
+pub(crate) fn widen_with_head(changes: &mut [Change], base: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+    for change in changes.iter_mut() {
+        let Some(lang) = language_for_text(&change.file, &change.new) else {
+            continue;
+        };
+        if change.partial {
+            continue;
+        }
+        let path = changes::resolve(base, &change.file);
+        let post::Head::Found(mut text) = post::head_text(&path, deadline) else {
+            continue;
+        };
+        if change.file.to_ascii_lowercase().ends_with(".ipynb") {
+            match changes::notebook_text(&text) {
+                Some(code) => text = code,
+                None => continue,
+            }
+        }
+        let mut merged = change.baseline.clone().unwrap_or_else(|| comment_lines(&change.old, lang));
+        let mut held: HashMap<String, usize> = HashMap::new();
+        for line in &merged {
+            *held.entry(line.clone()).or_insert(0) += 1;
+        }
+        let mut wanted: HashMap<String, usize> = HashMap::new();
+        for line in comment_lines(&text, lang) {
+            *wanted.entry(line).or_insert(0) += 1;
+        }
+        for (line, count) in wanted {
+            for _ in held.get(&line).copied().unwrap_or(0)..count {
+                merged.push(line.clone());
+            }
+        }
+        change.baseline = Some(merged);
+    }
+}
+
 fn settle(ledger: &Ledger, prepared: &HashMap<String, Prepared>, changes: &mut [Change]) -> Option<String> {
     let mut retry: Vec<(String, u64, u64, usize)> = Vec::new();
     let mut committed: Vec<(String, u64, usize, u64)> = Vec::new();
@@ -287,6 +324,10 @@ fn judge_payload(payload: &Map<String, Value>, provider: Provider, state: Option
         None => HashMap::new(),
     };
     let mut verdict = evaluate(&changes);
+    if verdict.is_some() {
+        widen_with_head(&mut changes, &base);
+        verdict = evaluate(&changes);
+    }
     if verdict.is_some() {
         git::drop_marked(&mut changes, &base);
         verdict = evaluate(&changes);

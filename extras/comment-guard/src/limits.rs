@@ -2,7 +2,7 @@ use std::ops::RangeInclusive;
 use std::sync::OnceLock;
 
 pub const DEFAULT_LINES: usize = 2;
-pub const DEFAULT_LINE_CHARS: usize = 75;
+pub const DEFAULT_LINE_CHARS: usize = 90;
 pub const LINES_RANGE: RangeInclusive<usize> = 1..=50;
 pub const LINE_CHARS_RANGE: RangeInclusive<usize> = 20..=500;
 
@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn nothing_set_gives_the_defaults() {
-        assert_eq!(parse(None, None, None), Limits { lines: 2, line_chars: 75 });
+        assert_eq!(parse(None, None, None), Limits { lines: 2, line_chars: 90 });
         assert_eq!(parse(Some(""), None, None), Limits::default());
     }
 
@@ -84,7 +84,7 @@ mod tests {
             assert_eq!(parse(Some(&format!("lines = {bad}")), None, None).lines, 2, "{bad}");
         }
         for bad in ["19", "501", "x", ""] {
-            assert_eq!(parse(Some(&format!("line_chars = {bad}")), None, None).line_chars, 75, "{bad}");
+            assert_eq!(parse(Some(&format!("line_chars = {bad}")), None, None).line_chars, 90, "{bad}");
         }
         assert_eq!(parse(Some("lines = 50\nline_chars = 500"), None, None), Limits { lines: 50, line_chars: 500 });
         assert_eq!(parse(Some("lines = 1\nline_chars = 20"), None, None), Limits { lines: 1, line_chars: 20 });
