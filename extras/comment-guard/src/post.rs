@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{Map, Value};
 
 use crate::changes::{read_source, resolve, MAX_OLD_FILE};
-use crate::decision::{comment_lines, evaluate, evaluate_after, trimmed_with, Change};
+use crate::decision::{comment_lines, evaluate, evaluate_after, trimmed_with, widen_with_headers, Change};
 use crate::git::{drop_marked, inside_repository, run_git};
 use crate::languages::language_for_file;
 use crate::session::{content_hash, identity, seen_of, Ledger};
@@ -125,6 +125,7 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger, trim: bool) 
     }
     let mut verdict = evaluate_after(&changes);
     if verdict.is_some() {
+        widen_with_headers(&mut changes);
         crate::widen_with_head(&mut changes, &cwd);
         verdict = evaluate_after(&changes);
     }

@@ -55,6 +55,129 @@ impl Change {
     }
 }
 
+const LICENCE_PHRASES: [&str; 6] = [
+    "\u{a9}",
+    "licensed under",
+    "licensed to",
+    "all rights reserved",
+    "permission is hereby granted",
+    "redistribution and use in source",
+];
+const HEADER_LINES: usize = 40;
+
+fn names_a_licence(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    if LICENCE_PHRASES.iter().any(|phrase| lower.contains(phrase)) {
+        return true;
+    }
+    lower.match_indices("copyright").any(|(at, word)| {
+        let rest = lower.get(at.saturating_add(word.len())..).unwrap_or("").trim_start();
+        ["(c)", "the ", "contributors"].iter().any(|start| rest.starts_with(start)) || rest.starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
+fn licence_header(text: &str, lang: Language) -> Vec<String> {
+    let mut header: Vec<String> = Vec::new();
+    let mut scanner = scan(text, lang);
+    while let Some(kind) = scanner.next() {
+        match kind {
+            LineKind::Comment(line) if !scanner.shares_line_with_code() => header.push(line.to_owned()),
+            LineKind::Other if scanner.is_blank() && !header.is_empty() => break,
+            LineKind::Other if !scanner.shares_line_with_code() => {}
+            _ => break,
+        }
+        if header.len() >= HEADER_LINES {
+            break;
+        }
+    }
+    if header.iter().any(|line| names_a_licence(line)) {
+        header
+    } else {
+        Vec::new()
+    }
+}
+
+pub fn add_existing(change: &mut Change, lang: Language, lines: Vec<String>) -> bool {
+    let mut merged = change.baseline.clone().unwrap_or_else(|| comment_lines(&change.old, lang));
+    let mut held: HashMap<String, usize> = HashMap::new();
+    for line in &merged {
+        *held.entry(line.clone()).or_insert(0) += 1;
+    }
+    let mut grown = false;
+    for line in lines {
+        match held.get_mut(&line) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => {
+                merged.push(line);
+                grown = true;
+            }
+        }
+    }
+    if grown {
+        change.baseline = Some(merged);
+    }
+    grown
+}
+
+pub fn widen_with_headers(changes: &mut [Change]) {
+    for change in changes.iter_mut().filter(|change| !change.partial) {
+        let Some(lang) = language_for_text(&change.file, &change.new) else {
+            continue;
+        };
+        let header = licence_header(&change.new, lang);
+        add_existing(change, lang, header);
+    }
+}
+
+fn opens_scope(line: &str) -> bool {
+    line.trim_end().ends_with([':', '{', '(', '['])
+}
+
+fn tidy_blanks(lines: &[&str], old: &str, gone: &mut HashSet<usize>, standing: &HashMap<usize, String>) {
+    let old_lines: Vec<&str> = old.split('\n').collect();
+    let prefix = if old.is_empty() {
+        0
+    } else {
+        lines.iter().zip(&old_lines).take_while(|(new, before)| new == before).count()
+    };
+    let room = old_lines.len().min(lines.len()).saturating_sub(prefix);
+    let suffix = lines
+        .iter()
+        .rev()
+        .zip(old_lines.iter().rev())
+        .take(room)
+        .take_while(|(new, before)| new == before)
+        .count();
+    let editable = prefix..lines.len().saturating_sub(suffix);
+    let blank = |index: usize| lines.get(index).is_some_and(|line| line.trim().is_empty()) && !standing.contains_key(&index);
+    let mut kept: Vec<usize> = Vec::new();
+    let mut added: Vec<usize> = Vec::new();
+    let mut gap = false;
+    for index in 0..lines.len() {
+        if gone.contains(&index) {
+            gap = true;
+            continue;
+        }
+        if gap && blank(index) && editable.contains(&index) {
+            let after_opener = |prev: usize| blank(prev) || opens_scope(lines.get(prev).copied().unwrap_or(""));
+            if kept.last().copied().is_none_or(after_opener) {
+                added.push(index);
+                gap = false;
+                continue;
+            }
+        }
+        if gap && index.saturating_add(1) == lines.len() && blank(index) {
+            if let Some(prev) = kept.last().copied().filter(|prev| blank(*prev) && editable.contains(prev)) {
+                kept.pop();
+                added.push(prev);
+            }
+        }
+        gap = false;
+        kept.push(index);
+    }
+    gone.extend(added);
+}
+
 pub fn comment_lines(text: &str, lang: Language) -> Vec<String> {
     scan(text, lang)
         .filter_map(|kind| match kind {
@@ -1018,6 +1141,7 @@ pub fn trimmed_with(change: &Change, docstrings: bool) -> Option<Trimmed> {
                 standing.insert(piece.first, format!("{pad}pass"));
             }
         }
+        tidy_blanks(&lines, &change.old, &mut gone, &standing);
         let text = lines
             .iter()
             .enumerate()

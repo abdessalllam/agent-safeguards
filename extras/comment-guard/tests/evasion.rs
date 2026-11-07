@@ -1234,6 +1234,69 @@ fn a_sync_that_writes_text_found_elsewhere_in_the_repository_is_left_alone_and_r
 }
 
 #[test]
+fn a_licence_header_at_the_top_of_a_file_is_never_cut() {
+    let dir = temp_dir("licence");
+    let allow = |name: &str, text: &str| matches!(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join(name), text), Provider::Claude), Verdict::Allow);
+    let block = "/*\n * Copyright 2024 Someone\n * Licensed under MIT\n * Line three\n * Line four\n */\nexport const a = 1;\n";
+    assert!(allow("a.ts", block));
+    assert!(allow("b.ts", "// Copyright (c) 2024 Someone\n// Line two\n// Line three\n// Line four\nexport const b = 1;\n"));
+    assert!(allow("c.ts", "// Copyright The Go Authors.\n// Line two\n// Line three\n// Line four\nexport const c = 1;\n"));
+    assert!(!allow("d.ts", "// copyright note one\n// copyright note two\n// copyright note three\nexport const d = 1;\n"));
+    let long = format!("// Copyright 2009 The Authors. All rights reserved.\n// {}\n// third\n// fourth\npackage main\n", "w".repeat(100));
+    assert!(allow("a.go", &long));
+    let shebang = "#!/usr/bin/env python3\n# Copyright 2024 Someone\n# Licensed under MIT\n# Line three\n# Line four\nimport os\n";
+    assert!(allow("a.py", shebang));
+    let spdx = "// SPDX-License-Identifier: MIT\n// Copyright 2024 Someone\n// Line three\n// Line four\nfn a() {}\n";
+    assert!(allow("a.rs", spdx));
+    let drop = |name: &str, text: &str| cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join(name), text), Provider::Claude)).0;
+    let both = format!("{block}// B1 one\n// B2 two\n// B3 three\nexport const b = 2;\n");
+    assert_eq!(drop("b.ts", &both)["content"], format!("{block}export const b = 2;\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_block_that_only_looks_like_a_licence_header_is_still_cut() {
+    let dir = temp_dir("not-licence");
+    let drop = |name: &str, text: &str| cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join(name), text), Provider::Claude)).0;
+    assert_eq!(drop("a.rs", "// One long.\n// Two long.\n// Three long.\nfn a() {}\n")["content"], "fn a() {}\n");
+    let after_code = "fn a() {}\n// Copyright 2024 Someone\n// Line two\n// Line three\n// Line four\nfn b() {}\n";
+    assert_eq!(drop("b.rs", after_code)["content"], "fn a() {}\nfn b() {}\n");
+    let essay = "// Copyright 2024 Someone\n// Licensed under MIT\n\n// Essay one\n// Essay two\n// Essay three\nfn a() {}\n";
+    assert_eq!(drop("c.rs", essay)["content"], "// Copyright 2024 Someone\n// Licensed under MIT\n\nfn a() {}\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cutting_a_block_does_not_leave_a_stray_blank_line() {
+    let dir = temp_dir("tidy");
+    let drop = |name: &str, text: &str| cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join(name), text), Provider::Claude)).0;
+    let split = "def d(x):\n    # one\n    # two\n\n    # three\n    # four\n    return x\n";
+    assert_eq!(drop("a.py", split)["content"], "def d(x):\n    return x\n");
+    let class = "class A:\n    \"\"\"One.\n\n    Two.\n    Three.\n    \"\"\"\n\n    x = 1\n";
+    assert_eq!(drop("b.py", class)["content"], "class A:\n    x = 1\n");
+    assert_eq!(drop("c.py", "a = 1\n\n# one\n# two\n# three\n\nb = 2\n")["content"], "a = 1\n\nb = 2\n");
+    assert_eq!(drop("d.rs", "// one\n// two\n// three\n\nfn a() {}\n")["content"], "fn a() {}\n");
+    assert_eq!(drop("e.rs", "fn a() {}\n\n// one\n// two\n// three\n")["content"], "fn a() {}\n");
+    assert_eq!(drop("f.rs", "fn a() {}\n\n// one\n// two\n// three\nfn b() {}\n")["content"], "fn a() {}\n\nfn b() {}\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_blank_line_that_was_already_in_the_file_stays_when_an_edit_is_cut() {
+    let dir = temp_dir("tidy-edit");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "a = 1\n\nb = 2\n").expect("write");
+    let beside = json!({ "file_path": path.to_string_lossy(), "old_string": "a = 1\n\nb = 2", "new_string": "a = 1\n\n# one\n# two\n# three\n\nb = 2" });
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Edit", beside, Provider::Claude));
+    assert_eq!(input["new_string"], "a = 1\n\nb = 2");
+    std::fs::write(&path, "def f():\n    return 1\n").expect("write");
+    let opener = json!({ "file_path": path.to_string_lossy(), "old_string": "def f():\n", "new_string": "def f():\n    # one\n    # two\n\n    # three\n" });
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Edit", opener, Provider::Claude));
+    assert_eq!(input["new_string"], "def f():\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_symbol_with_a_history_word_inside_it_is_not_a_history_comment() {
     let dir = temp_dir("snake");
     let path = dir.join("a.ts");
@@ -3086,9 +3149,9 @@ fn a_multi_line_block_comment_over_the_limit_is_cut_as_a_unit_even_when_it_is_a_
     let dir = temp_dir("block-units");
     let drop = |name: &str, text: &str| cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join(name), text), Provider::Claude)).0;
     let trim = |name: &str, text: &str| cut(trimming(None, None, "Write", written(&dir.join(name), text), Provider::Claude)).0;
-    let licence = "/*\n * Copyright 2026 Someone\n * Licensed under MIT\n * Line three\n * Line four\n */\nexport const a = 1;\n";
-    assert_eq!(drop("a.ts", licence)["content"], "export const a = 1;\n");
-    assert_eq!(trim("a.ts", licence)["content"], "export const a = 1;\n");
+    let notes = "/*\n * Walks the list once\n * Counts the entries\n * Line three\n * Line four\n */\nexport const a = 1;\n";
+    assert_eq!(drop("a.ts", notes)["content"], "export const a = 1;\n");
+    assert_eq!(trim("a.ts", notes)["content"], "export const a = 1;\n");
     let plain = "/*\none\ntwo\nthree\nfour\n*/\nint a;\n";
     assert_eq!(drop("c.c", plain)["content"], "int a;\n");
     assert_eq!(drop("a.go", "/*\none\ntwo\nthree\n*/\npackage main\n")["content"], "package main\n");

@@ -345,6 +345,7 @@ fn judge_payload(payload: &Map<String, Value>, provider: Provider, state: Option
     };
     let mut verdict = evaluate(&changes);
     if verdict.is_some() {
+        decision::widen_with_headers(&mut changes);
         widen_with_head(&mut changes, &base);
         verdict = evaluate(&changes);
     }

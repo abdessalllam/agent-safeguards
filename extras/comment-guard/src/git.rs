@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::changes::{resolve, MAX_OLD_FILE};
-use crate::decision::{comment_lines, Change};
+use crate::decision::{add_existing, comment_lines, Change};
 use crate::languages::language_for_text;
 use crate::session::content_hash;
 
@@ -212,28 +212,11 @@ fn merge_known(change: &mut Change, known: &HashSet<u64>) -> bool {
     let Some(lang) = language_for_text(&change.file, &change.new) else {
         return false;
     };
-    let mut merged = change.baseline.clone().unwrap_or_else(|| comment_lines(&change.old, lang));
-    let mut held: HashMap<String, usize> = HashMap::new();
-    for line in &merged {
-        *held.entry(line.clone()).or_insert(0) += 1;
-    }
-    let mut grown = false;
-    for line in comment_lines(&change.new, lang) {
-        if line.chars().count() < KNOWN_MIN || !known.contains(&content_hash(&line)) {
-            continue;
-        }
-        match held.get_mut(&line) {
-            Some(count) if *count > 0 => *count -= 1,
-            _ => {
-                merged.push(line);
-                grown = true;
-            }
-        }
-    }
-    if grown {
-        change.baseline = Some(merged);
-    }
-    grown
+    let found: Vec<String> = comment_lines(&change.new, lang)
+        .into_iter()
+        .filter(|line| line.chars().count() >= KNOWN_MIN && known.contains(&content_hash(line)))
+        .collect();
+    add_existing(change, lang, found)
 }
 
 pub fn widen_with_known(changes: &mut [Change], base: &Path) -> Vec<String> {
