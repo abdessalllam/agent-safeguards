@@ -129,6 +129,11 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger, trim: bool) 
         verdict = evaluate_after(&changes);
     }
     if verdict.is_some() {
+        let widened = crate::git::widen_with_known(&mut changes, &cwd);
+        remember_known(&changes, &widened, ledger);
+        verdict = evaluate_after(&changes);
+    }
+    if verdict.is_some() {
         drop_marked(&mut changes, &cwd);
         if !born {
             drop_copies(&mut changes, command, &cwd, since, ledger);
@@ -160,6 +165,19 @@ pub fn judge_command(payload: &Map<String, Value>, ledger: &Ledger, trim: bool) 
             input: Value::Null,
             note: notes.join(" "),
         },
+    }
+}
+
+fn remember_known(changes: &[Change], widened: &[String], ledger: &Ledger) {
+    for change in changes.iter().filter(|change| widened.contains(&change.file)) {
+        let (Some(lang), Some(baseline)) = (language_for_file(&change.file), &change.baseline) else {
+            continue;
+        };
+        if evaluate(std::slice::from_ref(change)).is_some() {
+            continue;
+        }
+        let state = seen_of(&change.new, &comment_lines(&change.new, lang));
+        ledger.rebaseline(&identity(Path::new(&change.file)), baseline.clone(), state);
     }
 }
 

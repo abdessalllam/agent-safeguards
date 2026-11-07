@@ -348,6 +348,11 @@ fn judge_payload(payload: &Map<String, Value>, provider: Provider, state: Option
         widen_with_head(&mut changes, &base);
         verdict = evaluate(&changes);
     }
+    let mut widened: Vec<String> = Vec::new();
+    if verdict.is_some() {
+        widened = git::widen_with_known(&mut changes, &base);
+        verdict = evaluate(&changes);
+    }
     if verdict.is_some() {
         git::drop_marked(&mut changes, &base);
         verdict = evaluate(&changes);
@@ -355,6 +360,15 @@ fn judge_payload(payload: &Map<String, Value>, provider: Provider, state: Option
     if verdict.is_none() {
         if let Some(ledger) = &ledger {
             verdict = settle(ledger, &prepared, &mut changes);
+        }
+    }
+    if verdict.is_none() {
+        if let Some(ledger) = &ledger {
+            for change in changes.iter().filter(|change| widened.contains(&change.file)) {
+                if let (Some(item), Some(baseline)) = (prepared.get(&change.file), &change.baseline) {
+                    ledger.rebaseline(&item.id, baseline.clone(), item.after);
+                }
+            }
         }
     }
     match verdict {

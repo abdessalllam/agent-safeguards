@@ -1178,6 +1178,61 @@ fn copying_a_commented_file_is_not_adding_comments() {
     assert!(copied.is_empty(), "{copied}");
 }
 
+fn prose(marker: &str, tag: &str, count: usize) -> String {
+    (0..count)
+        .map(|n| format!("{marker} {tag} explains step {n} of the algorithm in detail\n"))
+        .collect()
+}
+
+#[test]
+fn comment_text_that_already_exists_in_another_file_is_not_new_commentary() {
+    let dir = temp_dir("known-text");
+    git(&dir, &["init", "-q"]);
+    std::fs::create_dir_all(dir.join("up")).expect("dir");
+    std::fs::create_dir_all(dir.join("cli")).expect("dir");
+    let block = prose("//", "upstream", 6);
+    std::fs::write(dir.join("up").join("a.rs"), format!("{block}fn a() {{}}\n")).expect("write");
+    let write = |name: &str, text: &str| trimming_in(Mode::Drop, None, None, "Write", written(&dir.join("cli").join(name), text), Provider::Claude);
+    assert!(matches!(write("b.rs", &format!("{block}fn b() {{}}\n")), Verdict::Allow));
+    assert!(!matches!(write("c.rs", &format!("{}fn c() {{}}\n", prose("//", "brand new", 6))), Verdict::Allow));
+    std::fs::write(dir.join("up").join("notes.md"), prose("//", "only in notes", 6)).expect("write");
+    assert!(!matches!(write("d.rs", &format!("{}fn d() {{}}\n", prose("//", "only in notes", 6))), Verdict::Allow));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_sync_that_writes_text_found_elsewhere_in_the_repository_is_left_alone_and_remembered() {
+    let rig = Rig::new("known-sync");
+    git(&rig.cwd, &["init", "-q"]);
+    std::fs::create_dir_all(rig.cwd.join("up")).expect("dir");
+    std::fs::create_dir_all(rig.cwd.join("cli")).expect("dir");
+    let source = rig.cwd.join("up").join("a.py");
+    let content = format!("{}x = 1\n", prose("#", "upstream", 6));
+    std::fs::write(&source, &content).expect("write");
+    let command = "python3 sync.py";
+    rig.pre_bash_with("sync", "t1", command);
+    let copy = rig.cwd.join("cli").join("a.py");
+    std::fs::write(&copy, &content).expect("write");
+    if !creation_time_is_known(&copy) {
+        return;
+    }
+    let out = rig.bash_with_id("sync", "t1", command);
+    assert!(out.is_empty(), "{out}");
+    std::fs::remove_file(&source).expect("remove");
+    let edited = rig.pre_edit("sync", &copy, "x = 1", "x = 2");
+    assert!(edited.is_empty(), "{edited}");
+    rig.pre_bash_with("sync", "t2", command);
+    std::fs::write(rig.cwd.join("cli").join("b.py"), format!("{}x = 1\n", prose("#", "written here", 6))).expect("write");
+    let loud = rig.bash_with_id("sync", "t2", command);
+    assert!(blocked(&loud), "{loud}");
+    rig.pre_bash_with("sync", "t3", command);
+    let twin = format!("{}x = 1\n", prose("#", "twin text", 6));
+    std::fs::write(rig.cwd.join("cli").join("c.py"), &twin).expect("write");
+    std::fs::write(rig.cwd.join("cli").join("d.py"), &twin).expect("write");
+    let both = rig.bash_with_id("sync", "t3", command);
+    assert!(blocked(&both), "{both}");
+}
+
 #[test]
 fn a_symbol_with_a_history_word_inside_it_is_not_a_history_comment() {
     let dir = temp_dir("snake");
