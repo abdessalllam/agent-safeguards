@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::LazyLock;
@@ -12,10 +12,6 @@ use crate::consts;
 
 static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)\A([A-Za-z_][A-Za-z0-9_]*)\+?=(.*)\z")
-        .unwrap_or_else(|_| std::process::abort())
-});
-static HEREDOC_START: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<<(-?)[ \t]*(?:'([^']*)'|"([^"]*)"|\\?([A-Za-z_][A-Za-z0-9_]*))"#)
         .unwrap_or_else(|_| std::process::abort())
 });
 static KEYWORD_OPTION: LazyLock<Regex> =
@@ -306,7 +302,7 @@ fn digits(chars: &[char], at: &mut usize, radix: u32, limit: usize) -> Option<u3
 }
 
 // Bash `$'...'` escapes, so the literal the shell stores is what gets protected.
-fn decode_ansi_c(text: &str) -> String {
+fn decode_ansi_c(text: &str, truncate_nul: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<u8> = Vec::new();
     let mut at = 0usize;
@@ -331,6 +327,14 @@ fn decode_ansi_c(text: &str) -> String {
             't' => out.push(9),
             'v' => out.push(11),
             '\\' | '\'' | '"' | '?' => push_char(&mut out, u32::from(next)),
+            'c' => match chars.get(at) {
+                Some(&control) => {
+                    at = at.saturating_add(1);
+                    let code = if control == '?' { 127 } else { u32::from(control) & 0x1f };
+                    out.push(u8::try_from(code).unwrap_or(0));
+                }
+                None => out.extend_from_slice(b"\\c"),
+            },
             'x' => match digits(&chars, &mut at, 16, 2) {
                 Some(value) => out.push(u8::try_from(value & 0xff).unwrap_or(0)),
                 None => out.extend_from_slice(b"\\x"),
@@ -353,11 +357,16 @@ fn decode_ansi_c(text: &str) -> String {
             }
         }
     }
+    if truncate_nul {
+        if let Some(place) = out.iter().position(|byte| *byte == 0) {
+            out.truncate(place);
+        }
+    }
     String::from_utf8_lossy(&out).into_owned()
 }
 
 // `$'...'` becomes the single-quoted text it stands for; `$"..."` loses its `$`.
-fn rewrite_dollar_quotes(line: &str) -> String {
+fn rewrite_dollar_quotes(line: &str, truncate_nul: bool) -> String {
     let chars: Vec<char> = line.chars().collect();
     let mut out = String::new();
     let mut at = 0usize;
@@ -407,7 +416,7 @@ fn rewrite_dollar_quotes(line: &str) -> String {
                     }
                     if chars.get(end) == Some(&'\'') {
                         out.push('\'');
-                        out.push_str(&decode_ansi_c(&raw).replace('\'', "'\\''"));
+                        out.push_str(&decode_ansi_c(&raw, truncate_nul).replace('\'', "'\\''"));
                         out.push('\'');
                         at = end.saturating_add(1);
                         continue;
@@ -427,56 +436,125 @@ fn rewrite_dollar_quotes(line: &str) -> String {
     out
 }
 
-fn heredoc_end(line: &str) -> Option<(String, bool)> {
-    let found = HEREDOC_START
-        .captures_iter(line)
-        .filter(|found| {
-            found
-                .get(0)
-                .is_some_and(|whole| !line.get(..whole.start()).unwrap_or("").ends_with('<'))
-        })
-        .last()?;
-    let word = found
-        .get(2)
-        .or_else(|| found.get(3))
-        .or_else(|| found.get(4))?
-        .as_str();
-    let dash = found.get(1).is_some_and(|part| !part.as_str().is_empty());
-    (!word.is_empty()).then(|| (word.to_owned(), dash))
-}
-
-#[derive(Default)]
-pub struct ValueScanner {
-    ending: Option<(String, bool)>,
-    skipped: Vec<String>,
-}
-
-impl ValueScanner {
-    pub fn scan(&mut self, line: &str, out: &mut Vec<(bool, String)>) {
-        if let Some((word, dash)) = &self.ending {
-            let body = line.trim_end_matches(['\n', '\r']);
-            let candidate = if *dash { body.trim_start_matches('\t') } else { body };
-            if candidate == word {
-                self.ending = None;
-                self.skipped.clear();
-            } else {
-                self.skipped.push(line.to_owned());
+// A delimiter word as the shell reads it: quotes and backslashes are removed.
+fn read_word(chars: &[char], start: usize) -> (String, usize) {
+    let mut word = String::new();
+    let mut at = start;
+    let mut quote: Option<char> = None;
+    while let Some(&ch) = chars.get(at) {
+        match quote {
+            Some(open) if ch == open => {
+                quote = None;
+                at = at.saturating_add(1);
             }
-            return;
+            Some(_) => {
+                word.push(ch);
+                at = at.saturating_add(1);
+            }
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                at = at.saturating_add(1);
+            }
+            None if ch == '\\' => {
+                if let Some(&escaped) = chars.get(at.saturating_add(1)) {
+                    word.push(escaped);
+                }
+                at = at.saturating_add(2);
+            }
+            None if ch.is_whitespace() || ";&|()<>".contains(ch) => break,
+            None => {
+                word.push(ch);
+                at = at.saturating_add(1);
+            }
         }
-        line_values(&rewrite_dollar_quotes(line), out);
-        self.ending = heredoc_end(line);
     }
+    (word, at)
+}
 
-    // A here-document that never ends was not one: its lines are read as ordinary ones.
-    pub fn finish(&mut self, out: &mut Vec<(bool, String)>) {
-        while !self.skipped.is_empty() {
-            self.ending = None;
-            for line in std::mem::take(&mut self.skipped) {
-                self.scan(&line, out);
+// The `<<` operators outside quotes and comments, in order, each with its delimiter.
+fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut found = Vec::new();
+    let mut at = 0usize;
+    let mut quote: Option<char> = None;
+    while let Some(&ch) = chars.get(at) {
+        if let Some(open) = quote {
+            at = at.saturating_add(1);
+            if ch == '\\' && open == '"' {
+                at = at.saturating_add(1);
+            } else if ch == open {
+                quote = None;
             }
+            continue;
         }
-        self.ending = None;
+        let previous = at.checked_sub(1).and_then(|place| chars.get(place)).copied();
+        match ch {
+            '\\' => at = at.saturating_add(2),
+            '\'' | '"' => {
+                quote = Some(ch);
+                at = at.saturating_add(1);
+            }
+            '#' if previous.is_none_or(|before| before.is_whitespace() || ";&|(".contains(before)) => break,
+            '<' if chars.get(at.saturating_add(1)) == Some(&'<')
+                && chars.get(at.saturating_add(2)) != Some(&'<')
+                && previous != Some('<') =>
+            {
+                let mut cursor = at.saturating_add(2);
+                let dash = chars.get(cursor) == Some(&'-');
+                if dash {
+                    cursor = cursor.saturating_add(1);
+                }
+                while chars.get(cursor).is_some_and(|space| *space == ' ' || *space == '\t') {
+                    cursor = cursor.saturating_add(1);
+                }
+                let (word, end) = read_word(&chars, cursor);
+                if !word.is_empty() {
+                    found.push((word, dash));
+                }
+                at = end.max(at.saturating_add(2));
+            }
+            _ => at = at.saturating_add(1),
+        }
+    }
+    found
+}
+
+fn line_body(line: &str) -> &str {
+    line.trim_end_matches(['\n', '\r'])
+}
+
+fn first_after(positions: Option<&Vec<usize>>, after: usize) -> Option<usize> {
+    let list = positions?;
+    list.get(list.partition_point(|place| *place <= after)).copied()
+}
+
+// A stray `<<` hides nothing: an opener counts only if its delimiter line follows.
+pub fn values_in_lines(lines: &[String], out: &mut Vec<(bool, String)>) {
+    let mut exact: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut stripped: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, line) in lines.iter().enumerate() {
+        let body = line_body(line);
+        exact.entry(body).or_default().push(index);
+        stripped.entry(body.trim_start_matches('\t')).or_default().push(index);
+    }
+    let mut index = 0usize;
+    while let Some(line) = lines.get(index) {
+        if line.contains("$'") {
+            for bash in [true, false] {
+                line_values(&rewrite_dollar_quotes(line, bash), out);
+            }
+        } else {
+            line_values(&rewrite_dollar_quotes(line, false), out);
+        }
+        let mut cursor = Some(index);
+        for (word, dash) in heredoc_delimiters(line) {
+            let table = if dash { &stripped } else { &exact };
+            cursor = cursor.and_then(|from| first_after(table.get(word.as_str()), from));
+        }
+        index = match cursor {
+            Some(end) if end > index => end.saturating_add(1),
+            _ => index.saturating_add(1),
+        };
     }
 }
 

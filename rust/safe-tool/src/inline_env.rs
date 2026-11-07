@@ -8,7 +8,7 @@ fn gate(source: &str) -> Regex {
 
 static PYTHON: LazyLock<Regex> = LazyLock::new(|| gate(r"\b(?:python[0-9.]*|pypy[0-9.]*)\b"));
 static PYTHON_IMPORT: LazyLock<Regex> =
-    LazyLock::new(|| gate(r"from\s+os\s+import\s+(?:\*|[^;\n]*\benviron\b)"));
+    LazyLock::new(|| gate(r"from\s+os\s+import\s+(?:\*|[^;\n]*\benvironb?\b)"));
 static NODE: LazyLock<Regex> = LazyLock::new(|| gate(r"\b(?:node(?:js)?|bun|deno)\b"));
 static RUBY: LazyLock<Regex> = LazyLock::new(|| gate(r"\bruby[0-9.]*\b"));
 static PERL: LazyLock<Regex> = LazyLock::new(|| gate(r"\bperl[0-9.]*\b"));
@@ -16,15 +16,18 @@ static PHP: LazyLock<Regex> = LazyLock::new(|| gate(r"\bphp[0-9.]*\b"));
 static AWK: LazyLock<Regex> = LazyLock::new(|| gate(r"\b[gmn]?awk\b"));
 static AROUND_DOT: LazyLock<Regex> = LazyLock::new(|| gate(r"\s*\.\s*"));
 static BEFORE_PAREN: LazyLock<Regex> = LazyLock::new(|| gate(r"\s+\("));
+static BRACKET_ENV: LazyLock<Regex> = LazyLock::new(|| gate(r#"\[\s*["'`]env["'`]\s*\]"#));
+static PYTHON_IMPORT_LINE: LazyLock<Regex> = LazyLock::new(|| gate(r"from\s+os\s+import\s+[^;\n]*"));
+static FOR_LOOP: LazyLock<Regex> = LazyLock::new(|| gate(r"(?:\b|\\[nrt])for[\s(]"));
 
 const OBJECT_METHODS: [&str; 6] =
     ["valueOf", "toString", "toLocaleString", "toJSON", "constructor", "__proto__"];
 
 // Spaces around a dot or before a bracket do not change what the code reads.
 fn normalized(text: &str) -> String {
-    BEFORE_PAREN
-        .replace_all(&AROUND_DOT.replace_all(text, "."), "(")
-        .into_owned()
+    let dotted = AROUND_DOT.replace_all(text, ".");
+    let compact = BEFORE_PAREN.replace_all(&dotted, "(");
+    BRACKET_ENV.replace_all(&compact, ".env").into_owned()
 }
 
 fn name_char(ch: char) -> bool {
@@ -57,7 +60,7 @@ fn is_membership_test(before: &str) -> bool {
         return false;
     }
     let statement = head.rsplit([';', '\n']).next().unwrap_or("");
-    !statement.contains("for ") && !statement.contains("for(")
+    !FOR_LOOP.is_match(statement)
 }
 
 fn starts_with_any(rest: &str, starts: &[&str]) -> bool {
@@ -70,7 +73,11 @@ fn python(text: &str) -> bool {
     };
     whole_use(text, "os.environ", &allowed, true)
         || whole_use(text, "os.environb", &allowed, true)
-        || (PYTHON_IMPORT.is_match(text) && whole_use(text, "environ", &allowed, true))
+        || (PYTHON_IMPORT.is_match(text) && {
+            let without_import = PYTHON_IMPORT_LINE.replace_all(text, " ");
+            whole_use(&without_import, "environ", &allowed, true)
+                || whole_use(&without_import, "environb", &allowed, true)
+        })
 }
 
 fn node(text: &str) -> bool {
@@ -81,10 +88,13 @@ fn node(text: &str) -> bool {
                     .chars()
                     .take_while(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
                     .collect();
+                let called = after
+                    .get(name.len()..)
+                    .is_some_and(|tail| tail.trim_start().starts_with('('));
                 name.chars()
                     .next()
                     .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '_' | '$'))
-                    && !OBJECT_METHODS.contains(&name.as_str())
+                    && !(called && OBJECT_METHODS.contains(&name.as_str()))
             })
     };
     whole_use(text, "process.env", &allowed, true)
@@ -103,24 +113,24 @@ fn ruby(text: &str) -> bool {
 }
 
 fn perl(text: &str) -> bool {
-    text.contains("%ENV") || text.contains("%main::ENV") || text.contains("%::ENV")
+    ["%ENV", "%main::ENV", "%::ENV", "%main'ENV"]
+        .iter()
+        .any(|name| text.contains(name))
 }
 
 fn php(text: &str) -> bool {
     let indexed = |rest: &str| rest.starts_with('[');
-    let all_variables = text.match_indices("getenv(").any(|(at, found)| {
-        text.get(at.saturating_add(found.len())..).is_some_and(|rest| {
-            let rest = rest.trim_start();
-            rest.starts_with(')')
-                || (rest.get(..4).is_some_and(|word| word.eq_ignore_ascii_case("null"))
-                    && rest.get(4..).is_some_and(|tail| tail.trim_start().starts_with(')')))
-        })
+    let lowered = text.to_lowercase();
+    let all_variables = lowered.match_indices("getenv(").any(|(at, found)| {
+        lowered
+            .get(at.saturating_add(found.len())..)
+            .is_some_and(|rest| !matches!(rest.trim_start().chars().next(), Some('\'' | '"' | '$')))
     });
     whole_use(text, "$_ENV", &indexed, false)
         || whole_use(text, "$_SERVER", &indexed, false)
         || all_variables
-        || text.contains("phpinfo(")
-        || text.contains("get_defined_vars(")
+        || lowered.contains("phpinfo(")
+        || lowered.contains("get_defined_vars(")
 }
 
 fn awk(text: &str) -> bool {
@@ -154,6 +164,13 @@ mod tests {
             r#"python3 -c "from os import environ; print(environ)""#,
             r#"python3 -c "from os import *; print(dict(environ))""#,
             r#"python3 -c 'import os; print(dict(os . environ))'"#,
+            "php -r 'var_dump(GETENV());'",
+            "php -r 'var_dump(getenv(name: null));'",
+            "php -r 'var_dump(getenv(null, true));'",
+            r#"node -e 'console.log(process["env"])'"#,
+            r#"python3 -c 'from os import environb; print(dict(environb))'"#,
+            "perl -e \"print %main'ENV\"",
+            "python3 -c 'import os; print([os.environ[k] for\tk in os.environ])'",
             "python3 - <<'PY'\nimport os\nprint(os.environ)\nPY",
             r#"node -e "console.log(process.env)""#,
             r#"node -e "console.log(process . env)""#,
@@ -190,6 +207,9 @@ mod tests {
             r#"python3 -c "import os; print(os.getenv('HOME'))""#,
             r#"node -e "console.log(process.env.HOME.length)""#,
             r#"node -e "console.log(process.env['X'])""#,
+            r#"node -e "console.log(process.env.constructor)""#,
+            r#"python3 -c 'from os import environ; print(environ["FIXTURE_NAME"])'"#,
+            r#"php -r 'echo getenv($name);'"#,
             r#"node -e "console.log('X' in process.env)""#,
             r#"ruby -e 'puts ENV["HOME"].size'"#,
             r#"ruby -e 'puts ENV.fetch("HOME").size'"#,

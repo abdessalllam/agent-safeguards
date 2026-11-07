@@ -291,6 +291,90 @@ fn unicode_json_and_mixed_case_percent_forms_are_withheld() {
 }
 
 #[test]
+fn a_here_document_marker_in_a_comment_a_string_or_arithmetic_hides_nothing() {
+    let rcs = [
+        "# example: cat <<EOF\nA=gardenpiano\ncat <<EOF\nhelp\nEOF\n",
+        "printf \"%s\\n\" \"<<EOF\"\nA=gardenpiano\ncat <<EOF\nhelp\nEOF\n",
+        "x=$((1<<4))\nA=gardenpiano\n",
+    ];
+    for (n, rc) in rcs.iter().enumerate() {
+        let h = home(&format!("marker{n}"), Some(rc));
+        let out = run(&h, "claude", "PostToolUse", &after("echo hi", "gardenpiano\n"), &[]);
+        assert!(withheld(&out, "gardenpiano"), "fixture {n}: {out}");
+    }
+}
+
+#[test]
+fn here_document_delimiters_of_every_shape_and_several_documents_are_data() {
+    let rcs = [
+        "cat <<EOF-HELP\nA=always\nEOF-HELP\n",
+        "cat <<E\"OF\"\nA=always\nEOF\n",
+        "cat <<123\nA=always\n123\n",
+        "cat <<FIRST <<SECOND\nB=neverthere\nFIRST\nA=always\nSECOND\n",
+        "cat <<-TABBED\n\tA=always\n\tTABBED\n",
+    ];
+    for (n, rc) in rcs.iter().enumerate() {
+        let h = home(&format!("shape{n}"), Some(rc));
+        let out = run(&h, "claude", "PostToolUse", &after("echo hi", "this always succeeds\n"), &[]);
+        assert!(allowed(&out), "fixture {n}: {out}");
+    }
+    let h = home("after-two", Some("cat <<FIRST <<SECOND\nB=neverthere\nFIRST\nA=always\nSECOND\nexport REAL=value1\n"));
+    let out = run(&h, "claude", "PostToolUse", &after("echo hi", "value1\n"), &[]);
+    assert!(withheld(&out, "value1"), "{out}");
+}
+
+#[test]
+fn ansi_c_newline_nul_and_control_literals_are_protected() {
+    let h = home("ansi2", Some("A=$'garden\\npiano'\nB=$'gardennul\\0tail'\nC=$'garden\\cApiano'\n"));
+    for shown in ["garden\npiano", "gardennul\n", "garden\u{1}piano"] {
+        let out = run(&h, "claude", "PostToolUse", &after("echo hi", &format!("{shown}\n")), &[]);
+        assert!(!allowed(&out), "{shown:?}: {out}");
+    }
+}
+
+#[test]
+fn php_slash_escapes_and_combined_json_escapes_are_withheld() {
+    let h = home("json3", Some("A='Garden/piano'\nB=$'caf\\xc3\\xa9\\bfixture'\n"));
+    for shown in ["\"Garden\\/piano\"", "\"caf\\u00e9\\bfixture\""] {
+        let out = run(&h, "claude", "PostToolUse", &after("echo hi", &format!("{shown}\n")), &[]);
+        assert!(withheld(&out, shown), "{shown}: {out}");
+    }
+}
+
+#[test]
+fn twenty_thousand_comment_markers_are_scanned_in_linear_time() {
+    let rc = format!("{}A=gardenpiano\n", "# <<EOF\n".repeat(19999));
+    let h = home("linear", Some(&rc));
+    let started = std::time::Instant::now();
+    let out = run(&h, "claude", "PostToolUse", &after("echo hi", "gardenpiano\n"), &[]);
+    assert!(withheld(&out, "gardenpiano"), "{out}");
+    assert!(started.elapsed().as_secs_f64() < 2.5, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn more_inline_forms_are_judged_by_what_they_read() {
+    let h = home("inline3", None);
+    for command in [
+        "php -r 'var_dump(GETENV());'",
+        "php -r 'var_dump(getenv(name: null));'",
+        "node -e 'console.log(process[\"env\"])'",
+        "python3 -c 'from os import environb; print(dict(environb))'",
+        "perl -e \"print %main'ENV\"",
+        "python3 -c 'import os; print([os.environ[k] for\tk in os.environ])'",
+    ] {
+        let out = run(&h, "claude", "PreToolUse", &before(command), &[]);
+        assert!(denied(&out), "{command}: {out}");
+    }
+    for command in [
+        "node -e 'console.log(process.env.constructor)'",
+        "python3 -c 'from os import environ; print(environ[\"FIXTURE_NAME\"])'",
+    ] {
+        let out = run(&h, "claude", "PreToolUse", &before(command), &[]);
+        assert!(allowed(&out), "{command}: {out}");
+    }
+}
+
+#[test]
 fn spaced_inline_code_is_judged_like_the_compact_form() {
     let h = home("spaced", None);
     for command in [

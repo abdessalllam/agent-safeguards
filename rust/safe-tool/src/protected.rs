@@ -13,6 +13,7 @@ const MAX_VALUE_CHARS: usize = 4096;
 const MAX_TOTAL_CHARS: usize = 65536;
 const MIN_ENCODED: usize = 7;
 const MAX_FOLDER_FILES: usize = 200;
+const MAX_FILE_CHARS: usize = 4 * 1024 * 1024;
 const SECRET_WORDS: [&str; 6] = ["key", "token", "secret", "pass", "credential", "auth"];
 const FOLDERS: [(&str, &[&str]); 4] = [
     (".zsh", &["zsh", "sh"]),
@@ -85,7 +86,7 @@ fn numeric(value: &str) -> bool {
 fn verdict(value: &str, home: &str) -> Verdict {
     let chars = value.chars().count();
     if chars < MIN_CHARS
-        || value.contains(['\0', '\n', '\r'])
+        || value.trim().is_empty()
         || numeric(value)
         || names_existing_path(value, home)
     {
@@ -180,6 +181,8 @@ fn json_ascii(value: &str, upper_hex: bool) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
             ch if ch.is_ascii() && ch >= ' ' => out.push(ch),
             ch => {
                 let mut units = [0u16; 2];
@@ -213,17 +216,20 @@ pub fn forms(value: &str) -> Vec<String> {
         out.push(encoded.to_lowercase());
         out.push(encoded);
     }
-    if !value.is_ascii() || value.contains(['"', '\\']) {
-        out.push(json_ascii(value, false));
-        out.push(json_ascii(value, true));
-    }
+    let mut json = vec![json_ascii(value, false), json_ascii(value, true)];
     if let Ok(quoted) = serde_json::to_string(value) {
         if let Some(inner) = quoted.get(1..quoted.len().saturating_sub(1)) {
-            if inner != value {
-                out.push(inner.to_owned());
-            }
+            json.push(inner.to_owned());
         }
     }
+    let slashed: Vec<String> = json
+        .iter()
+        .chain(std::iter::once(&value.to_owned()))
+        .filter(|form| form.contains('/'))
+        .map(|form| form.replace('/', "\\/"))
+        .collect();
+    json.extend(slashed);
+    out.extend(json.into_iter().filter(|form| form != value));
     out.retain(|form| form.chars().count() >= MIN_CHARS);
     out
 }
@@ -279,12 +285,18 @@ fn from_files(home: &str) -> Collected {
     let (paths, mut complete) = startup_paths(home);
     let mut values = Vec::new();
     for path in paths {
-        let mut scanner = keys::ValueScanner::default();
-        let read = keys::each_logical_line(&path, |line| scanner.scan(line, &mut values));
-        scanner.finish(&mut values);
-        if matches!(read, Ok(keys::LineRead::Truncated)) {
+        let mut lines: Vec<String> = Vec::new();
+        let mut size = 0usize;
+        let read = keys::each_logical_line(&path, |line| {
+            size = size.saturating_add(line.len());
+            if size <= MAX_FILE_CHARS {
+                lines.push(line.to_owned());
+            }
+        });
+        if size > MAX_FILE_CHARS || matches!(read, Ok(keys::LineRead::Truncated)) {
             complete = false;
         }
+        keys::values_in_lines(&lines, &mut values);
     }
     Collected { values, complete }
 }
@@ -397,6 +409,20 @@ mod tests {
         assert!(found.is_match("caf\u{e9}fixture"));
         assert!(found.is_match("\"caf\\u00e9fixture\""));
         assert!(found.is_match("\"caf\\u00E9fixture\""));
+    }
+
+    #[test]
+    fn php_slash_escapes_and_combined_json_escapes_are_found() {
+        let found = matcher_for(&[(false, "Garden/piano"), (false, "caf\u{e9}\u{8}fixture")], &[]);
+        assert!(found.is_match("\"Garden\\/piano\""));
+        assert!(found.is_match("\"caf\\u00e9\\bfixture\""));
+    }
+
+    #[test]
+    fn multi_line_values_are_protected_but_blank_ones_are_not() {
+        let found = matcher_for(&[(false, "garden\npiano"), (false, "\n\n\n\n\n\n\n")], &[]);
+        assert!(found.is_match("garden\npiano"));
+        assert!(!found.is_match("a\n\n\n\n\n\n\nb"));
     }
 
     #[test]
