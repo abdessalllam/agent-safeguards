@@ -381,9 +381,10 @@ mod tests {
 
     #[test]
     fn opens_plain_file_but_rejects_links() {
-        let base = std::env::var("CARGO_TARGET_DIR")
+        let parent = std::env::var("CARGO_TARGET_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir())
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let base = PathBuf::from(guard_common::sys::realpath(&parent.to_string_lossy()))
             .join(format!("s7-open-{}", std::process::id()));
         let plain = base.join("plain");
         std::fs::create_dir_all(&plain).expect("create fixture");

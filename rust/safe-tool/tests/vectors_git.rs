@@ -48,9 +48,10 @@ fn vectors_match_python() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/git.json");
     let source = std::fs::read_to_string(path).expect("run python3 tests/gen_git.py first");
     let records: Vec<Value> = serde_json::from_str(&source).expect("git vectors");
-    let fixture = std::env::var("CARGO_TARGET_DIR")
+    let parent = std::env::var("CARGO_TARGET_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir())
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let fixture = std::path::PathBuf::from(guard_common::sys::realpath(&parent.to_string_lossy()))
         .join(format!("s7-vectors-open-{}", std::process::id()));
     let plain = fixture.join("plain");
     std::fs::create_dir_all(&plain).expect("fixture directory");
