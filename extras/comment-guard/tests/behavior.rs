@@ -348,13 +348,14 @@ fn a_block_comment_of_four_prose_lines_is_denied_and_delimiter_lines_do_not_coun
 }
 
 #[test]
-fn a_doc_comment_is_exempt_from_the_line_cap_but_not_from_the_other_rules() {
-    assert!(!denied(&edit("a.rs", "", "/// one\n/// two\n/// three\n/// four\n")));
-    assert!(!denied(&edit("a.rs", "", "//! one\n//! two\n//! three\n")));
-    assert!(!denied(&edit("a.ts", "", "/**\n * one\n * two\n * three\n */\n")));
-    assert!(denied(&edit("a.rs", "", &format!("/// {}\n", "w".repeat(100)))));
-    assert!(denied(&edit("a.rs", "", "/// added on 2026-10-27\n")));
-    assert!(denied(&edit("a.rs", "", "// one\n// two\n// three\n/// doc\n")));
+fn only_a_python_module_docstring_is_exempt_from_the_line_cap() {
+    assert!(denied(&edit("a.rs", "", "/// one\n/// two\n/// three\n/// four\n")));
+    assert!(denied(&edit("a.rs", "", "//! one\n//! two\n//! three\n")));
+    assert!(denied(&edit("a.ts", "", "/**\n * one\n * two\n * three\n */\n")));
+    assert!(!denied(&edit("a.rs", "", "/// one\n/// two\n")));
+    assert!(!denied(&edit("a.py", "", "\"\"\"\none\ntwo\nthree\nfour\n\"\"\"\n")));
+    assert!(denied(&edit("a.py", "", &format!("\"\"\"\n{}\n\"\"\"\n", "w".repeat(100)))));
+    assert!(denied(&edit("a.py", "", "\"\"\"\nadded on 2026-10-27\n\"\"\"\n")));
 }
 
 #[test]

@@ -206,7 +206,7 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
         }
         if !counted {
             fresh_lines = fresh_lines.saturating_add(1);
-            if !doc && letters(line) > 0 {
+            if !scanner.is_exempt_doc_line() && letters(line) > 0 {
                 run_fresh = run_fresh.saturating_add(1);
             }
             if coded && run_fresh > 0 {
@@ -707,7 +707,6 @@ struct OpenBlock {
     fine: bool,
     fresh: bool,
     lettered: usize,
-    doc: bool,
 }
 
 struct OpenDoc {
@@ -716,6 +715,8 @@ struct OpenDoc {
     fine: bool,
     fresh: bool,
     statement: bool,
+    exempt: bool,
+    lettered: usize,
 }
 
 fn fits(line: &str) -> bool {
@@ -850,6 +851,8 @@ pub fn trimmed_with(change: &Change, docstrings: bool) -> Option<Trimmed> {
                 fine: true,
                 fresh: !anchors.contains(&anchor_of(&lines, &logical, index)),
                 statement: scanner.at_statement(),
+                exempt: scanner.is_exempt_doc_line(),
+                lettered: 0,
             });
         }
         if scanner.block_start() {
@@ -859,7 +862,6 @@ pub fn trimmed_with(change: &Change, docstrings: bool) -> Option<Trimmed> {
                 fine: true,
                 fresh: true,
                 lettered: 0,
-                doc: scanner.is_doc_line(),
             });
         }
         let found = match kind {
@@ -907,12 +909,15 @@ pub fn trimmed_with(change: &Change, docstrings: bool) -> Option<Trimmed> {
                 doc.fresh &= !kept && !protected(body(line)) && !protected(text);
                 doc.fine &= fits(line);
                 doc.shown.push(line.trim().to_owned());
+                if letters(line) > 0 {
+                    doc.lettered = doc.lettered.saturating_add(1);
+                }
             } else if let Some(unit) = block.as_mut() {
                 let guarded = protected(body(line)) || (scanner.line_index() < 3 && directive_shaped(line));
                 unit.fresh &= !kept && !guarded;
                 unit.fine &= fits(line);
                 unit.shown.push(line.trim().to_owned());
-                if letters(line) > 0 && !scanner.is_doc_line() {
+                if letters(line) > 0 {
                     unit.lettered = unit.lettered.saturating_add(1);
                 }
             } else {
@@ -923,7 +928,7 @@ pub fn trimmed_with(change: &Change, docstrings: bool) -> Option<Trimmed> {
                         first: index,
                         last: index,
                         shown: vec![line.trim().to_owned()],
-                        cost: usize::from(!scanner.is_doc_line() && letters(line) > 0),
+                        cost: usize::from(!scanner.is_exempt_doc_line() && letters(line) > 0),
                         fine: fits(line),
                         docstring: false,
                     });
@@ -938,7 +943,7 @@ pub fn trimmed_with(change: &Change, docstrings: bool) -> Option<Trimmed> {
                         run: run_id,
                         first: unit.first,
                         last: index,
-                        cost: if unit.doc { 0 } else { unit.lettered },
+                        cost: unit.lettered,
                         shown: unit.shown,
                         fine: unit.fine,
                         docstring: false,
@@ -956,7 +961,7 @@ pub fn trimmed_with(change: &Change, docstrings: bool) -> Option<Trimmed> {
                         run: run_id,
                         first: doc.first,
                         last: index,
-                        cost: 0,
+                        cost: if doc.exempt { 0 } else { doc.lettered },
                         shown: doc.shown,
                         fine: doc.fine,
                         docstring: true,

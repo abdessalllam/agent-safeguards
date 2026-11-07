@@ -171,9 +171,19 @@ fn an_edit_is_judged_on_the_whole_file_so_a_docstring_end_is_not_a_start() {
 }
 
 #[test]
-fn python_docstrings_are_exempt_from_the_line_cap_but_not_from_the_other_rules() {
+fn only_the_module_docstring_of_a_python_file_is_exempt_from_the_line_cap() {
     let four = "def f():\n    \"\"\"\n    one\n    two\n    three\n    four\n    \"\"\"\n    return 1\n";
-    assert!(!denied(&write_file(None, None, Path::new("c_doc.py"), four)));
+    assert!(denied(&write_file(None, None, Path::new("c_doc.py"), four)));
+    let module = "\"\"\"\none\ntwo\nthree\nfour\n\"\"\"\nx = 1\n";
+    assert!(!denied(&write_file(None, None, Path::new("c_doc.py"), module)));
+    let headed = "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n\"\"\"\none\ntwo\nthree\nfour\n\"\"\"\nx = 1\n";
+    assert!(!denied(&write_file(None, None, Path::new("c_doc.py"), headed)));
+    let second = "\"\"\"\none\n\"\"\"\n\"\"\"\ntwo\nthree\nfour\n\"\"\"\nx = 1\n";
+    assert!(denied(&write_file(None, None, Path::new("c_doc.py"), second)));
+    let after_code = "import os\n\"\"\"\none\ntwo\nthree\nfour\n\"\"\"\n";
+    assert!(denied(&write_file(None, None, Path::new("c_doc.py"), after_code)));
+    let class = "class A:\n    \"\"\"\n    one\n    two\n    three\n    \"\"\"\n    x = 1\n";
+    assert!(denied(&write_file(None, None, Path::new("c_doc.py"), class)));
     let dated = "def f():\n    \"\"\"\n    one\n    two 2026-10-27\n    \"\"\"\n    return 1\n";
     assert!(denied(&write_file(None, None, Path::new("c_doc.py"), dated)));
     let short = "def f():\n    \"\"\"One line.\"\"\"\n    return 1\n";
@@ -2300,7 +2310,9 @@ fn comments_that_cannot_be_cut_safely_are_still_refused() {
     refuse("Containerfile", "FROM alpine\n# one\n# two\n# three\n# four\nRUN echo x\n");
     refuse("justfile", "build:\n  echo hi\n# one\n# two\n# three\n# four\n");
     let preserved = "/*! one\n two\n three\n four */\na { b: c }\n";
-    assert!(matches!(trimming(None, None, "Write", written(&dir.join("p.css"), preserved), Provider::Claude), Verdict::Allow));
+    refuse("p.css", preserved);
+    let short = "/*! one\n two */\na { b: c }\n";
+    assert!(matches!(trimming(None, None, "Write", written(&dir.join("p.css"), short), Provider::Claude), Verdict::Allow));
     refuse("q.css", "/*# one\n two\n three\n four */\na { b: c }\n");
     assert!(unrefused.borrow().is_empty(), "{:?} were trimmed or allowed", unrefused.borrow());
     let css = "/* one */\n/* two */\n/* three */\n/* four */\na { b: c }\n";
@@ -3015,7 +3027,7 @@ fn a_docstring_written_by_a_command_is_reported_never_cut_on_disk() {
 }
 
 #[test]
-fn a_multi_line_block_comment_over_the_limit_is_cut_as_a_unit_and_a_doc_block_is_exempt() {
+fn a_multi_line_block_comment_over_the_limit_is_cut_as_a_unit_even_when_it_is_a_doc_block() {
     let dir = temp_dir("block-units");
     let drop = |name: &str, text: &str| cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join(name), text), Provider::Claude)).0;
     let trim = |name: &str, text: &str| cut(trimming(None, None, "Write", written(&dir.join(name), text), Provider::Claude)).0;
@@ -3031,11 +3043,25 @@ fn a_multi_line_block_comment_over_the_limit_is_cut_as_a_unit_and_a_doc_block_is
     let within = "/*\n * one\n * two\n */\nexport const a = 1;\n";
     assert!(matches!(trimming(None, None, "Write", written(&dir.join("a.ts"), within), Provider::Claude), Verdict::Allow));
     let doc = "/**\n * One.\n * Two.\n * Three.\n * Four.\n */\nexport function f() {}\n";
-    assert!(matches!(trimming(None, None, "Write", written(&dir.join("a.ts"), doc), Provider::Claude), Verdict::Allow));
+    assert_eq!(drop("a.ts", doc)["content"], "export function f() {}\n");
     let long_doc = format!("/**\n * One.\n * {}\n */\nexport function f() {{}}\n", "w".repeat(100));
     assert!(!matches!(trimming(None, None, "Write", written(&dir.join("a.ts"), &long_doc), Provider::Claude), Verdict::Allow));
     let trailing = "/*\none\ntwo\nthree\n*/ const a = 1;\n";
     assert!(denied(&trimming(None, None, "Write", written(&dir.join("a.ts"), trailing), Provider::Claude)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_module_docstring_stays_while_other_docs_over_the_limit_are_cut() {
+    let dir = temp_dir("module-doc");
+    let drop = |name: &str, text: &str| cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join(name), text), Provider::Claude)).0;
+    let module = "\"\"\"\nOne.\nTwo.\nThree.\nFour.\n\"\"\"\n\n\ndef f():\n    \"\"\"\n    One.\n    Two.\n    Three.\n    \"\"\"\n    return 1\n";
+    let kept = "\"\"\"\nOne.\nTwo.\nThree.\nFour.\n\"\"\"\n\n\ndef f():\n    return 1\n";
+    assert_eq!(drop("m.py", module)["content"], kept);
+    let only = "def f():\n    \"\"\"\n    One.\n    Two.\n    Three.\n    \"\"\"\n";
+    assert_eq!(drop("n.py", only)["content"], "def f():\n    pass\n");
+    let rust = "/// One.\n/// Two.\n/// Three.\n/// Four.\npub fn f() {}\n";
+    assert_eq!(drop("a.rs", rust)["content"], "pub fn f() {}\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
