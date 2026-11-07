@@ -9,7 +9,7 @@ use guard_common::{env, locale, pyglob, secret_scan};
 use regex::bytes::Regex;
 use serde_json::{Map, Value};
 
-use crate::{command, consts, local_only, output};
+use crate::{command, consts, local_only, output, protected};
 
 pub const READ_DEFAULT_LINES: usize = 2_000;
 pub const READ_LINE_CHARACTERS: usize = 2_000;
@@ -271,6 +271,10 @@ pub fn handle_content_tool(runtime: &str, event: &str, payload: &Value) -> Resul
     let response = payload.get("tool_response").unwrap_or(&Value::Null);
     let values = output::response_values(response, 0).map_err(|_| HookError::Internal)?;
     let labels = output::response_labels(response, 0).map_err(|_| HookError::Internal)?;
+    if protected::leaks(&values) || protected::leaks(&labels) {
+        output::withhold_post_hook(runtime, response, Some("secret"), None).map_err(|_| HookError::Internal)?;
+        return Ok(());
+    }
     if secret_scan::contains_key(&values) || secret_scan::contains_key(&labels) {
         let replacement = if runtime == "claude" {
             let (replacement, found) = redact_keys(response, 0).map_err(|_| HookError::Internal)?;
@@ -341,7 +345,10 @@ pub fn handle_event(runtime: &str, event: &str, payload: &Value) -> Result<(), H
         }
     } else {
         let response = payload.get("tool_response").unwrap_or(&Value::Null);
-        let reason = output::withheld_because(text, response).map_err(|_| HookError::Internal)?;
+        let mut reason = output::withheld_because(text, response).map_err(|_| HookError::Internal)?;
+        if reason.is_none() && protected::response_leaks(response).map_err(|_| HookError::Internal)? {
+            reason = Some("secret".to_owned());
+        }
         if let Some(reason) = reason {
             output::withhold_post_hook(runtime, response, Some(&reason), None)
                 .map_err(|_| HookError::Internal)?;

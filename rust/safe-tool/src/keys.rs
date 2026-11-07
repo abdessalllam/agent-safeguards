@@ -155,31 +155,35 @@ fn read_universal_line(reader: &mut impl BufRead) -> std::io::Result<Option<Vec<
     }
 }
 
-pub fn keys_set_in(path: &str) -> Result<(HashSet<String>, bool), EmbeddedNul> {
+pub enum LineRead {
+    Missing,
+    Unreadable,
+    Truncated,
+    Complete,
+}
+
+pub fn each_logical_line(path: &str, mut each: impl FnMut(&str)) -> Result<LineRead, EmbeddedNul> {
     if path.contains('\0') {
         return Err(EmbeddedNul);
     }
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((HashSet::new(), true))
-        }
-        Err(_) => return Ok((HashSet::new(), false)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(LineRead::Missing),
+        Err(_) => return Ok(LineRead::Unreadable),
     };
     let mut reader = BufReader::new(file);
-    let mut found = HashSet::new();
     let mut pending = String::new();
     let mut number = 0usize;
     loop {
         let bytes = match read_universal_line(&mut reader) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => break,
-            Err(_) => return Ok((HashSet::new(), false)),
+            Err(_) => return Ok(LineRead::Unreadable),
         };
         if number >= consts::MAX_STARTUP_FILE_LINES
             || pending.chars().count() > consts::MAX_STARTUP_LINE_CHARS
         {
-            return Ok((found, false));
+            return Ok(LineRead::Truncated);
         }
         number = number.saturating_add(1);
         let line = format!("{pending}{}", String::from_utf8_lossy(&bytes));
@@ -187,10 +191,93 @@ pub fn keys_set_in(path: &str) -> Result<(HashSet<String>, bool), EmbeddedNul> {
             pending = continued.to_owned();
         } else {
             pending.clear();
-            apply_line(&line, &mut found);
+            each(&line);
         }
     }
-    Ok((found, true))
+    Ok(LineRead::Complete)
+}
+
+pub fn keys_set_in(path: &str) -> Result<(HashSet<String>, bool), EmbeddedNul> {
+    let mut found = HashSet::new();
+    Ok(match each_logical_line(path, |line| apply_line(line, &mut found))? {
+        LineRead::Missing => (HashSet::new(), true),
+        LineRead::Unreadable => (HashSet::new(), false),
+        LineRead::Truncated => (found, false),
+        LineRead::Complete => (found, true),
+    })
+}
+
+// Alias bodies and fish set values join assignments: each can hold a credential.
+fn command_values(words: &[String], out: &mut Vec<(bool, String)>) {
+    let mut words = words;
+    while words
+        .first()
+        .is_some_and(|word| ["then", "do", "else", "!"].contains(&word.as_str()))
+    {
+        words = words.get(1..).unwrap_or(&[]);
+    }
+    let Some(first) = words.first() else {
+        return;
+    };
+    let rest = words.get(1..).unwrap_or(&[]);
+    if first == "alias" {
+        for token in rest.iter().filter(|word| !word.starts_with('-')) {
+            if let Some((name, body)) = token.split_once('=') {
+                if !name.is_empty() {
+                    out.push((true, body.to_owned()));
+                }
+            }
+        }
+        return;
+    }
+    if first == "set" {
+        let mut operands = rest.iter().filter(|word| !word.starts_with('-'));
+        if operands
+            .next()
+            .is_some_and(|name| consts::KEY_NAME_PATTERN_FULL.is_match(name))
+        {
+            out.extend(operands.map(|value| (false, value.clone())));
+        }
+        return;
+    }
+    let keyword = ["export", "readonly", "declare", "typeset"].contains(&first.as_str());
+    let mut tokens = if keyword { rest } else { words };
+    while keyword
+        && tokens
+            .first()
+            .is_some_and(|word| KEYWORD_OPTION.is_match(word))
+    {
+        tokens = tokens.get(1..).unwrap_or(&[]);
+    }
+    for token in tokens {
+        match ASSIGNMENT.captures(token) {
+            Some(captures) => out.push((false, captures.get(2).map_or("", |part| part.as_str()).to_owned())),
+            None if keyword => {}
+            None => break,
+        }
+    }
+}
+
+pub fn line_values(line: &str, out: &mut Vec<(bool, String)>) {
+    let Ok(tokens) = Lexer::new(line)
+        .posix(true)
+        .punctuation_chars(";&|")
+        .whitespace_split(true)
+        .commenters("#")
+        .tokens()
+    else {
+        return;
+    };
+    let mut command = Vec::new();
+    for token in tokens {
+        if !token.is_empty() && token.chars().all(|ch| ";&|".contains(ch)) {
+            command_values(&command, out);
+            command.clear();
+        } else {
+            command.push(token);
+        }
+    }
+    command_values(&command, out);
 }
 
 #[cfg(test)]

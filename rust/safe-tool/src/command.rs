@@ -8,7 +8,7 @@ use guard_common::sys::EmbeddedNul;
 use guard_common::{emit, env, locale};
 use regex::Regex;
 
-use crate::{chunk, consts, git_rules, paths, process, startup, words};
+use crate::{chunk, consts, git_rules, inline_env, paths, process, startup, words};
 
 static DATA_ENV_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.env").unwrap_or_else(|_| std::process::abort()));
@@ -297,6 +297,7 @@ fn sensitive_command_level(command: &str, data_heredocs: bool) -> Result<bool, E
         || consts::PROCESS_ENVIRONMENT_PATTERN.is_match(&lowered)
         || startup::reads_startup_file(&command)?
         || chunk::prints_secret_variable(&command)
+        || inline_env::dumps_environment(&command)
         || names_non_template_data_env(&lowered)
     {
         return Ok(true);
