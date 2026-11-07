@@ -9,10 +9,10 @@ use serde_json::Value;
 use crate::{consts, keys, output};
 
 const MIN_CHARS: usize = 6;
-const MAX_CHARS: usize = 1024;
+const MAX_VALUE_CHARS: usize = 4096;
+const MAX_TOTAL_CHARS: usize = 65536;
 const MIN_ENCODED: usize = 7;
-const MAX_VALUES: usize = 500;
-const MAX_FOLDER_FILES: usize = 40;
+const MAX_FOLDER_FILES: usize = 200;
 const SECRET_WORDS: [&str; 6] = ["key", "token", "secret", "pass", "credential", "auth"];
 const FOLDERS: [(&str, &[&str]); 4] = [
     (".zsh", &["zsh", "sh"]),
@@ -25,10 +25,22 @@ const STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 enum Matcher {
     Nothing,
     Ready(Regex),
-    Broken,
+    Incomplete,
 }
 
-fn startup_paths(home: &str) -> Vec<String> {
+enum Verdict {
+    Skip,
+    Keep,
+    TooLong,
+}
+
+pub struct Collected {
+    pub values: Vec<(bool, String)>,
+    pub complete: bool,
+}
+
+fn startup_paths(home: &str) -> (Vec<String>, bool) {
+    let mut complete = true;
     let mut paths: Vec<String> = consts::STARTUP_KEY_FILES
         .iter()
         .map(|name| format!("{home}/{name}"))
@@ -47,10 +59,13 @@ fn startup_paths(home: &str) -> Vec<String> {
             })
             .collect();
         names.sort();
-        names.truncate(MAX_FOLDER_FILES);
+        if names.len() > MAX_FOLDER_FILES {
+            complete = false;
+            names.truncate(MAX_FOLDER_FILES);
+        }
         paths.extend(names.into_iter().map(|name| format!("{home}/{folder}/{name}")));
     }
-    paths
+    (paths, complete)
 }
 
 fn names_existing_path(value: &str, home: &str) -> bool {
@@ -67,12 +82,19 @@ fn numeric(value: &str) -> bool {
             .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | ':' | '-' | '+' | ','))
 }
 
-fn protectable(value: &str, home: &str) -> bool {
+fn verdict(value: &str, home: &str) -> Verdict {
     let chars = value.chars().count();
-    (MIN_CHARS..=MAX_CHARS).contains(&chars)
-        && !value.contains(['\0', '\n', '\r'])
-        && !numeric(value)
-        && !names_existing_path(value, home)
+    if chars < MIN_CHARS
+        || value.contains(['\0', '\n', '\r'])
+        || numeric(value)
+        || names_existing_path(value, home)
+    {
+        return Verdict::Skip;
+    }
+    if chars > MAX_VALUE_CHARS {
+        return Verdict::TooLong;
+    }
+    Verdict::Keep
 }
 
 // Alias bodies of plain words stay visible; only shaped ones are protected.
@@ -133,17 +155,45 @@ fn base64_forms(bytes: &[u8]) -> Vec<String> {
     out
 }
 
-fn percent(bytes: &[u8]) -> String {
+fn percent(bytes: &[u8], lower_hex: bool) -> String {
     bytes
         .iter()
         .map(|byte| {
             if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
                 char::from(*byte).to_string()
+            } else if lower_hex {
+                format!("%{byte:02x}")
             } else {
                 format!("%{byte:02X}")
             }
         })
         .collect()
+}
+
+// Python's default JSON text writes every non-ASCII character as \uXXXX.
+fn json_ascii(value: &str, upper_hex: bool) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_ascii() && ch >= ' ' => out.push(ch),
+            ch => {
+                let mut units = [0u16; 2];
+                for unit in ch.encode_utf16(&mut units) {
+                    if upper_hex {
+                        out.push_str(&format!("\\u{unit:04X}"));
+                    } else {
+                        out.push_str(&format!("\\u{unit:04x}"));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn forms(value: &str) -> Vec<String> {
@@ -157,10 +207,15 @@ pub fn forms(value: &str) -> Vec<String> {
         hex(bytes).to_uppercase(),
     ];
     out.extend(base64_forms(bytes));
-    let encoded = percent(bytes);
+    let encoded = percent(bytes, false);
     if encoded != value {
+        out.push(percent(bytes, true));
         out.push(encoded.to_lowercase());
         out.push(encoded);
+    }
+    if !value.is_ascii() || value.contains(['"', '\\']) {
+        out.push(json_ascii(value, false));
+        out.push(json_ascii(value, true));
     }
     if let Ok(quoted) = serde_json::to_string(value) {
         if let Some(inner) = quoted.get(1..quoted.len().saturating_sub(1)) {
@@ -173,18 +228,30 @@ pub fn forms(value: &str) -> Vec<String> {
     out
 }
 
-fn build(values: Vec<(bool, String)>, process: Vec<String>, home: &str) -> Matcher {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut chosen: Vec<String> = Vec::new();
-    let from_files = values
+fn build(collected: Collected, process: Vec<String>, home: &str) -> Matcher {
+    if !collected.complete {
+        return Matcher::Incomplete;
+    }
+    let from_files = collected
+        .values
         .into_iter()
         .flat_map(|(is_alias, value)| candidates(is_alias, &value));
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut chosen: Vec<String> = Vec::new();
+    let mut total = 0usize;
     for value in from_files.chain(process) {
-        if chosen.len() >= MAX_VALUES {
-            break;
-        }
-        if protectable(&value, home) && seen.insert(value.clone()) {
-            chosen.push(value);
+        match verdict(&value, home) {
+            Verdict::Skip => {}
+            Verdict::TooLong => return Matcher::Incomplete,
+            Verdict::Keep => {
+                if seen.insert(value.clone()) {
+                    total = total.saturating_add(value.chars().count());
+                    if total > MAX_TOTAL_CHARS {
+                        return Matcher::Incomplete;
+                    }
+                    chosen.push(value);
+                }
+            }
         }
     }
     let mut forms_seen: HashSet<String> = HashSet::new();
@@ -204,18 +271,22 @@ fn build(values: Vec<(bool, String)>, process: Vec<String>, home: &str) -> Match
         .build()
     {
         Ok(matcher) => Matcher::Ready(matcher),
-        Err(_) => Matcher::Broken,
+        Err(_) => Matcher::Incomplete,
     }
 }
 
-fn from_files(home: &str) -> Vec<(bool, String)> {
-    let mut found = Vec::new();
-    for path in startup_paths(home) {
-        let mut lines = Vec::new();
-        let _ = keys::each_logical_line(&path, |line| keys::line_values(line, &mut lines));
-        found.extend(lines);
+fn from_files(home: &str) -> Collected {
+    let (paths, mut complete) = startup_paths(home);
+    let mut values = Vec::new();
+    for path in paths {
+        let mut scanner = keys::ValueScanner::default();
+        let read = keys::each_logical_line(&path, |line| scanner.scan(line, &mut values));
+        scanner.finish(&mut values);
+        if matches!(read, Ok(keys::LineRead::Truncated)) {
+            complete = false;
+        }
     }
-    found
+    Collected { values, complete }
 }
 
 fn from_process() -> Vec<String> {
@@ -234,27 +305,60 @@ fn matcher() -> &'static Matcher {
     })
 }
 
-// A matcher that failed to build withholds everything rather than failing open.
-pub fn leaks(text: &str) -> bool {
+// An incomplete matcher withholds all output instead of part of it.
+pub fn leak_reason(text: &str) -> Option<&'static str> {
     match matcher() {
-        Matcher::Nothing => false,
-        Matcher::Ready(found) => found.is_match(text),
-        Matcher::Broken => true,
+        Matcher::Nothing => None,
+        Matcher::Ready(found) => found.is_match(text).then_some("secret"),
+        Matcher::Incomplete => Some("coverage"),
     }
 }
 
-pub fn response_leaks(response: &Value) -> Result<bool, output::ResponseTooComplex> {
-    Ok(leaks(&output::response_text(response, 0)?))
+fn string_leaves(value: &Value, depth: usize, out: &mut String) -> Result<(), output::ResponseTooComplex> {
+    if depth > output::MAX_RESPONSE_DEPTH {
+        return Err(output::ResponseTooComplex);
+    }
+    match value {
+        Value::String(text) => {
+            out.push_str(text);
+            out.push('\n');
+        }
+        Value::Array(items) => {
+            for child in items {
+                string_leaves(child, depth.saturating_add(1), out)?;
+            }
+        }
+        Value::Object(fields) => {
+            for child in fields.values() {
+                string_leaves(child, depth.saturating_add(1), out)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// Field names like stderr belong to the tool, so only string content is read.
+pub fn response_leak_reason(response: &Value) -> Result<Option<&'static str>, output::ResponseTooComplex> {
+    let mut text = String::new();
+    string_leaves(response, 0, &mut text)?;
+    Ok(leak_reason(&text))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn collected(values: &[(bool, &str)]) -> Collected {
+        Collected {
+            values: values.iter().map(|(alias, value)| (*alias, (*value).to_owned())).collect(),
+            complete: true,
+        }
+    }
+
     fn matcher_for(values: &[(bool, &str)], process: &[&str]) -> Regex {
-        let values = values.iter().map(|(alias, value)| (*alias, (*value).to_owned())).collect();
         let process = process.iter().map(|value| (*value).to_owned()).collect();
-        match build(values, process, "/nonexistent-home") {
+        match build(collected(values), process, "/nonexistent-home") {
             Matcher::Ready(found) => found,
             _ => panic!("expected a matcher"),
         }
@@ -268,7 +372,6 @@ mod tests {
         assert!(found.is_match("VALUE1"));
         assert!(found.is_match("76616c756531"));
         assert!(found.is_match("dmFsdWUx"));
-        assert!(found.is_match("Hunter2%2Dpass") || found.is_match("Hunter2-pass"));
         assert!(!found.is_match("nothing to see here"));
     }
 
@@ -279,6 +382,21 @@ mod tests {
             let data = format!("{prefix}s3cr3t-token-value::tail");
             assert!(found.is_match(&base64(data.as_bytes())), "prefix {prefix:?}");
         }
+    }
+
+    #[test]
+    fn percent_escapes_match_in_either_hex_case_with_the_literals_unchanged() {
+        let found = matcher_for(&[(false, "Garden/piano")], &[]);
+        assert!(found.is_match("Garden%2Fpiano"));
+        assert!(found.is_match("Garden%2fpiano"));
+    }
+
+    #[test]
+    fn json_text_with_unicode_escapes_is_found() {
+        let found = matcher_for(&[(false, "caf\u{e9}fixture")], &[]);
+        assert!(found.is_match("caf\u{e9}fixture"));
+        assert!(found.is_match("\"caf\\u00e9fixture\""));
+        assert!(found.is_match("\"caf\\u00E9fixture\""));
     }
 
     #[test]
@@ -304,7 +422,27 @@ mod tests {
 
     #[test]
     fn nothing_to_protect_builds_no_matcher() {
-        assert!(matches!(build(Vec::new(), Vec::new(), "/nonexistent-home"), Matcher::Nothing));
-        assert!(matches!(build(vec![(false, "abc".to_owned())], Vec::new(), "/nonexistent-home"), Matcher::Nothing));
+        assert!(matches!(build(collected(&[]), Vec::new(), "/nonexistent-home"), Matcher::Nothing));
+        assert!(matches!(build(collected(&[(false, "abc")]), Vec::new(), "/nonexistent-home"), Matcher::Nothing));
+    }
+
+    #[test]
+    fn many_small_values_are_all_covered() {
+        let owned: Vec<String> = (0..600).map(|n| format!("fixtureitem{n:04}")).collect();
+        let values: Vec<(bool, &str)> = owned.iter().map(|value| (false, value.as_str())).collect();
+        let found = matcher_for(&values, &[]);
+        assert!(found.is_match("fixtureitem0000"));
+        assert!(found.is_match("fixtureitem0599"));
+    }
+
+    #[test]
+    fn coverage_that_cannot_be_complete_withholds_everything() {
+        let long = "x".repeat(MAX_VALUE_CHARS + 1);
+        assert!(matches!(build(collected(&[(false, long.as_str())]), Vec::new(), "/nonexistent-home"), Matcher::Incomplete));
+        let owned: Vec<String> = (0..200).map(|n| format!("{n:04}-{}", "y".repeat(400))).collect();
+        let values: Vec<(bool, &str)> = owned.iter().map(|value| (false, value.as_str())).collect();
+        assert!(matches!(build(collected(&values), Vec::new(), "/nonexistent-home"), Matcher::Incomplete));
+        let partial = Collected { values: Vec::new(), complete: false };
+        assert!(matches!(build(partial, Vec::new(), "/nonexistent-home"), Matcher::Incomplete));
     }
 }

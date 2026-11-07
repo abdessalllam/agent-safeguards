@@ -8,12 +8,24 @@ fn gate(source: &str) -> Regex {
 
 static PYTHON: LazyLock<Regex> = LazyLock::new(|| gate(r"\b(?:python[0-9.]*|pypy[0-9.]*)\b"));
 static PYTHON_IMPORT: LazyLock<Regex> =
-    LazyLock::new(|| gate(r"from\s+os\s+import\s+[^;\n]*\benviron\b"));
+    LazyLock::new(|| gate(r"from\s+os\s+import\s+(?:\*|[^;\n]*\benviron\b)"));
 static NODE: LazyLock<Regex> = LazyLock::new(|| gate(r"\b(?:node(?:js)?|bun|deno)\b"));
 static RUBY: LazyLock<Regex> = LazyLock::new(|| gate(r"\bruby[0-9.]*\b"));
 static PERL: LazyLock<Regex> = LazyLock::new(|| gate(r"\bperl[0-9.]*\b"));
 static PHP: LazyLock<Regex> = LazyLock::new(|| gate(r"\bphp[0-9.]*\b"));
 static AWK: LazyLock<Regex> = LazyLock::new(|| gate(r"\b[gmn]?awk\b"));
+static AROUND_DOT: LazyLock<Regex> = LazyLock::new(|| gate(r"\s*\.\s*"));
+static BEFORE_PAREN: LazyLock<Regex> = LazyLock::new(|| gate(r"\s+\("));
+
+const OBJECT_METHODS: [&str; 6] =
+    ["valueOf", "toString", "toLocaleString", "toJSON", "constructor", "__proto__"];
+
+// Spaces around a dot or before a bracket do not change what the code reads.
+fn normalized(text: &str) -> String {
+    BEFORE_PAREN
+        .replace_all(&AROUND_DOT.replace_all(text, "."), "(")
+        .into_owned()
+}
 
 fn name_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
@@ -64,11 +76,16 @@ fn python(text: &str) -> bool {
 fn node(text: &str) -> bool {
     let allowed = |rest: &str| {
         rest.starts_with('[')
-            || (rest.starts_with('.')
-                && rest
+            || rest.strip_prefix('.').is_some_and(|after| {
+                let name: String = after
                     .chars()
-                    .nth(1)
-                    .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_' || ch == '$'))
+                    .take_while(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
+                    .collect();
+                name.chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '_' | '$'))
+                    && !OBJECT_METHODS.contains(&name.as_str())
+            })
     };
     whole_use(text, "process.env", &allowed, true)
         || whole_use(text, "Bun.env", &allowed, true)
@@ -86,18 +103,22 @@ fn ruby(text: &str) -> bool {
 }
 
 fn perl(text: &str) -> bool {
-    text.contains("%ENV")
+    text.contains("%ENV") || text.contains("%main::ENV") || text.contains("%::ENV")
 }
 
 fn php(text: &str) -> bool {
     let indexed = |rest: &str| rest.starts_with('[');
-    let empty_getenv = text.match_indices("getenv(").any(|(at, found)| {
-        text.get(at.saturating_add(found.len())..)
-            .is_some_and(|rest| rest.trim_start().starts_with(')'))
+    let all_variables = text.match_indices("getenv(").any(|(at, found)| {
+        text.get(at.saturating_add(found.len())..).is_some_and(|rest| {
+            let rest = rest.trim_start();
+            rest.starts_with(')')
+                || (rest.get(..4).is_some_and(|word| word.eq_ignore_ascii_case("null"))
+                    && rest.get(4..).is_some_and(|tail| tail.trim_start().starts_with(')')))
+        })
     });
     whole_use(text, "$_ENV", &indexed, false)
         || whole_use(text, "$_SERVER", &indexed, false)
-        || empty_getenv
+        || all_variables
         || text.contains("phpinfo(")
         || text.contains("get_defined_vars(")
 }
@@ -108,12 +129,13 @@ fn awk(text: &str) -> bool {
 
 // Inline interpreter code that reads the whole environment prints every value at once.
 pub fn dumps_environment(command: &str) -> bool {
-    (PYTHON.is_match(command) && python(command))
-        || (NODE.is_match(command) && node(command))
-        || (RUBY.is_match(command) && ruby(command))
-        || (PERL.is_match(command) && perl(command))
-        || (PHP.is_match(command) && php(command))
-        || (AWK.is_match(command) && awk(command))
+    let text = normalized(command);
+    (PYTHON.is_match(command) && python(&text))
+        || (NODE.is_match(command) && node(&text))
+        || (RUBY.is_match(command) && ruby(&text))
+        || (PERL.is_match(command) && perl(&text))
+        || (PHP.is_match(command) && php(&text))
+        || (AWK.is_match(command) && awk(&text))
 }
 
 #[cfg(test)]
@@ -129,20 +151,27 @@ mod tests {
             r#"python -c "import os; print(os.environb)""#,
             r#"python3 -c "import os; [print(k) for k in os.environ]""#,
             r#"python3 -c "import os\nfor k in os.environ: print(k, os.environ[k])""#,
-            r#"node -e "for (const k in process.env) console.log(k, process.env[k])""#,
             r#"python3 -c "from os import environ; print(environ)""#,
+            r#"python3 -c "from os import *; print(dict(environ))""#,
+            r#"python3 -c 'import os; print(dict(os . environ))'"#,
             "python3 - <<'PY'\nimport os\nprint(os.environ)\nPY",
             r#"node -e "console.log(process.env)""#,
+            r#"node -e "console.log(process . env)""#,
+            r#"node -e "console.log(process.env.valueOf())""#,
             r#"node -e "console.log(JSON.stringify(process.env))""#,
             r#"node -e "Object.entries(process.env).forEach(console.log)""#,
+            r#"node -e "for (const k in process.env) console.log(k, process.env[k])""#,
             r#"bun -e "console.log(Bun.env)""#,
             r#"deno eval "console.log(Deno.env.toObject())""#,
             "ruby -e 'p ENV'",
             "ruby -e 'puts ENV.to_h'",
             "perl -e 'print %ENV'",
+            "perl -e 'print %main::ENV'",
             "perl -e 'for (keys %ENV) { print }'",
             "php -r 'print_r($_ENV);'",
             "php -r 'var_dump(getenv());'",
+            "php -r 'var_dump(getenv ());'",
+            "php -r 'var_dump(getenv(null));'",
             "php -r 'phpinfo();'",
             "awk 'BEGIN { for (k in ENVIRON) print k, ENVIRON[k] }'",
         ];
@@ -156,6 +185,7 @@ mod tests {
         let allowed = [
             r#"python3 -c "import os; print(len(os.environ['HOME']))""#,
             r#"python3 -c "import os; print(os.environ.get('X', 'd'))""#,
+            r#"python3 -c 'import os; print(os.environ.get ("HOME"))'"#,
             r#"python3 -c "import os; print('X' in os.environ)""#,
             r#"python3 -c "import os; print(os.getenv('HOME'))""#,
             r#"node -e "console.log(process.env.HOME.length)""#,
@@ -163,6 +193,7 @@ mod tests {
             r#"node -e "console.log('X' in process.env)""#,
             r#"ruby -e 'puts ENV["HOME"].size'"#,
             r#"ruby -e 'puts ENV.fetch("HOME").size'"#,
+            r#"ruby -e 'puts ENV.fetch ("HOME")'"#,
             "perl -e 'print length $ENV{HOME}'",
             r#"php -r 'echo strlen(getenv("HOME"));'"#,
             r#"awk 'BEGIN { print length(ENVIRON["HOME"]) }'"#,

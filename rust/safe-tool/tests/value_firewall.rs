@@ -194,3 +194,118 @@ fn writing_a_script_through_a_quoted_heredoc_is_not_refused() {
     let out = run(&h, "claude", "PreToolUse", &before(command), &[]);
     assert!(allowed(&out), "{out}");
 }
+
+fn put(home: &Home, relative: &str, text: &str) {
+    let path = home.0.join(relative);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("folders");
+    std::fs::write(path, text).expect("file");
+}
+
+fn why_coverage(out: &str) -> bool {
+    let parsed: Value = serde_json::from_str(out.trim()).unwrap_or(Value::Null);
+    let context = parsed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
+    context.contains(&guard_common::locale::message("safe_tool.withheld.why.coverage", &[]))
+}
+
+#[test]
+fn ansi_c_and_locale_quoted_values_are_protected() {
+    let h = home("ansi", Some("A=$'ansi-quoted-1'\nB=$'caf\\xc3\\xa9-escape'\nC=$\"locale-quoted-1\"\n"));
+    for shown in ["ansi-quoted-1", "caf\u{e9}-escape", "locale-quoted-1"] {
+        let out = run(&h, "claude", "PostToolUse", &after("echo hi", &format!("{shown}\n")), &[]);
+        assert!(withheld(&out, shown), "{shown}: {out}");
+    }
+}
+
+#[test]
+fn a_startup_value_equal_to_a_field_name_does_not_withhold_every_result() {
+    let h = home("field", Some("export LOG_DEST=stderr\n"));
+    let out = run(&h, "claude", "PostToolUse", &after("echo hi", "hello world\n"), &[]);
+    assert!(allowed(&out), "{out}");
+    let out = run(&h, "claude", "PostToolUse", &after("echo hi", "log goes to stderr\n"), &[]);
+    assert!(withheld(&out, "log goes to"), "{out}");
+}
+
+#[test]
+fn here_document_text_is_not_an_assignment_and_later_assignments_still_count() {
+    let rc = "app_help() {\ncat <<'DOC'\nLOG_DEST=stderr\nDOC\n}\nexport REAL=value1\n";
+    let h = home("heredoc", Some(rc));
+    let out = run(&h, "claude", "PostToolUse", &after("echo hi", "plain stderr text\n"), &[]);
+    assert!(allowed(&out), "{out}");
+    let out = run(&h, "claude", "PostToolUse", &after("echo hi", "value1\n"), &[]);
+    assert!(withheld(&out, "value1"), "{out}");
+}
+
+#[test]
+fn a_quoted_here_document_marker_that_never_ends_does_not_hide_later_assignments() {
+    let h = home("unended", Some("echo \"<<EOF\"\nexport K2=value2\n"));
+    let out = run(&h, "claude", "PostToolUse", &after("echo hi", "value2\n"), &[]);
+    assert!(withheld(&out, "value2"), "{out}");
+}
+
+#[test]
+fn many_values_long_values_and_late_folder_files_are_all_covered() {
+    let many: String = (0..600).map(|n| format!("A{n}=fixtureitem{n:04}\n")).collect();
+    let h = home("many", Some(&many));
+    let extra = [("MY_API_TOKEN", "ab-process-token-9")];
+    for shown in ["fixtureitem0000", "fixtureitem0599", "ab-process-token-9"] {
+        let out = run(&h, "claude", "PostToolUse", &after("echo hi", &format!("{shown}\n")), &extra);
+        assert!(withheld(&out, shown), "{shown}: {out}");
+    }
+    let big = "x".repeat(1025);
+    let h = home("big", Some(&format!("export BIG={big}\n")));
+    let out = run(&h, "claude", "PostToolUse", &after("echo hi", &format!("{big}\n")), &[]);
+    assert!(withheld(&out, &big), "1025 characters");
+    let h = home("folder", None);
+    for n in 0..45 {
+        put(&h, &format!(".zsh/f{n:02}.zsh"), &format!("export Z{n}=folderfile{n:02}x\n"));
+    }
+    let out = run(&h, "claude", "PostToolUse", &after("echo hi", "folderfile44x\n"), &[]);
+    assert!(withheld(&out, "folderfile44x"), "{out}");
+}
+
+#[test]
+fn startup_files_too_large_to_check_withhold_every_result_and_say_why() {
+    let too_long = format!("export HUGE={}\n", "y".repeat(5000));
+    let late = format!("{}export LATE=late-value-1\n", "# c\n".repeat(20001));
+    for (name, rc) in [("long", too_long), ("late", late)] {
+        let h = home(name, Some(&rc));
+        let out = run(&h, "claude", "PostToolUse", &after("echo hi", "hello world\n"), &[]);
+        assert!(withheld(&out, "hello world"), "{name}: {out}");
+        assert!(why_coverage(&out), "{name}: {out}");
+    }
+    let h = home("crowded", None);
+    for n in 0..201 {
+        put(&h, &format!(".zsh/f{n:03}.zsh"), "# nothing\n");
+    }
+    let out = run(&h, "claude", "PostToolUse", &after("echo hi", "hello world\n"), &[]);
+    assert!(withheld(&out, "hello world") && why_coverage(&out), "crowded: {out}");
+}
+
+#[test]
+fn unicode_json_and_mixed_case_percent_forms_are_withheld() {
+    let h = home("forms2", Some("A='caf\u{e9}-fixture'\nB='Garden/piano'\n"));
+    for shown in ["\"caf\\u00e9-fixture\"", "Garden%2fpiano", "Garden%2Fpiano"] {
+        let out = run(&h, "claude", "PostToolUse", &after("echo hi", &format!("{shown}\n")), &[]);
+        assert!(withheld(&out, shown), "{shown}: {out}");
+    }
+}
+
+#[test]
+fn spaced_inline_code_is_judged_like_the_compact_form() {
+    let h = home("spaced", None);
+    for command in [
+        "python3 -c 'import os; print(dict(os . environ))'",
+        "node -e 'console.log(process . env)'",
+        "php -r 'var_dump(getenv ());'",
+    ] {
+        let out = run(&h, "claude", "PreToolUse", &before(command), &[]);
+        assert!(denied(&out), "{command}: {out}");
+    }
+    for command in [
+        "python3 -c 'import os; print(os.environ.get (\"HOME\"))'",
+        "ruby -e 'puts ENV.fetch (\"HOME\")'",
+    ] {
+        let out = run(&h, "claude", "PreToolUse", &before(command), &[]);
+        assert!(allowed(&out), "{command}: {out}");
+    }
+}

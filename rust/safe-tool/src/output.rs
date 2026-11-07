@@ -311,6 +311,7 @@ fn why_key(why: &str) -> Option<&'static str> {
         "definition" => Some("safe_tool.withheld.why.definition"),
         "address" => Some("safe_tool.withheld.why.address"),
         "host" => Some("safe_tool.withheld.why.host"),
+        "coverage" => Some("safe_tool.withheld.why.coverage"),
         _ => None,
     }
 }

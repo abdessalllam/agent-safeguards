@@ -81,6 +81,7 @@
   "safe_tool.withheld.reason": "Sensitive command output was withheld. Use safe-tool or ask the user to run the command outside the agent.",
   "safe_tool.withheld.reason_why": "Sensitive command output was withheld because it holds {why}. Narrow the read (`rg -l`, `rg -c`, `sed -n` on a few lines, leave out the matching line) and retry; use safe-tool, or ask the user to run the command outside the agent, only if the content itself is needed.",
   "safe_tool.withheld.why.address": "a private network address",
+  "safe_tool.withheld.why.coverage": "startup files too large for the guard to check completely",
   "safe_tool.withheld.why.definition": "an alias or shell function definition",
   "safe_tool.withheld.why.email": "an email address",
   "safe_tool.withheld.why.host": "host or login-banner details",
