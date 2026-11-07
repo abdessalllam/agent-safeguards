@@ -32,21 +32,52 @@ pub fn current() -> Limits {
     CURRENT.get().copied().unwrap_or_default()
 }
 
-thread_local! {
-    // Per thread so a test can switch the mode without touching the others.
-    static REMOVE: Cell<bool> = const { Cell::new(false) };
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    Trim,
+    #[default]
+    Drop,
+    Block,
 }
 
-pub fn set_remove(on: bool) {
-    REMOVE.with(|flag| flag.set(on));
-}
-
-pub fn kept_lines() -> usize {
-    if REMOVE.with(Cell::get) {
-        0
-    } else {
-        current().lines
+impl Mode {
+    pub fn parse(text: &str) -> Option<Mode> {
+        let word = text.split('#').next().unwrap_or("").trim().to_ascii_lowercase();
+        match word.as_str() {
+            "trim" | "1" | "true" | "yes" | "on" => Some(Mode::Trim),
+            "drop" | "remove" => Some(Mode::Drop),
+            "block" | "refuse" | "0" | "false" | "no" | "off" => Some(Mode::Block),
+            _ => None,
+        }
     }
+}
+
+thread_local! {
+    static MODE: Cell<Mode> = const { Cell::new(Mode::Drop) };
+}
+
+pub fn set_mode(mode: Mode) {
+    MODE.with(|cell| cell.set(mode));
+}
+
+pub fn mode() -> Mode {
+    MODE.with(Cell::get)
+}
+
+pub fn file_mode(file: Option<&str>) -> Option<Mode> {
+    for raw in file.unwrap_or("").lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(['=', ':']) else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("mode") {
+            return Mode::parse(value);
+        }
+    }
+    None
 }
 
 fn number(text: &str, range: &RangeInclusive<usize>) -> Option<usize> {

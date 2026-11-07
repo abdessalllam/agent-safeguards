@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use serde_json::Value;
 
-use comment_guard::limits::{self, Limits};
+use comment_guard::limits::{self, Limits, Mode};
 use comment_guard::locale::message;
 use comment_guard::{judge, judge_after, judge_after_trimming, judge_trimming, Provider, Verdict, MAX_INPUT};
 
@@ -36,6 +36,12 @@ fn main() -> ExitCode {
                 let lines = found.lines.to_string();
                 let chars = found.line_chars.to_string();
                 say(&message("comment_guard.check.limits", &[("lines", lines.as_str()), ("chars", chars.as_str())]));
+                let name = match load_mode() {
+                    Mode::Trim => "trim",
+                    Mode::Drop => "drop",
+                    Mode::Block => "block",
+                };
+                say(&message("comment_guard.check.mode", &[("mode", name)]));
             }
             ExitCode::SUCCESS
         }
@@ -95,21 +101,24 @@ fn load_limits() -> Limits {
     limits::parse(file.as_deref(), lines.as_deref(), chars.as_deref())
 }
 
-fn trimming_enabled() -> bool {
-    if let Ok(value) = std::env::var("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM") {
-        let value = value.trim();
-        if value == "0" || ["false", "no", "off", "refuse"].iter().any(|word| value.eq_ignore_ascii_case(word)) {
-            return false;
+fn load_mode() -> Mode {
+    for name in ["AGENT_SAFEGUARDS_COMMENT_GUARD_MODE", "AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM"] {
+        if let Some(mode) = std::env::var(name).ok().and_then(|value| Mode::parse(&value)) {
+            return mode;
         }
     }
-    !switch_file().is_some_and(|path| path.with_file_name("comment-guard-refuse").exists())
-}
-
-fn removing_comments() -> bool {
-    if let Ok(value) = std::env::var("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM") {
-        return value.trim().eq_ignore_ascii_case("remove");
+    let file = switch_file().and_then(|path| {
+        let mut text = String::new();
+        std::fs::File::open(path).ok()?.take(4096).read_to_string(&mut text).ok()?;
+        Some(text)
+    });
+    if let Some(mode) = limits::file_mode(file.as_deref()) {
+        return mode;
     }
-    switch_file().is_some_and(|path| path.with_file_name("comment-guard-remove").exists())
+    match switch_file() {
+        Some(path) if path.with_file_name("comment-guard-refuse").exists() => Mode::Block,
+        _ => Mode::default(),
+    }
 }
 
 fn guard_enabled() -> bool {
@@ -136,7 +145,9 @@ fn hook(provider: Provider, event: Option<&str>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     limits::configure(load_limits());
-    limits::set_remove(removing_comments());
+    let mode = load_mode();
+    limits::set_mode(mode);
+    let trimming = mode != Mode::Block;
     let limit = MAX_INPUT.saturating_add(1) as u64;
     let mut stdin = std::io::stdin().lock().take(limit);
     let mut input = String::new();
@@ -146,12 +157,12 @@ fn hook(provider: Provider, event: Option<&str>) -> ExitCode {
     }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if after {
-            if trimming_enabled() {
+            if trimming {
                 judge_after_trimming(&input)
             } else {
                 judge_after(&input)
             }
-        } else if trimming_enabled() {
+        } else if trimming {
             judge_trimming(&input, provider)
         } else {
             judge(&input, provider)

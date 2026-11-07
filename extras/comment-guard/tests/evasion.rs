@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
 
+use comment_guard::limits::Mode;
 use comment_guard::{judge_in, judge_trimming_in, Provider, Verdict};
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -90,25 +91,33 @@ fn stacked_two_line_edits_are_judged_against_the_first_state_of_the_file() {
         Some(&state),
         Some("s1"),
         &path,
+        "def g() -> int:",
+        "# stacked three\n# stacked four\ndef g() -> int:",
+    );
+    assert!(denied(&second));
+    assert!(reason(&second).contains("block of 4 lines"));
+    let separate = edit_file(
+        Some(&state),
+        Some("s1"),
+        &path,
         "    return 1",
         "    # stacked three\n    # stacked four\n    return 1",
     );
-    assert!(denied(&second));
-    assert!(reason(&second).contains("4 comment lines"));
+    assert!(!denied(&separate));
     let other_session = edit_file(
         Some(&state),
         Some("s2"),
         &path,
-        "    return 1",
-        "    # stacked three\n    # stacked four\n    return 1",
+        "def g() -> int:",
+        "# stacked three\n# stacked four\ndef g() -> int:",
     );
     assert!(!denied(&other_session));
     let without_session = edit_file(
         Some(&state),
         None,
         &path,
-        "    return 1",
-        "    # stacked three\n    # stacked four\n    return 1",
+        "def g() -> int:",
+        "# stacked three\n# stacked four\ndef g() -> int:",
     );
     assert!(!denied(&without_session));
     let _ = std::fs::remove_dir_all(&dir);
@@ -136,7 +145,9 @@ fn a_new_file_written_in_pieces_is_counted_as_a_whole() {
     let path = dir.join("fresh.ts");
     assert!(!denied(&write_file(Some(&state), Some("p"), &path, "// a\n// b\nconst x = 1;\n")));
     std::fs::write(&path, "// a\n// b\nconst x = 1;\n").expect("write");
-    let more = edit_file(Some(&state), Some("p"), &path, "const x = 1;", "const x = 1;\n// c\n// d");
+    let apart = edit_file(Some(&state), Some("p"), &path, "const x = 1;", "const x = 1;\n// c\n// d");
+    assert!(!denied(&apart));
+    let more = edit_file(Some(&state), Some("p"), &path, "// b", "// b\n// c\n// d");
     assert!(denied(&more));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&state);
@@ -160,36 +171,41 @@ fn an_edit_is_judged_on_the_whole_file_so_a_docstring_end_is_not_a_start() {
 }
 
 #[test]
-fn python_docstrings_cannot_carry_extra_comments() {
+fn python_docstrings_are_exempt_from_the_line_cap_but_not_from_the_other_rules() {
     let four = "def f():\n    \"\"\"\n    one\n    two\n    three\n    four\n    \"\"\"\n    return 1\n";
-    assert!(denied(&write_file(None, None, Path::new("c_doc.py"), four)));
+    assert!(!denied(&write_file(None, None, Path::new("c_doc.py"), four)));
+    let dated = "def f():\n    \"\"\"\n    one\n    two 2026-10-27\n    \"\"\"\n    return 1\n";
+    assert!(denied(&write_file(None, None, Path::new("c_doc.py"), dated)));
     let short = "def f():\n    \"\"\"One line.\"\"\"\n    return 1\n";
     assert!(!denied(&write_file(None, None, Path::new("c_doc.py"), short)));
 }
 
 #[test]
-fn trailing_comments_on_code_lines_count() {
+fn trailing_comments_are_separate_blocks_and_bad_ones_are_caught() {
     let typescript = "const a = 1; // inline one\nconst b = 2; // inline two\nconst c = 3; // inline three\nconst d = 4; // inline four\n";
     let verdict = write_file(None, None, Path::new("d_inline.ts"), typescript);
-    assert!(denied(&verdict));
-    assert!(reason(&verdict).contains("4 comment lines"));
+    assert!(!denied(&verdict));
+    let dated = "const a = 1; // fixed 2024-01-01\nconst b = 2; // inline two\n";
+    assert!(denied(&write_file(None, None, Path::new("d_inline.ts"), dated)));
     let python = "a = 1  # one\nb = 2  # two\nc = 3  # three\n";
-    assert!(denied(&write_file(None, None, Path::new("t.py"), python)));
+    assert!(!denied(&write_file(None, None, Path::new("t.py"), python)));
+    let long = format!("a = 1  # {}\n", "a".repeat(91));
+    assert!(denied(&write_file(None, None, Path::new("t.py"), &long)));
     let strings = "url = \"http://example.com\"\nname = 'a # b'\n";
     assert!(!denied(&write_file(None, None, Path::new("t.py"), strings)));
 }
 
 #[test]
 fn jsx_comments_count() {
-    let jsx = "export const V = () => (\n  <div>\n    {/* jsx comment one */}\n    {/* jsx comment two */}\n    {/* jsx comment three */}\n    {/* jsx comment four */}\n  </div>\n);\n";
+    let jsx = "export const V = () => (\n  <div>\n    {/* jsx comment one\n        jsx comment two\n        jsx comment three\n        jsx comment four\n        jsx comment five\n        jsx comment six */}\n  </div>\n);\n";
     assert!(denied(&write_file(None, None, Path::new("q_view.tsx"), jsx)));
 }
 
 #[test]
 fn html_and_css_are_checked_with_the_same_limit() {
-    let html = "<!-- html comment line one -->\n<!-- html comment line two -->\n<!-- html comment line three -->\n<!-- html comment line four -->\n<p>ok</p>\n";
+    let html = "<!-- html comment line one\nhtml comment line two\nhtml comment line three\nhtml comment line four -->\n<p>ok</p>\n";
     assert!(denied(&write_file(None, None, Path::new("f_page.html"), html)));
-    let css = "/* css comment line one */\n/* css comment line two */\n/* css comment line three */\n/* css comment line four */\nbody { margin: 0; }\n";
+    let css = "/* css comment line one\n css comment line two\n css comment line three\n css comment line four */\nbody { margin: 0; }\n";
     assert!(denied(&write_file(None, None, Path::new("k_style.css"), css)));
     assert!(denied(&write_file(None, None, Path::new("k_style.scss"), &lines("//", "", 4))));
     assert!(!denied(&write_file(None, None, Path::new("ok.html"), "<!-- one -->\n<p>ok</p>\n")));
@@ -230,7 +246,7 @@ fn a_patch_is_judged_on_the_resulting_file_and_on_the_session_baseline() {
     );
     let verdict = pre(Some(&state), Some("c1"), "apply_patch", json!({ "command": second }), Provider::Codex);
     assert!(denied(&verdict));
-    assert!(reason(&verdict).contains("4 comment lines"));
+    assert!(reason(&verdict).contains("block of 4 lines"));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&state);
 }
@@ -277,6 +293,7 @@ impl Rig {
             .args(["hook", host, event])
             .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
             .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "0")
+            .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_MODE")
             .env("XDG_STATE_HOME", &self.state)
             .env("HOME", &self.home);
         if let Some(folder) = path {
@@ -410,6 +427,8 @@ fn a_command_edit_is_not_absorbed_into_the_baseline_of_the_next_edit() {
     let rig = Rig::new("absorb");
     init_repo(&rig.cwd);
     let file = commit_file(&rig.cwd, "a.py", "x = 1\n");
+    let first = rig.pre_edit("s7", &file, "x = 1", "# one\n# two\nx = 1");
+    assert!(first.is_empty(), "{first}");
     std::fs::write(&file, "# one\n# two\nx = 1\n").expect("write");
     let after = rig.bash(Some("s7"), &format!("sed -i '' '1i x' {}", file.display()));
     assert!(after.is_empty(), "{after}");
@@ -500,15 +519,18 @@ fn the_codex_form_of_the_post_command_hook_blocks_too() {
     }
     let out = rig.bash_at(&rig.cwd, Some("c9"), &format!("echo > {}", file.display()), "codex", None);
     assert!(blocked(&out), "{out}");
-    assert!(out.contains("4 comment lines"), "{out}");
+    assert!(out.contains("block of 4 lines"), "{out}");
 }
 
 #[test]
 fn trailing_markers_without_a_space_still_count() {
     let typescript = "const a=1;// one\nconst b=2;// two\nconst c=3;// three\n";
-    assert!(denied(&write_file(None, None, Path::new("t.ts"), typescript)));
+    assert!(!denied(&write_file(None, None, Path::new("t.ts"), typescript)));
+    assert!(denied(&write_file(None, None, Path::new("t.ts"), "const a=1;// fixed 2024-01-01\n")));
     let rust = "fn f() {\n    let a = '\"'; // one\n    let b = '\"'; // two\n    let c = '\"'; // three\n}\n";
-    assert!(denied(&write_file(None, None, Path::new("t.rs"), rust)));
+    assert!(!denied(&write_file(None, None, Path::new("t.rs"), rust)));
+    let long = format!("fn f() {{ let a = 1; // {}\n}}\n", "x".repeat(91));
+    assert!(denied(&write_file(None, None, Path::new("t.rs"), &long)));
 }
 
 #[test]
@@ -594,11 +616,13 @@ fn a_new_file_in_a_repository_is_judged_against_nothing() {
     init_repo(&rig.cwd);
     commit_file(&rig.cwd, "a.py", "x = 1\n");
     let fresh = rig.cwd.join("b.py");
+    let command = format!("printf x > {}", fresh.display());
+    rig.pre_bash_with("g6", "t1", &command);
     std::fs::write(&fresh, lines("#", "", 4)).expect("write");
     if !creation_time_is_known(&fresh) {
         return;
     }
-    let out = rig.bash(Some("g6"), &format!("cat {}", fresh.display()));
+    let out = rig.bash_with_id("g6", "t1", &command);
     assert!(blocked(&out), "{out}");
 }
 
@@ -706,7 +730,7 @@ fn comments_on_one_physical_line_count_as_one_line_but_are_each_checked() {
     let two_lines = "int a = /* a */ 1; /* b */\nint b = /* c */ 2; /* d */\n";
     assert!(!denied(&write_file(None, None, Path::new("a.c"), two_lines)));
     let three_lines = "int a = /* a */ 1;\nint b = /* b */ 2;\nint c = /* c */ 3;\n";
-    assert!(denied(&write_file(None, None, Path::new("a.c"), three_lines)));
+    assert!(!denied(&write_file(None, None, Path::new("a.c"), three_lines)));
     let verdict = write_file(None, None, Path::new("a.c"), "int a = /* fine */ 1; /* used to differ */\n");
     assert!(denied(&verdict));
     assert!(reason(&verdict).contains("used to"));
@@ -841,8 +865,10 @@ fn files_a_command_wrote_under_a_marked_path_are_not_reported() {
     }
     let quiet = rig.bash(Some("m1"), &format!("rsync x {}", upstream.display()));
     assert!(quiet.is_empty(), "{quiet}");
+    let command = format!("printf x > {}", own.display());
+    rig.pre_bash_with("m1", "t2", &command);
     std::fs::write(&own, lines("#", "", 6)).expect("write");
-    let loud = rig.bash(Some("m1"), &format!("printf x > {}", own.display()));
+    let loud = rig.bash_with_id("m1", "t2", &command);
     assert!(blocked(&loud), "{loud}");
     assert!(loud.contains("own.py"), "{loud}");
 }
@@ -948,7 +974,9 @@ fn an_edit_that_never_landed_does_not_forget_what_the_session_added() {
     assert!(!denied(&edit_file(Some(&state), Some("nl"), &path, "x = 1", "# one\n# two\nx = 1")));
     apply_edit(&path, "x = 1", "# one\n# two\nx = 1");
     assert!(!denied(&edit_file(Some(&state), Some("nl"), &path, "y = 2", "y = 3")));
-    let again = edit_file(Some(&state), Some("nl"), &path, "y = 2", "# three\n# four\ny = 2");
+    let separate = edit_file(Some(&state), Some("nl"), &path, "y = 2", "# three\n# four\ny = 2");
+    assert!(!denied(&separate));
+    let again = edit_file(Some(&state), Some("nl"), &path, "x = 1", "# three\n# four\nx = 1");
     assert!(denied(&again));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&state);
@@ -982,10 +1010,10 @@ fn edits_and_commands_in_turn_keep_counting_from_the_original_file() {
     assert!(first.is_empty(), "{first}");
     std::fs::write(&file, "# one\n# two\nx = 1\ny = 2\n").expect("write");
     rig.pre_bash("tn", "t1");
-    std::fs::write(&file, "# one\n# two\nx = 1\n# three\n# four\ny = 2\n").expect("write");
+    std::fs::write(&file, "# one\n# two\n# three\n# four\nx = 1\ny = 2\n").expect("write");
     let ran = rig.bash_with_id("tn", "t1", &format!("sed -i x {}", file.display()));
     assert!(blocked(&ran), "{ran}");
-    let again = rig.pre_edit("tn", &file, "y = 2", "# five\ny = 2");
+    let again = rig.pre_edit("tn", &file, "x = 1", "# five\nx = 1");
     assert!(again.contains("\"permissionDecision\":\"deny\""), "{again}");
 }
 
@@ -1006,10 +1034,10 @@ fn a_bulk_rename_through_a_command_is_not_reported_but_added_comments_still_are(
     }
     let renamed = rig.bash_with_id("br", "t1", "python3 rename.py");
     assert!(renamed.is_empty(), "{renamed}");
-    rig.pre_bash("br", "t2");
+    rig.pre_bash_with("br", "t2", "printf x > f0.py");
     let more = "# melara note a\n# melara note b\n# melara note c\n# extra one\n# extra two\n# extra three\nx = 0\n";
     std::fs::write(rig.cwd.join("f0.py"), more).expect("write");
-    let loud = rig.bash_with_id("br", "t2", "python3 rename.py");
+    let loud = rig.bash_with_id("br", "t2", "printf x > f0.py");
     assert!(blocked(&loud), "{loud}");
     assert!(loud.contains("f0.py"), "{loud}");
 }
@@ -1057,7 +1085,7 @@ fn a_file_that_is_not_utf8_is_handled_without_a_panic() {
 }
 
 #[test]
-fn a_git_command_that_rewrites_a_file_unchanged_does_not_reset_the_allowance() {
+fn a_git_command_that_rewrites_a_file_unchanged_keeps_new_blocks_new() {
     let rig = Rig::new("stash-pop");
     init_repo(&rig.cwd);
     let file = commit_file(&rig.cwd, "a.py", "x = 1\ny = 2\n");
@@ -1068,12 +1096,14 @@ fn a_git_command_that_rewrites_a_file_unchanged_does_not_reset_the_allowance() {
     std::fs::write(&file, "# one\n# two\nx = 1\ny = 2\n").expect("write");
     let popped = rig.bash_with_id("sp", "t1", "git stash && git stash pop");
     assert!(popped.is_empty(), "{popped}");
-    let again = rig.pre_edit("sp", &file, "y = 2", "# three\n# four\ny = 2");
+    let separate = rig.pre_edit("sp", &file, "y = 2", "# three\n# four\ny = 2");
+    assert!(separate.is_empty(), "{separate}");
+    let again = rig.pre_edit("sp", &file, "x = 1", "# three\n# four\nx = 1");
     assert!(again.contains("\"permissionDecision\":\"deny\""), "{again}");
 }
 
 #[test]
-fn two_edits_judged_against_the_same_file_state_share_one_allowance() {
+fn two_edits_against_the_same_file_state_are_independent_until_they_land() {
     let dir = temp_dir("parallel-edits");
     let state = temp_dir("parallel-edits-state");
     let path = dir.join("a.py");
@@ -1081,8 +1111,11 @@ fn two_edits_judged_against_the_same_file_state_share_one_allowance() {
     let first = edit_file(Some(&state), Some("pe"), &path, "x = 1", "# one\n# two\nx = 1");
     assert!(!denied(&first));
     let second = edit_file(Some(&state), Some("pe"), &path, "y = 2", "# three\n# four\ny = 2");
-    assert!(denied(&second));
-    assert!(reason(&second).contains("4 comment lines"));
+    assert!(!denied(&second));
+    apply_edit(&path, "x = 1", "# one\n# two\nx = 1");
+    let adjacent = edit_file(Some(&state), Some("pe"), &path, "x = 1", "# three\n# four\nx = 1");
+    assert!(denied(&adjacent));
+    assert!(reason(&adjacent).contains("block of 4 lines"));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&state);
 }
@@ -1208,7 +1241,9 @@ fn a_file_rewritten_with_other_line_endings_is_still_in_a_known_state() {
     let first = edit_file(Some(&state), Some("le"), &path, "x = 1", "# one\n# two\nx = 1");
     assert!(!denied(&first));
     std::fs::write(&path, "# one\r\n# two\r\nx = 1\r\ny = 2\r\n").expect("write");
-    let second = edit_file(Some(&state), Some("le"), &path, "y = 2", "# three\n# four\ny = 2");
+    let separate = edit_file(Some(&state), Some("le"), &path, "y = 2", "# three\n# four\ny = 2");
+    assert!(!denied(&separate));
+    let second = edit_file(Some(&state), Some("le"), &path, "x = 1", "# three\n# four\nx = 1");
     assert!(denied(&second));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&state);
@@ -1244,15 +1279,11 @@ fn copies_made_with_globs_dots_and_spaced_names_are_copies_too() {
 }
 
 #[test]
-fn blank_comment_lines_are_never_forgiven_as_a_rewrap() {
-    let dir = temp_dir("blank-lines");
-    let path = dir.join("a.rs");
-    std::fs::write(&path, "// alpha beta gamma delta\nfn a() {}\n").expect("write");
-    let blanks = format!("// alpha beta\n// gamma\n{}fn a() {{}}\n", "//\n".repeat(10));
-    assert!(denied(&write_file(None, None, &path, &blanks)));
-    let wrapped = "// alpha beta\n// gamma delta\nfn a() {}\n";
-    assert!(!denied(&write_file(None, None, &path, wrapped)));
-    let _ = std::fs::remove_dir_all(&dir);
+fn empty_comment_lines_are_spacers_and_never_count_against_the_limit() {
+    let spaced = format!("// alpha beta\n// gamma\n{}fn a() {{}}\n", "//\n".repeat(10));
+    assert!(!denied(&write_file(None, None, Path::new("spacers.rs"), &spaced)));
+    let three = format!("// alpha\n//\n// beta\n//\n// gamma\n{}fn a() {{}}\n", "//\n".repeat(3));
+    assert!(denied(&write_file(None, None, Path::new("spacers.rs"), &three)));
 }
 
 #[test]
@@ -1293,7 +1324,7 @@ fn a_named_folder_or_a_spaced_file_is_refreshed_before_a_command_too() {
 }
 
 #[test]
-fn two_hooks_running_at_the_same_time_cannot_both_use_the_whole_allowance() {
+fn two_hooks_running_at_the_same_time_can_add_separate_short_blocks() {
     for trial in 0..20 {
         let dir = temp_dir(&format!("overlap-{trial}"));
         let state = temp_dir(&format!("overlap-state-{trial}"));
@@ -1313,7 +1344,7 @@ fn two_hooks_running_at_the_same_time_cannot_both_use_the_whole_allowance() {
                 .collect();
             workers.into_iter().map(|worker| worker.join().expect("worker")).collect()
         });
-        assert_eq!(results.iter().filter(|denied| **denied).count(), 1, "trial {trial}: {results:?}");
+        assert_eq!(results.iter().filter(|denied| **denied).count(), 0, "trial {trial}: {results:?}");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&state);
     }
@@ -1334,11 +1365,11 @@ fn a_file_written_by_a_command_with_too_many_comments_is_reported() {
     let out = rig.bash(Some("b1"), &format!("printf '# a\\n# b\\n# c\\n# d\\n' > {}", file.display()));
     assert!(out.contains("\"decision\":\"block\""), "{out}");
     assert!(out.contains("l_bash.py"), "{out}");
-    assert!(out.contains("4 comment lines"), "{out}");
+    assert!(out.contains("block of 4 lines"), "{out}");
 }
 
 #[test]
-fn a_command_that_adds_two_comments_is_silent_and_a_second_one_is_caught() {
+fn a_command_that_adds_two_comments_is_caught_only_when_the_next_two_are_adjacent() {
     let rig = Rig::new("bash-append");
     let file = rig.cwd.join("o_thing.rb");
     std::fs::write(&file, "x = 1\n# a\n# b\n").expect("write");
@@ -1348,6 +1379,9 @@ fn a_command_that_adds_two_comments_is_silent_and_a_second_one_is_caught() {
     let first = rig.bash(Some("b2"), &format!("printf '# a\\n# b\\n' >> {}", file.display()));
     assert!(first.is_empty(), "{first}");
     std::fs::write(&file, "x = 1\n# a\n# b\ny = 2\n# c\n# d\n").expect("write");
+    let separate = rig.bash(Some("b2"), &format!("printf '# c\\n# d\\n' >> {}", file.display()));
+    assert!(separate.is_empty(), "{separate}");
+    std::fs::write(&file, "x = 1\n# a\n# b\n# c\n# d\n").expect("write");
     let second = rig.bash(Some("b2"), &format!("printf '# c\\n# d\\n' >> {}", file.display()));
     assert!(second.contains("\"decision\":\"block\""), "{second}");
 }
@@ -1421,7 +1455,7 @@ fn a_tracked_file_is_judged_against_head() {
     std::fs::write(&file, "// old note\n// n1\n// n2\n// n3\nfn a() {}\n").expect("write");
     let out = rig.bash(Some("b6"), &format!("printf x >> {}", file.display()));
     assert!(out.contains("\"decision\":\"block\""), "{out}");
-    assert!(out.contains("3 comment lines"), "{out}");
+    assert!(out.contains("block of 3 lines"), "{out}");
     std::fs::write(&file, "// old note\n// n1\nfn a() {}\n").expect("write");
     let calm = rig.bash(Some("b6"), &format!("printf x >> {}", file.display()));
     assert!(calm.is_empty(), "{calm}");
@@ -1500,6 +1534,7 @@ fn the_post_command_hook_accepts_the_codex_form_too() {
         .args(["hook", "codex", "PostToolUse"])
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "0")
+        .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_MODE")
         .env("XDG_STATE_HOME", &rig.state)
         .env("HOME", &rig.home)
         .stdin(Stdio::null())
@@ -1590,7 +1625,7 @@ fn empty_comment_lines_replaced_one_for_one_are_not_new_commentary() {
     let hollow = write_file(None, None, &path, "<?php\n//\n//\n//\n$a = 1;\n");
     assert!(!denied(&hollow), "{}", reason(&hollow));
     let padded = write_file(None, None, &path, "<?php\n//\n//\n//\n//\n$a = 1;\n");
-    assert!(denied(&padded));
+    assert!(!denied(&padded));
     std::fs::write(&path, "<?php\n// release note\n$a = 1;\n").expect("write");
     let emptied = write_file(None, None, &path, "<?php\n//\n//\n//\n$a = 1;\n");
     assert!(!denied(&emptied), "{}", reason(&emptied));
@@ -1609,7 +1644,9 @@ fn html_delimiter_lines_are_not_letters_that_a_rewrap_could_hide() {
     let path = dir.join("page.html");
     std::fs::write(&path, "<!-- ab -->\n<p>hi</p>\n").expect("write");
     let hollow = write_file(None, None, &path, "<!--\n-->\n<!--\n-->\n<p>hi</p>\n");
-    assert!(denied(&hollow));
+    assert!(!denied(&hollow));
+    let overlong = write_file(None, None, &path, "<!--\na\nb\nc\nd\n-->\n<p>hi</p>\n");
+    assert!(denied(&overlong));
     let plain = write_file(None, None, &path, "<!-- ab -->\n<p>hi there</p>\n");
     assert!(!denied(&plain));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1756,8 +1793,16 @@ fn build_scripting_and_markup_files_are_checked() {
     ];
     for (name, open, close, code) in kinds {
         let path = dir.join(name);
-        let four: String = (1..=4).map(|n| format!("{open}note {n}{close}\n")).collect();
-        let two: String = (1..=2).map(|n| format!("{open}note {n}{close}\n")).collect();
+        let four: String = if close.is_empty() {
+            (1..=4).map(|n| format!("{open}note {n}\n")).collect()
+        } else {
+            format!("{open}note 1\nnote 2\nnote 3\nnote 4{close}\n")
+        };
+        let two: String = if close.is_empty() {
+            (1..=2).map(|n| format!("{open}note {n}\n")).collect()
+        } else {
+            format!("{open}note 1\nnote 2{close}\n")
+        };
         assert!(denied(&write_file(None, None, &path, &format!("{four}{code}"))), "four lines in {name}");
         assert!(!denied(&write_file(None, None, &path, &format!("{two}{code}"))), "two lines in {name}");
         assert!(!denied(&write_file(None, None, &path, code)), "code only in {name}");
@@ -1816,34 +1861,42 @@ fn comment_forms_of_the_less_common_languages_are_all_seen() {
         ("a.d", "/+\nnote one\nnote two\nnote three\nnote four\n+/\nvoid main() {}\n"),
         ("a.ml", "(*\n\"*)\nnote one\nnote two\nnote three\nnote four\n\"\n*)\nlet x = 1\n"),
         ("a.fs", "(*\n\"*)\nnote one\nnote two\nnote three\nnote four\n\"\n*)\nlet x = 1\n"),
-        ("a.ps1", "$a++# note one\n$b++# note two\n$c++# note three\n$d++# note four\n"),
-        ("Makefile", "A:=1# note one\nB:=2# note two\nC:=3# note three\nD:=4# note four\n"),
-        ("a.bat", "echo 1 & rem note one\necho 2 & rem note two\necho 3 & :: note three\necho 4 & REM note four\n"),
+        ("a.ps1", "$a++# note one\n$b++# fixed 2024-01-01\n$c++# note three\n$d++# note four\n"),
+        ("Makefile", "A:=1# note one\nB:=2# fixed 2024-01-01\nC:=3# note three\nD:=4# note four\n"),
+        ("a.bat", "echo 1 & rem note one\necho 2 & rem fixed 2024-01-01\necho 3 & :: note three\necho 4 & REM note four\n"),
         ("a.idr", "||| note one\n||| note two\n||| note three\n||| note four\n"),
         ("a.f90", "! note one\n! note two\n! note three\n! note four\nend\n"),
-        ("a.pas", "{ note one }\n{ note two }\n{ note three }\n{ note four }\nbegin end.\n"),
-        ("b.pas", "{$MESSAGE 'note one explain the cache'}\n{$MESSAGE 'note two explain the lock'}\n{$MESSAGE 'note three explain the retry'}\n{$MESSAGE 'note four explain the fallback'}\n"),
+        ("a.pas", "{ note one\nnote two\nnote three\nnote four }\nbegin end.\n"),
+        ("b.pas", "{$MESSAGE 'note one explain the cache'}\n{$MESSAGE 'fixed 2024-01-01'}\n{$MESSAGE 'note three explain the retry'}\n{$MESSAGE 'note four explain the fallback'}\n"),
         ("c.cmake", "#[=====[\nnote one\nnote two\nnote three\nnote four\n]=====]\nset(A 1)\n"),
         ("d.cmake", "#[============[\nnote one\nnote two\nnote three\nnote four\n]============]\nset(A 1)\n"),
         ("e.cmake", "#[[\nnote one\nnote two\nnote three\nnote four\n]]\nset(A 1)\n"),
         ("f.cmake", "#[===[\nnote one\nnote two\nnote three\nnote four\n]===]\nset(A 1)\n"),
         ("a.lua", "--[==[\nnote one\nnote two\nnote three\nnote four\n]==]\nlocal a = 1\n"),
         ("b.lua", "--[=====[\nnote one\nnote two\nnote three\nnote four\n]=====]\nlocal a = 1\n"),
-        ("b.bat", "@:: note one\n@:: note two\necho 3 & @:: note three\necho 4 & @:: note four\n"),
+        ("b.bat", "@:: note one\n@:: fixed 2024-01-01\necho 3 & @:: note three\necho 4 & @:: note four\n"),
         ("b.f90", "!$ note one explain the cache\n!$ note two explain the lock\n!a$ note three explain the retry\n!x$ note four\nend\n"),
         ("d.f90", "!$ call note one explain the cache\n!$ if note two explain the lock\n!$ do note three explain the retry\n!$ end note four explain the fallback\nend\n"),
-        ("c.pas", "{$R * note one explain the cache}\n{$R * note two explain the lock}\n{$R * note three explain the retry}\n{$R * note four explain the fallback}\nbegin end.\n"),
-        ("b.ps1", "$a = 1 \\# note one\n$b = 2 \\# note two\n$c = 3 \\# note three\n$d = 4 \\# note four\n"),
+        ("b.ps1", "$a = 1 \\# note one\n$b = 2 \\# fixed 2024-01-01\n$c = 3 \\# note three\n$d = 4 \\# note four\n"),
     ];
     for (name, text) in hidden {
         let path = dir.join(name);
         assert!(denied(&write_file(None, None, &path, text)), "{name} hid its comments");
+    }
+    for (name, text) in [
+        ("a.ps1", "$a++# one\n$b++# two\n$c++# three\n"),
+        ("Makefile", "A:=1# one\nB:=2# two\nC:=3# three\n"),
+        ("a.bat", "echo 1 & rem one\necho 2 & rem two\necho 3 & rem three\n"),
+        ("b.ps1", "$a = 1 \\# one\n$b = 2 \\# two\n$c = 3 \\# three\n"),
+    ] {
+        assert!(!denied(&write_file(None, None, &dir.join(name), text)), "{name} treated separate trailing comments as one block");
     }
     let plain = [
         ("a.f90", "!$OMP PARALLEL\n!$OMP DO\n!$OMP END DO\n!$OMP END PARALLEL\nend\n"),
         ("a.erl", "a() -> '100% one'.\nb() -> '100% two'.\nc() -> '100% three'.\nd() -> '100% four'.\n"),
         ("a.jsonnet", "local a = '# note one';\nlocal b = '# note two';\nlocal c = '# note three';\nlocal d = '# note four';\n"),
         ("a.pas", "{$MODE OBJFPC}\n{$H+}\n{$IFDEF UNIX}\n{$ENDIF}\nbegin end.\n"),
+        ("c.pas", "{$R * note one explain the cache}\n{$R * fixed 2024-01-01}\n{$R * note three explain the retry}\n{$R * note four explain the fallback}\nbegin end.\n"),
         ("a.pug", "p one\np two\n  span three\np four\n"),
         ("b.pas", "(*$MODE OBJFPC*)\n(*$H+*)\n(*$IFDEF UNIX*)\n(*$ENDIF*)\nbegin end.\n"),
         ("c.f90", "!dir$ IVDEP\n!DEC$ ATTRIBUTES DLLEXPORT :: a\n!$ call omp_set_num_threads(4)\n!$ use omp_lib\nend\n"),
@@ -2015,6 +2068,11 @@ fn a_notebook_written_or_edited_as_a_file_is_judged_by_its_code_cells() {
 }
 
 fn trimming(state: Option<&Path>, session: Option<&str>, tool: &str, input: Value, provider: Provider) -> Verdict {
+    trimming_in(Mode::Trim, state, session, tool, input, provider)
+}
+
+fn trimming_in(mode: Mode, state: Option<&Path>, session: Option<&str>, tool: &str, input: Value, provider: Provider) -> Verdict {
+    comment_guard::limits::set_mode(mode);
     let mut payload = json!({ "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": input });
     if let (Some(id), Some(map)) = (session, payload.as_object_mut()) {
         map.insert("session_id".to_owned(), json!(id));
@@ -2045,8 +2103,10 @@ fn a_write_with_too_many_comments_is_written_without_the_extra_ones() {
     assert_eq!(input["file_path"], path.to_string_lossy().as_ref());
     assert!(note.contains("3 new comment line(s)") && note.contains("# a3") && note.contains("# a5"), "{note}");
     let apart = "# a1\nx = 1\n# a2\ny = 2\n# a3\nz = 3\n";
-    let (input, _) = cut(trimming(None, None, "Write", written(&path, apart), Provider::Claude));
-    assert_eq!(input["content"], "# a1\nx = 1\ny = 2\nz = 3\n");
+    assert!(matches!(trimming(None, None, "Write", written(&path, apart), Provider::Claude), Verdict::Allow));
+    let (input, note) = cut(trimming_in(Mode::Drop, None, None, "Write", written(&path, text), Provider::Claude));
+    assert_eq!(input["content"], "x = 1\ny = 2\n");
+    assert!(note.contains("5 new comment line(s) were left out"), "{note}");
     let noisy = "# added on 2024-01-01 for the cache\n# ok one\n# ok two\n# ok three\nx = 1\n";
     let (input, _) = cut(trimming(None, None, "Write", written(&path, noisy), Provider::Claude));
     assert_eq!(input["content"], "# ok one\n# ok two\nx = 1\n");
@@ -2056,38 +2116,152 @@ fn a_write_with_too_many_comments_is_written_without_the_extra_ones() {
 }
 
 #[test]
+fn four_blocks_in_a_hundred_line_python_file_follow_the_selected_mode() {
+    let dir = temp_dir("hundred-line-blocks");
+    let path = dir.join("a.py");
+    let text: String = (0..100)
+        .map(|line| match line {
+            10 | 11 => format!("# first {line}\n"),
+            30 | 31 => format!("# second {line}\n"),
+            50 | 51 => format!("# third {line}\n"),
+            70..=74 => format!("# fourth {line}\n"),
+            _ => format!("value_{line} = {line}\n"),
+        })
+        .collect();
+    assert_eq!(text.lines().count(), 100);
+    let five: String = (70..=74).map(|line| format!("# fourth {line}\n")).collect();
+    let (drop_input, drop_note) = cut(trimming_in(Mode::Drop, None, None, "Write", written(&path, &text), Provider::Claude));
+    assert_eq!(drop_input["content"], text.replace(&five, ""));
+    assert!(drop_note.contains("5 new comment line(s) were left out"), "{drop_note}");
+    let (trim_input, trim_note) = cut(trimming_in(Mode::Trim, None, None, "Write", written(&path, &text), Provider::Claude));
+    assert_eq!(trim_input["content"], text.replace(&five, "# fourth 70\n# fourth 71\n"));
+    assert!(trim_note.contains("3 new comment line(s) were left out"), "{trim_note}");
+    let block = trimming_in(Mode::Block, None, None, "Write", written(&path, &text), Provider::Claude);
+    assert!(denied(&block));
+    assert!(reason(&block).contains("block of 5 lines"));
+    let within = text.replace(&five, "# fourth 70\n# fourth 71\nvalue_72 = 72\nvalue_73 = 73\nvalue_74 = 74\n");
+    assert_eq!(within.lines().count(), 100);
+    for mode in [Mode::Drop, Mode::Trim, Mode::Block] {
+        assert!(matches!(trimming_in(mode, None, None, "Write", written(&path, &within), Provider::Claude), Verdict::Allow), "{mode:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn blank_lines_keep_a_comment_block_open_but_code_ends_it() {
+    let dir = temp_dir("blank-block");
+    let path = dir.join("a.py");
+    let blank = "# a\n\n# b\n\n# c\nx = 1\n";
+    let block = write_file(None, None, &path, blank);
+    assert!(denied(&block));
+    assert!(reason(&block).contains("block of 3 lines"));
+    let separate = "# a\n\n# b\nx = 1\n# c\n";
+    assert!(!denied(&write_file(None, None, &path, separate)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_binary_selects_mode_from_environment_config_and_marker() {
+    let dir = temp_dir("mode-selection");
+    let folder = dir.join("agent-safeguards");
+    std::fs::create_dir_all(&folder).expect("config folder");
+    let config = folder.join("comment-guard");
+    let marker = folder.join("comment-guard-refuse");
+    let path = dir.join("a.py");
+    let run = |selected: Option<(&str, &str)>| -> Value {
+        let payload = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": written(&path, "# one\n# two\n# three\nx = 1\n"),
+        });
+        let mut command = Command::new(binary());
+        command
+            .args(["hook", "claude", "PreToolUse"])
+            .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
+            .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_MODE")
+            .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM")
+            .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES")
+            .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS")
+            .env("XDG_CONFIG_HOME", &dir)
+            .env("XDG_STATE_HOME", &dir)
+            .env("HOME", &dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        if let Some((name, value)) = selected {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().expect("start");
+        child.stdin.take().expect("stdin").write_all(payload.to_string().as_bytes()).expect("write");
+        let output = child.wait_with_output().expect("wait");
+        assert_eq!(output.status.code(), Some(0));
+        serde_json::from_slice(&output.stdout).expect("json")
+    };
+    let selected = |out: &Value| -> &str {
+        if out["hookSpecificOutput"]["permissionDecision"] == "deny" {
+            "block"
+        } else if out["hookSpecificOutput"]["updatedInput"]["content"] == "x = 1\n" {
+            "drop"
+        } else if out["hookSpecificOutput"]["updatedInput"]["content"] == "# one\n# two\nx = 1\n" {
+            "trim"
+        } else {
+            panic!("unexpected mode output: {out}");
+        }
+    };
+    assert_eq!(selected(&run(None)), "drop");
+    for (value, expected) in [("drop", "drop"), ("trim", "trim"), ("block", "block")] {
+        assert_eq!(selected(&run(Some(("AGENT_SAFEGUARDS_COMMENT_GUARD_MODE", value)))), expected);
+    }
+    for (value, expected) in [("remove", "drop"), ("1", "trim"), ("true", "trim"), ("0", "block"), ("false", "block"), ("off", "block"), ("refuse", "block")] {
+        assert_eq!(selected(&run(Some(("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", value)))), expected);
+    }
+    std::fs::write(&config, "mode = drop\n").expect("config");
+    assert_eq!(selected(&run(None)), "drop");
+    std::fs::write(&config, "mode = trim\n").expect("config");
+    assert_eq!(selected(&run(None)), "trim");
+    std::fs::remove_file(&config).expect("remove config");
+    std::fs::write(&marker, "").expect("marker");
+    assert_eq!(selected(&run(None)), "block");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn an_edit_with_too_many_comments_is_trimmed_inside_its_replacement() {
     let dir = temp_dir("trim-edit");
     let path = dir.join("a.py");
     std::fs::write(&path, "x = 1\ny = 2\nz = 3\n").expect("write");
     let at_end = json!({ "file_path": path.to_string_lossy(), "old_string": "y = 2", "new_string": "y = 2\n# n1\n# n2\n# n3\n# n4" });
-    let (input, _) = cut(trimming(None, None, "Edit", at_end, Provider::Claude));
+    let (input, _) = cut(trimming(None, None, "Edit", at_end.clone(), Provider::Claude));
     assert_eq!(input["new_string"], "y = 2\n# n1\n# n2");
     let at_start = json!({ "file_path": path.to_string_lossy(), "old_string": "x = 1", "new_string": "# n1\n# n2\n# n3\n# n4\nx = 2" });
-    let (input, _) = cut(trimming(None, None, "Edit", at_start, Provider::Claude));
+    let (input, _) = cut(trimming(None, None, "Edit", at_start.clone(), Provider::Claude));
     assert_eq!(input["new_string"], "# n1\n# n2\nx = 2");
     let middle = json!({ "file_path": path.to_string_lossy(), "old_string": "y = 2\n", "new_string": "# n1\ny = 3\n# n2\n# n3\n" });
-    let (input, _) = cut(trimming(None, None, "Edit", middle, Provider::Claude));
-    assert_eq!(input["new_string"], "# n1\ny = 3\n");
+    assert!(matches!(trimming(None, None, "Edit", middle, Provider::Claude), Verdict::Allow));
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Edit", at_end.clone(), Provider::Claude));
+    assert_eq!(input["new_string"], "y = 2");
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Edit", at_start, Provider::Claude));
+    assert_eq!(input["new_string"], "x = 2");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn comments_that_cannot_be_cut_safely_are_still_refused() {
     let dir = temp_dir("trim-refuse");
+    let unrefused = std::cell::RefCell::new(Vec::new());
     let refuse = |name: &str, text: &str| {
         let verdict = trimming(None, None, "Write", written(&dir.join(name), text), Provider::Claude);
-        assert!(matches!(verdict, Verdict::Deny(_)), "{name} was trimmed or allowed");
+        if !matches!(verdict, Verdict::Deny(_)) {
+            unrefused.borrow_mut().push(name.to_owned());
+        }
     };
-    refuse("a.py", "x = f(\n    \"\"\"\n    one\n    two\n    three\n    four\n    \"\"\"\n)\n");
-    refuse("b.py", "a = 1  # one\nb = 2  # two\nc = 3  # three\nd = 4  # four\n");
-    refuse("c.c", "/*\none\ntwo\nthree\nfour\n*/\nint a;\n");
+    refuse("a.py", "x = f(\n    \"\"\"\n    one\n    two 2026-10-27\n    three\n    \"\"\"\n)\n");
+    refuse("b.py", "a = 1  # one\nb = 2  # fixed 2024-01-01\nc = 3  # three\nd = 4  # four\n");
     refuse("d.html", "// one\n// two\n// three\n// four\n<p>hi</p>\n");
     refuse("e.sh", "cat <<EOF\n# one\n# two\n# three\n# four\nEOF\n");
     refuse("f.rs", "let s = r#\"\n// one\n// two\n// three\n// four\n\"#;\n");
     refuse("g.sh", "echo 'a\n# one\n# two\n# three\n# four\n'\n");
     refuse("h.c", "// one \\\n// two\n// three\n// four\nint a;\n");
-    refuse("i.py", "x = 1  # a\ny = 2  # b\nz = 3  # c\n# one\n# two\n# three\n# four\n");
+    refuse("i.py", "x = 1  # a\ny = 2  # b\nz = 3  # fixed 2024-01-01\n# one\n# two\n# three\n# four\n");
     refuse("j.go", "// #include <stdio.h>\n// one\n// two\n// three\nimport \"C\"\n");
     refuse("k.pug", "//\n  one\n  two\n  three\n  four\np hi\n");
     refuse("e1.js", "const s = `outer ${`inner\n// one\n// two\n// three\n// four\n`} tail`\nconst x = 1\n");
@@ -2099,12 +2273,12 @@ fn comments_that_cannot_be_cut_safely_are_still_refused() {
     refuse("e6.rb", "s = %q@\n# one\n# two\n# three\n# four\n@\nx = 1\n");
     refuse("e7.groovy", "def s = $/\n// one\n// two\n// three\n// four\n/$\ndef x = 1\n");
     refuse("e8.php", "<?php\necho 1;\n?>\n// one\n// two\n// three\n// four\n<?php\n$x = 1;\n");
-    refuse("Dockerfile", "# syntax=docker/dockerfile:1\nFROM alpine # one\nRUN echo x # two\n");
-    refuse("e10.rb", "# frozen_string_literal: true\nx = 1 # one\ny = 2 # two\n");
-    refuse("e11.ps1", "#requires -Version 7\nGet-Date # one\nGet-Date # two\n");
+    refuse("Dockerfile", "# syntax=docker/dockerfile:1\nFROM alpine # fixed 2024-01-01\nRUN echo x # two\n");
+    refuse("e10.rb", "# frozen_string_literal: true\nx = 1 # fixed 2024-01-01\ny = 2 # two\n");
+    refuse("e11.ps1", "#requires -Version 7\nGet-Date # fixed 2024-01-01\nGet-Date # two\n");
     refuse("e12.scala", "val page = <pre>\n// one\n// two\n// three\n// four\n</pre>\nval x = 1\n");
     refuse("e13.rb", "__END__\n# one\n# two\n# three\n# four\n");
-    refuse("first.py", "# mode: strict\nx = 1  # one\ny = 2  # two\n");
+    refuse("first.py", "# mode: strict\nx = 1  # fixed 2024-01-01\ny = 2  # two\n");
     refuse("x.nix", "s = ''\n# one\n# two\n# three\n# four\n'';\nx = 1\n");
     refuse("a.rb", "list = %w(\n# one\n# two\n# three\n# four\n)\nx = 1\n");
     refuse("b.rb", "text = %q{\n# one\n# two\n# three\n# four\n}\nx = 1\n");
@@ -2119,18 +2293,21 @@ fn comments_that_cannot_be_cut_safely_are_still_refused() {
     refuse("a.sql", "create function f() returns int as $$\n-- one\n-- two\n-- three\n-- four\nselect 1; $$ language sql;\n");
     refuse("Makefile", "define text\n# one\n# two\n# three\n# four\nendef\nall:\n\techo hi\n");
     refuse("a.ps1", "$s = @\"\n# one\n# two\n# three\n# four\n\"@\n$x = 1\n");
-    refuse("l.sql", "/*+ one */\n/*+ two */\n/*+ three */\n/*+ four */\nselect 1;\n");
+    refuse("l.sql", "/*+ one\n two\n three\n four */\nselect 1;\n");
     refuse("m.html", "<!--[if IE]>\n<!--[if gt IE 8]>\n<!--[if lt IE 7]>\n<!--[if IE 9]>\n<p>hi</p>\n");
     refuse("r.cpp", "const char* s = R\"(\n// one\n// two\n// three\n// four\n)\";\nint x = 1;\n");
     refuse("r.h", "NSString *s = @\"x\";\n// one\n// two\n// three\n// four\nint x = 1;\n");
     refuse("Containerfile", "FROM alpine\n# one\n# two\n# three\n# four\nRUN echo x\n");
     refuse("justfile", "build:\n  echo hi\n# one\n# two\n# three\n# four\n");
-    refuse("p.css", "/*! one */\n/*! two */\n/*! three */\n/*! four */\na { b: c }\n");
-    refuse("q.css", "/*# one */\n/*# two */\n/*# three */\n/*# four */\na { b: c }\n");
+    let preserved = "/*! one\n two\n three\n four */\na { b: c }\n";
+    assert!(matches!(trimming(None, None, "Write", written(&dir.join("p.css"), preserved), Provider::Claude), Verdict::Allow));
+    refuse("q.css", "/*# one\n two\n three\n four */\na { b: c }\n");
+    assert!(unrefused.borrow().is_empty(), "{:?} were trimmed or allowed", unrefused.borrow());
     let css = "/* one */\n/* two */\n/* three */\n/* four */\na { b: c }\n";
-    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("n.css"), css), Provider::Claude));
-    assert_eq!(input["content"], "/* one */\n/* two */\na { b: c }\n");
-    refuse("o.html", "<!-- one -->\n<!-- two -->\n<!-- three -->\n<p>hi</p>\n");
+    assert!(matches!(trimming(None, None, "Write", written(&dir.join("n.css"), css), Provider::Claude), Verdict::Allow));
+    assert!(matches!(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join("n.css"), css), Provider::Claude), Verdict::Allow));
+    assert!(matches!(trimming(None, None, "Write", written(&dir.join("o.html"), "<!-- one -->\n<!-- two -->\n<!-- three -->\n<p>hi</p>\n"), Provider::Claude), Verdict::Allow));
+    refuse("o.html", "<p>hi</p><!-- fixed 2024-01-01 -->\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2154,9 +2331,13 @@ fn the_languages_on_the_list_are_trimmed_and_their_directives_are_kept() {
         let (input, _) = cut(trimming(None, None, "Write", written(&dir.join(name), &text), Provider::Claude));
         let expected = format!("{marker} note 1\n{marker} note 2\n{code}");
         assert_eq!(input["content"], expected.as_str(), "{name}");
+        let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join(name), &text), Provider::Claude));
+        assert_eq!(input["content"], code, "{name}");
     }
     let python = "# coding: utf-8\nx = 1  # one\ny = 2  # two\nz = 3  # three\n";
-    assert!(matches!(trimming(None, None, "Write", written(&dir.join("c.py"), python), Provider::Claude), Verdict::Deny(_)));
+    assert!(matches!(trimming(None, None, "Write", written(&dir.join("c.py"), python), Provider::Claude), Verdict::Allow));
+    let dated = "# coding: utf-8\nx = 1  # fixed 2024-01-01\ny = 2  # two\n";
+    assert!(matches!(trimming(None, None, "Write", written(&dir.join("c.py"), dated), Provider::Claude), Verdict::Deny(_)));
     let cookie = "# coding: utf-8\n# one\n# two\nx = 1\n";
     assert!(matches!(trimming(None, None, "Write", written(&dir.join("d.py"), cookie), Provider::Claude), Verdict::Allow));
     let source_map = "x = 1;\n//# sourceMappingURL=a.js.map\n// one\n// two\n";
@@ -2164,9 +2345,11 @@ fn the_languages_on_the_list_are_trimmed_and_their_directives_are_kept() {
     let reference = "/// <reference types=\"node\" />\n// a\n// b\n// c\n// d\nexport {};\n";
     let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("r.ts"), reference), Provider::Claude));
     assert_eq!(input["content"], "/// <reference types=\"node\" />\n// a\n// b\nexport {};\n");
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join("r.ts"), reference), Provider::Claude));
+    assert_eq!(input["content"], "/// <reference types=\"node\" />\nexport {};\n");
     let map = "a { b: c }\n/*# sourceMappingURL=a.css.map */\n/* one */\n/* two */\n/* three */\n/* four */\n";
-    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("m.css"), map), Provider::Claude));
-    assert_eq!(input["content"], "a { b: c }\n/*# sourceMappingURL=a.css.map */\n/* one */\n/* two */\n");
+    assert!(matches!(trimming(None, None, "Write", written(&dir.join("m.css"), map), Provider::Claude), Verdict::Allow));
+    assert!(matches!(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join("m.css"), map), Provider::Claude), Verdict::Allow));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2187,20 +2370,21 @@ fn what_the_eighteenth_review_found_is_refused_or_kept() {
     refuse("h1.js", "const t = `${foo / 2 + \"`\"} say \"hi\n// a\n// b\n// c\n// d\n`;\nconst z = 1;\n");
     refuse("h1b.ts", "const t = `${foo + '`'} it's '\n// a\n// b\n// c\n// d\n`;\nconst z = 1;\n");
     refuse("h2.py", "def ready():\n    return 1\n# Local Variables:\n# mode: python\n# End:\n");
-    refuse("h2b.c", "int a;\n/* Local Variables: */\n/* tab-width: 4 */\n/* End: */\n");
+    allow("h2b.c", "int a;\n/* Local Variables: */\n/* tab-width: 4 */\n/* End: */\n");
+    refuse("h2b.c", "int a; /* Local Variables: fixed 2024-01-01 */\n");
     refuse("f1b.ts", "const s = `A ${ '}' + `\n// one\n// two\n// three\n// four\n` } B`;\nconst x = 1;\n");
     refuse("f2.js", "export function F() {\n  return (\n    <pre>\n// one\n// two\n// three\n// four\n    </pre>\n  );\n}\n");
     refuse("f2b.js", "const a = <Foo />;\n// one\n// two\n// three\n// four\nconst x = 1;\n");
-    refuse("f3.sh", "# one\r\n# two\r\necho hello \\\r\n# three\r\nworld\r\n");
-    refuse("f3.c", "// one\r\n// two\r\n#define X 1 \\\r\n// three\r\nint y;\r\n");
+    refuse("f3.sh", "# one\r\n# two\r\necho hello \\\r\n# fixed 2024-01-01\r\nworld\r\n");
+    refuse("f3.c", "// one\r\n// two\r\n#define X 1 \\\r\n// fixed 2024-01-01\r\nint y;\r\n");
     refuse("f4.go", "package p\n\nimport (\n\t\"C\"\n)\n\n// note one\n// note two\n//export Hello\nfunc Hello() {}\n");
     refuse("f4b.go", "package q\n\n// #include <stdlib.h>\n// int kept;\n// int dropped_a;\n// int dropped_b;\nimport (\n\t\"C\"\n)\n");
     let line = "//line /Users/me/src/module/internal/services/payments/adapters/grpc/generated/v1/public/api.pb.go:10\n";
     refuse("f5.go", &format!("{line}package g\nfunc F() {{}}\n"));
     refuse("f5c.go", "//line C:\\Program Files\\go\\src\\module\\internal\\services\\payments\\adapters\\grpc\\generated\\v1\\api.pb.go:10\npackage g\n");
     allow("f5d.go", "//line My File.go:10\npackage g\n");
-    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("f5b.go"), "//line :10\n// one\n// two\npackage g\n"), Provider::Claude));
-    assert_eq!(input["content"], "//line :10\n// one\npackage g\n");
+    allow("f5b.go", "//line :10\n// one\npackage g\n");
+    refuse("f5b.go", "//line :10\n// one\n// two\npackage g\n");
     allow("g3.js", "// line http://example.com:8080\n// line cache:1\npackage g\n");
     refuse("g3b.js", "// line cache:1\n// line cache:2\n// line cache:3\n// line cache:4\nconst x = 1;\n");
     let embed = "//go:embed web/static/dist/application-7f3e9c1a8b7f3e9c1a8b7f3e9c1a8b7f3e9c1a8b7f3e9c1a8b7f3e9c1a8b.js\n";
@@ -2208,8 +2392,7 @@ fn what_the_eighteenth_review_found_is_refused_or_kept() {
     let job = "#!/bin/bash\n#SBATCH --job-name=train\n#SBATCH --time=01:00:00\n#SBATCH --mem=4G\n#SBATCH -N 4\n#PBS -N a\n#PBS -l select=1:ncpus=4\n#PBS -q fast\n#BSUB -J name\n#BSUB -n 4\n#BSUB -W 2:00\necho hello\n";
     allow("f7.sh", job);
     let unclean = "# one\n# two\n#SBATCH --mem=4G # limit\necho hi\n";
-    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("f7b.sh"), unclean), Provider::Claude));
-    assert_eq!(input["content"], "# one\n#SBATCH --mem=4G # limit\necho hi\n");
+    refuse("f7b.sh", unclean);
     refuse("f7c.sh", "# one\n#SBATCH --mem=4G # a\n#SBATCH --time=1 # b\n#SBATCH -N 2 # c\necho hi\n");
     allow("f8.cpp", "// note one\n// note two\n// NOLINTNEXTLINE(bugprone-use-after-move)\n// NOLINTBEGIN(build/include_order)\nint a;\n// NOLINTEND\n");
     allow("f8b.cpp", "// note one\n// note two\n// clang-format off\nint  a;\n// clang-format on\n");
@@ -2217,8 +2400,8 @@ fn what_the_eighteenth_review_found_is_refused_or_kept() {
     allow("f9b.css", "/* one */\n/* two */\n/* stylelint-disable selector-max-id */\na { b: c }\n/* stylelint-enable selector-max-id */\n");
     allow("f10b.go", "// note one\n// note two\n// @generated\npackage x\n");
     let many = "package x\n// note one\n// note two\n//go:embed a b c d e f g h\nvar x string\n";
-    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("f6b.go"), many), Provider::Claude));
-    assert_eq!(input["content"], "package x\n// note one\n//go:embed a b c d e f g h\nvar x string\n");
+    refuse("f6b.go", many);
+    allow("f6b.go", "package x\n// note one\n//go:embed a b c d e f g h\nvar x string\n");
     for (name, text) in [
         ("g1.js", "const label = `progress ${done / total}`;\n// one\n// two\n// three\n// four\nconst x = 1;\n"),
         ("g1b.js", "const t = `${(a + b) / 2} ${a /= b} ${x[1] / 2}`;\n// one\n// two\n// three\n// four\nconst x = 1;\n"),
@@ -2233,13 +2416,15 @@ fn what_the_eighteenth_review_found_is_refused_or_kept() {
     allow("g4b.sh", "#OAR -l nodes=1\n#OAR -n x\n#OAR -q y\necho hi\n");
     allow("g4c.sh", "#MSUB -l nodes=1\n#MSUB -N a\n#MSUB -q b\necho hi\n");
     let modeline = "// one\n// two\nint x;\n/* vim: set ts=4 sw=4: */\n";
-    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("g5.c"), modeline), Provider::Claude));
-    assert_eq!(input["content"], "int x;\n/* vim: set ts=4 sw=4: */\n");
+    allow("g5.c", modeline);
+    let overlong_modeline = "// one\n// two\n// three\nint x;\n/* vim: set ts=4 sw=4: */\n";
+    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("g5.c"), overlong_modeline), Provider::Claude));
+    assert_eq!(input["content"], modeline);
     let biome = "// biome-ignore lint/suspicious/noExplicitAny: legacy JSON.parse result checked by the schema on the next line\nexport const x: any = 1;\n";
     refuse("f9c.ts", biome);
     let marker = "// Package api is the public client.\n// Callers should use the typed methods.\n// Code generated by protoc-gen-go. DO NOT EDIT.\npackage api\n";
-    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("f10.go"), marker), Provider::Claude));
-    assert_eq!(input["content"], "// Package api is the public client.\n// Code generated by protoc-gen-go. DO NOT EDIT.\npackage api\n");
+    refuse("f10.go", marker);
+    allow("f10.go", "// Package api is the public client.\n// Code generated by protoc-gen-go. DO NOT EDIT.\npackage api\n");
     let plain = "const s = `n=${ a ? \"x}\" : 'y' } ok`;\n// one\n// two\n// three\n// four\nconst x = 1;\n";
     let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("plain.js"), plain), Provider::Claude));
     assert_eq!(input["content"], "const s = `n=${ a ? \"x}\" : 'y' } ok`;\n// one\n// two\nconst x = 1;\n");
@@ -2259,8 +2444,8 @@ fn what_the_twenty_first_review_found_is_refused_or_kept() {
     assert!(matches!(first, Verdict::Allow));
     std::fs::write(&path, "# one\n# two\nx = 1\n").expect("write");
     let again = json!({ "file_path": path.to_string_lossy(), "old_string": "# one\n# two\nx = 1", "new_string": "# three\n# four\n# one\n# two\nx = 1" });
-    let (input, _) = cut(trimming(Some(&state), Some("t21"), "Edit", again, Provider::Claude));
-    assert_eq!(input["new_string"], "# one\n# two\nx = 1");
+    let blocked = trimming_in(Mode::Block, Some(&state), Some("t21"), "Edit", again, Provider::Claude);
+    assert!(denied(&blocked));
     not_cut("i2.swift", "let s = #\"\"\"\nquote \"\"\" in text\n// one\n// two\n// three\n// four\n\"\"\"#\nlet x = 1\n");
     not_cut("i3.swift", "let s = #\"\"\"\n\"\"\"\n\"\"\"#\n// one\n// two\n// three\n// four\nlet x = 1\n");
     not_cut("i4.kt", "val s = \"\"\"\n${\"\"\"\n// one\n// two\n// three\n// four\n\"\"\"}\n\"\"\"\nval x = 1\n");
@@ -2269,8 +2454,8 @@ fn what_the_twenty_first_review_found_is_refused_or_kept() {
     let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("i5.kt"), slash), Provider::Claude));
     assert_eq!(input["content"], "val slash = \"\"\"\\\"\"\"\n// one\n// two\nval x = 1\n");
     let region = "fun f() {\n// region setup\n// one\n// two\n// endregion\nval x = 1\n}\n";
-    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("i6.kt"), region), Provider::Claude));
-    assert_eq!(input["content"], "fun f() {\n// region setup\n// endregion\nval x = 1\n}\n");
+    assert!(denied(&trimming(None, None, "Write", written(&dir.join("i6.kt"), region), Provider::Claude)));
+    assert!(matches!(trimming(None, None, "Write", written(&dir.join("i6.kt"), "fun f() {\n// region setup\n// endregion\nval x = 1\n}\n"), Provider::Claude), Verdict::Allow));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&state);
 }
@@ -2337,14 +2522,17 @@ fn harmless_look_alikes_do_not_stop_a_trim_and_a_huge_file_is_trimmed_quickly() 
     let shift = "n = 1 << 4\n# one\n# two\n# three\n# four\nx = 1\n";
     let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("a.py"), shift), Provider::Claude));
     assert_eq!(input["content"], "n = 1 << 4\n# one\n# two\nx = 1\n");
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join("a.py"), shift), Provider::Claude));
+    assert_eq!(input["content"], "n = 1 << 4\nx = 1\n");
     let raw = "fn f() {\n    let s = r\"ok\";\n    let t = r#\"also \"fine\"\"#;\n    // one\n    // two\n    // three\n    // four\n    let x = 1;\n}\n";
     let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("a.rs"), raw), Provider::Claude));
     assert!(input["content"].as_str().is_some_and(|text| text.contains("// two") && !text.contains("// three")));
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join("a.rs"), raw), Provider::Claude));
+    assert_eq!(input["content"], raw.replace("    // one\n    // two\n    // three\n    // four\n", ""));
     let many: String = (0..60_000).map(|n| format!("# c{n}\n")).chain(std::iter::once("x = 1\n".to_owned())).collect();
-    let started = std::time::Instant::now();
-    let (input, _) = cut(trimming(None, None, "Write", written(&dir.join("b.py"), &many), Provider::Claude));
+    let (input, note) = cut(trimming(None, None, "Write", written(&dir.join("b.py"), &many), Provider::Claude));
     assert_eq!(input["content"], "# c0\n# c1\nx = 1\n");
-    assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
+    assert!(note.contains("59998 new comment line(s) were left out"), "{note}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2425,10 +2613,12 @@ fn a_multi_edit_is_written_without_the_extra_comment_lines() {
         { "old_string": "a = 1", "new_string": "# a1\n# a2\na = 1" },
         { "old_string": "c = 3", "new_string": "c = 3\n# c1\n# c2\n# c3" },
     ] });
-    let (input, _) = cut(trimming(None, None, "MultiEdit", two, Provider::Claude));
-    assert_eq!(apply_edits(start, &input), "# a1\n# a2\na = 1\nb = 2\nc = 3\nd = 4\n");
+    let (input, _) = cut(trimming(None, None, "MultiEdit", two.clone(), Provider::Claude));
+    assert_eq!(apply_edits(start, &input), "# a1\n# a2\na = 1\nb = 2\nc = 3\n# c1\n# c2\nd = 4\n");
     assert_eq!(input["edits"][0]["new_string"], "# a1\n# a2\na = 1");
-    assert_eq!(input["edits"][1]["new_string"], "c = 3");
+    assert_eq!(input["edits"][1]["new_string"], "c = 3\n# c1\n# c2");
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "MultiEdit", two.clone(), Provider::Claude));
+    assert_eq!(apply_edits(start, &input), "# a1\n# a2\na = 1\nb = 2\nc = 3\nd = 4\n");
     let chained = json!({ "file_path": file, "edits": [
         { "old_string": "b = 2", "new_string": "b = 2\n# x1\n# x2\n# x3\n# x4" },
         { "old_string": "# x4", "new_string": "# y4" },
@@ -2453,6 +2643,7 @@ fn after_trimming(rig: &Rig, host: &str, command: &str) -> String {
         .args(["hook", host, "PostToolUse"])
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "1")
+        .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_MODE")
         .env("XDG_STATE_HOME", &rig.state)
         .env("HOME", &rig.home)
         .stdin(Stdio::piped())
@@ -2507,7 +2698,7 @@ fn a_docstring_over_the_limit_is_left_out_and_the_code_around_it_is_written() {
     let (input, note) = cut(trimming(None, None, "Write", written(&path, &module), Provider::Claude));
     assert_eq!(input["content"], "import os\n\nx = 1\n");
     assert!(note.contains("1 new comment line(s)") && !note.contains("pass"), "{note}");
-    let many = "def f():\n    \"\"\"One.\n\n    Two.\n    Three.\n    \"\"\"\n    return 1\n";
+    let many = "def f():\n    \"\"\"One.\n\n    Two 2026-10-27.\n    Three.\n    \"\"\"\n    return 1\n";
     let (input, note) = cut(trimming(None, None, "Write", written(&path, many), Provider::Claude));
     assert_eq!(input["content"], "def f():\n    return 1\n");
     assert!(note.contains("3 new comment line(s)"), "{note}");
@@ -2530,7 +2721,7 @@ fn a_docstring_that_is_a_whole_block_is_replaced_by_pass() {
     assert!(note.contains("replaced by `pass`"), "{note}");
     let (input, _) = write(&format!("def f():\n    {}\n", q3(&long)));
     assert_eq!(input["content"], "def f():\n    pass\n");
-    let (input, _) = write("class E(Exception):\n    \"\"\"One.\n    Two.\n    Three.\n    \"\"\"\n");
+    let (input, _) = write("class E(Exception):\n    \"\"\"One.\n    Two 2026-10-27.\n    Three.\n    \"\"\"\n");
     assert_eq!(input["content"], "class E(Exception):\n    pass\n");
     let (input, _) = write(&format!("if a:\n    {}\nelse:\n    b = 1\n", q3(&long)));
     assert_eq!(input["content"], "if a:\n    pass\nelse:\n    b = 1\n");
@@ -2562,12 +2753,12 @@ fn a_docstring_in_an_edit_is_cut_inside_its_replacement() {
     let ahead = json!({
         "file_path": path.to_string_lossy(),
         "old_string": "def f():\n",
-        "new_string": "def f():\n    \"\"\"One.\n    Two.\n    Three.\n    \"\"\"\n",
+        "new_string": "def f():\n    \"\"\"One.\n    Two 2026-10-27.\n    Three.\n    \"\"\"\n",
     });
     let (input, _) = cut(trimming(None, None, "Edit", ahead, Provider::Claude));
     assert_eq!(input["new_string"], "def f():\n");
     let patch = format!(
-        "*** Begin Patch\n*** Update File: {}\n@@\n def f():\n+    \"\"\"One.\n+    Two.\n+    Three.\n+    \"\"\"\n     return 1\n*** End Patch\n",
+        "*** Begin Patch\n*** Update File: {}\n@@\n def f():\n+    \"\"\"One.\n+    Two 2026-10-27.\n+    Three.\n+    \"\"\"\n     return 1\n*** End Patch\n",
         path.display()
     );
     let (input, _) = cut(trimming(None, None, "apply_patch", json!({ "command": patch }), Provider::Codex));
@@ -2587,7 +2778,7 @@ fn a_docstring_that_cannot_be_cut_safely_is_still_refused() {
         assert!(denied(&trimming(None, None, tool, input, provider)), "{tool} was not refused");
     };
     let write = |text: &str| written(&path, text);
-    refused("Write", write("x = foo(\n    \"\"\"One.\n    Two.\n    Three.\n    \"\"\"\n)\n"), Provider::Claude);
+    refused("Write", write("x = foo(\n    \"\"\"One.\n    Two 2026-10-27.\n    Three.\n    \"\"\"\n)\n"), Provider::Claude);
     refused("Write", write(&format!("{} + x\n", q3(&long))), Provider::Claude);
     refused("Write", write(&format!("{}  # note\n", q3(&long))), Provider::Claude);
     std::fs::write(&path, "def f():\n    \"\"\"Short.\n\n    More.\n    \"\"\"\n    return 1\n").expect("write");
@@ -2637,7 +2828,7 @@ fn what_the_docstring_review_found_is_refused_or_cut_safely() {
     let many = json!({
         "file_path": path.to_string_lossy(),
         "old_string": "def f():",
-        "new_string": "def f():\r\n    \"\"\"One.\r\n    Two.\r\n    Three.\r\n    \"\"\"",
+        "new_string": "def f():\r\n    \"\"\"One.\r\n    Two 2026-10-27.\r\n    Three.\r\n    \"\"\"",
     });
     let (input, _) = cut(trimming(None, None, "Edit", many, Provider::Claude));
     assert_eq!(input["new_string"], "def f():");
@@ -2663,11 +2854,10 @@ fn what_the_second_docstring_review_found_is_refused() {
     let marker = format!("\"\"\"\nCode generated by example; DO NOT EDIT.\n{long}\n\"\"\"\nx = 1\n");
     std::fs::remove_file(&path).expect("remove");
     assert!(denied(&write(&marker)));
-    comment_guard::limits::set_remove(true);
-    assert!(denied(&write(&marker)));
+    let drop = |text: &str| trimming_in(Mode::Drop, None, None, "Write", written(&path, text), Provider::Claude);
+    assert!(denied(&drop(&marker)));
     let vim = format!("\"\"\"\nvim: set ts=4\n{long}\n\"\"\"\nx = 1\n");
-    assert!(denied(&write(&vim)));
-    comment_guard::limits::set_remove(false);
+    assert!(denied(&drop(&vim)));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2707,10 +2897,9 @@ fn what_the_third_docstring_review_found_is_refused() {
     assert_eq!(input["content"], "def g():\n    return 1\n");
     std::fs::remove_file(&path).expect("remove");
     for prefix in ["r", "R", "u", "U", "b"] {
-        comment_guard::limits::set_remove(true);
         let marked = format!("{prefix}{}\nx = 1\n", q3(&format!("Code generated by example; DO NOT EDIT. {long}")));
-        assert!(denied(&write(&marked)), "{prefix}");
-        comment_guard::limits::set_remove(false);
+        let drop = |text: &str| trimming_in(Mode::Drop, None, None, "Write", written(&path, text), Provider::Claude);
+        assert!(denied(&drop(&marked)), "{prefix}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2750,7 +2939,7 @@ fn what_the_sixth_docstring_review_found_is_kept_apart() {
     let wrapped = format!("def f():\n    \"\"\"Keep\n    this.\n    {long}\n    \"\"\"\n    return 1\n");
     assert!(denied(&write(&wrapped)));
     std::fs::write(&path, "MESSAGE = \"cached result\"\n").expect("write");
-    let fresh = "MESSAGE = \"cached result\"\n\ndef f():\n    \"\"\"Return the cached result.\n    More.\n    Again.\n    \"\"\"\n    return MESSAGE\n";
+    let fresh = "MESSAGE = \"cached result\"\n\ndef f():\n    \"\"\"Return the cached result.\n    More 2026-10-27.\n    Again.\n    \"\"\"\n    return MESSAGE\n";
     let (input, _) = cut(write(fresh));
     assert_eq!(input["content"], "MESSAGE = \"cached result\"\n\ndef f():\n    return MESSAGE\n");
     let old = "class A:\n    def f(self):\n        \"\"\"Existing A documentation.\"\"\"\n        return 1\n";
@@ -2792,35 +2981,12 @@ fn what_the_seventh_docstring_review_found_is_handled() {
 }
 
 #[test]
-fn the_remove_mode_drops_every_new_comment_of_a_call_over_the_limit() {
-    let dir = temp_dir("trim-remove");
-    let path = dir.join("a.py");
-    let text = "# a1\n# a2\n# a3\nx = 1\n";
-    comment_guard::limits::set_remove(true);
-    let (input, note) = cut(trimming(None, None, "Write", written(&path, text), Provider::Claude));
-    assert_eq!(input["content"], "x = 1\n");
-    assert!(note.contains("3 new comment line(s)"), "{note}");
-    let long = "x".repeat(95);
-    let mixed = format!("# a1\n{}\nx = 1\n# a2\n# a3\n", q3("Short."));
-    let (input, _) = cut(trimming(None, None, "Write", written(&path, &mixed), Provider::Claude));
-    assert_eq!(input["content"], "x = 1\n");
-    let within = "# a1\n# a2\nx = 1\n";
-    assert!(matches!(trimming(None, None, "Write", written(&path, within), Provider::Claude), Verdict::Allow));
-    let (input, _) = cut(trimming(None, None, "Write", written(&path, &format!("def f():\n    {}\n", q3(&long))), Provider::Claude));
-    assert_eq!(input["content"], "def f():\n    pass\n");
-    comment_guard::limits::set_remove(false);
-    let (input, _) = cut(trimming(None, None, "Write", written(&path, text), Provider::Claude));
-    assert_eq!(input["content"], "# a1\n# a2\nx = 1\n");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn files_an_unfinished_merge_brought_in_are_not_cut() {
     let rig = Rig::new("merge-docs");
     init_repo(&rig.cwd);
     let file = commit_file(&rig.cwd, "a.py", "def f():\n    return 1\n");
     git(&rig.cwd, &["checkout", "-q", "-b", "feature"]);
-    let documented = "def f():\n    \"\"\"One.\n    Two.\n    Three.\n    \"\"\"\n    # a1\n    # a2\n    # a3\n    return 1\n";
+    let documented = "def f():\n    \"\"\"One.\n    Two 2026-10-27.\n    Three.\n    \"\"\"\n    # a1\n    # a2\n    # a3\n    return 1\n";
     std::fs::write(&file, documented).expect("write");
     git(&rig.cwd, &["-c", "core.hooksPath=/dev/null", "commit", "-q", "-am", "docs"]);
     git(&rig.cwd, &["checkout", "-q", "-"]);
@@ -2849,6 +3015,31 @@ fn a_docstring_written_by_a_command_is_reported_never_cut_on_disk() {
 }
 
 #[test]
+fn a_multi_line_block_comment_over_the_limit_is_cut_as_a_unit_and_a_doc_block_is_exempt() {
+    let dir = temp_dir("block-units");
+    let drop = |name: &str, text: &str| cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join(name), text), Provider::Claude)).0;
+    let trim = |name: &str, text: &str| cut(trimming(None, None, "Write", written(&dir.join(name), text), Provider::Claude)).0;
+    let licence = "/*\n * Copyright 2026 Someone\n * Licensed under MIT\n * Line three\n * Line four\n */\nexport const a = 1;\n";
+    assert_eq!(drop("a.ts", licence)["content"], "export const a = 1;\n");
+    assert_eq!(trim("a.ts", licence)["content"], "export const a = 1;\n");
+    let plain = "/*\none\ntwo\nthree\nfour\n*/\nint a;\n";
+    assert_eq!(drop("c.c", plain)["content"], "int a;\n");
+    assert_eq!(drop("a.go", "/*\none\ntwo\nthree\n*/\npackage main\n")["content"], "package main\n");
+    assert_eq!(drop("a.css", "/*\none\ntwo\nthree\n*/\nbody { margin: 0; }\n")["content"], "body { margin: 0; }\n");
+    let kept = "// keep one\n// keep two\nconst a = 1;\n/*\n * x one\n * x two\n * x three\n */\nconst b = 2;\n";
+    assert_eq!(drop("a.ts", kept)["content"], "// keep one\n// keep two\nconst a = 1;\nconst b = 2;\n");
+    let within = "/*\n * one\n * two\n */\nexport const a = 1;\n";
+    assert!(matches!(trimming(None, None, "Write", written(&dir.join("a.ts"), within), Provider::Claude), Verdict::Allow));
+    let doc = "/**\n * One.\n * Two.\n * Three.\n * Four.\n */\nexport function f() {}\n";
+    assert!(matches!(trimming(None, None, "Write", written(&dir.join("a.ts"), doc), Provider::Claude), Verdict::Allow));
+    let long_doc = format!("/**\n * One.\n * {}\n */\nexport function f() {{}}\n", "w".repeat(100));
+    assert!(!matches!(trimming(None, None, "Write", written(&dir.join("a.ts"), &long_doc), Provider::Claude), Verdict::Allow));
+    let trailing = "/*\none\ntwo\nthree\n*/ const a = 1;\n";
+    assert!(denied(&trimming(None, None, "Write", written(&dir.join("a.ts"), trailing), Provider::Claude)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_partial_edit_is_refused_not_trimmed() {
     let dir = temp_dir("trim-other");
     let all = dir.join("a.py");
@@ -2859,7 +3050,7 @@ fn a_partial_edit_is_refused_not_trimmed() {
 }
 
 #[test]
-fn what_a_trimmed_call_keeps_counts_against_the_session_allowance() {
+fn what_a_trimmed_call_keeps_counts_only_when_the_next_edit_is_adjacent() {
     let dir = temp_dir("trim-session");
     let state = temp_dir("trim-session-state");
     let path = dir.join("a.py");
@@ -2868,8 +3059,10 @@ fn what_a_trimmed_call_keeps_counts_against_the_session_allowance() {
     assert_eq!(content, "# a1\n# a2\nx = 1\ny = 2\n");
     std::fs::write(&path, &content).expect("write");
     let again = json!({ "file_path": path.to_string_lossy(), "old_string": "y = 2", "new_string": "y = 2\n# b1\n# b2" });
-    let (input, _) = cut(trimming(Some(&state), Some("ts"), "Edit", again, Provider::Claude));
-    assert_eq!(input["new_string"], "y = 2");
+    assert!(matches!(trimming(Some(&state), Some("ts"), "Edit", again, Provider::Claude), Verdict::Allow));
+    let adjacent = json!({ "file_path": path.to_string_lossy(), "old_string": "# a2", "new_string": "# a2\n# b1\n# b2" });
+    let (input, _) = cut(trimming(Some(&state), Some("ts"), "Edit", adjacent, Provider::Claude));
+    assert_eq!(input["new_string"], "# a2");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&state);
 }
@@ -2891,6 +3084,7 @@ fn the_installed_hook_answers_with_an_allow_that_carries_the_trimmed_input() {
             .args(["hook", "claude", "PreToolUse"])
             .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
             .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", trim)
+            .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_MODE")
             .env("XDG_STATE_HOME", &rig.state)
             .env("HOME", &rig.home)
             .stdin(Stdio::piped())
@@ -2936,12 +3130,12 @@ fn a_rewrap_that_also_rewords_is_judged_as_a_plain_replacement() {
 }
 
 #[test]
-fn blank_lines_are_still_charged_after_a_rewrap_is_forgiven() {
+fn spacers_after_a_rewrap_do_not_count_either() {
     let dir = temp_dir("wrap-blanks");
     let path = dir.join("a.rs");
     std::fs::write(&path, "// alpha beta gamma delta\nfn a() {}\n").expect("write");
     let hollow = "// alpha beta\n// gamma delta\n//\n//\nfn a() {}\n";
-    assert!(denied(&write_file(None, None, &path, hollow)));
+    assert!(!denied(&write_file(None, None, &path, hollow)));
     let wrapped = "// alpha beta\n// gamma delta\nfn a() {}\n";
     assert!(!denied(&write_file(None, None, &path, wrapped)));
     let _ = std::fs::remove_dir_all(&dir);

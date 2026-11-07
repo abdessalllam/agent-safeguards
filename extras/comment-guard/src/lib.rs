@@ -420,7 +420,7 @@ mod tests {
     fn pair(ledger: &Ledger) -> (HashMap<String, Prepared>, Vec<Change>) {
         let mut prepared = HashMap::new();
         let mut changes = Vec::new();
-        for (name, old, new) in [("/t/a.py", "x = 1\n", "# one\nx = 1\n"), ("/t/b.py", "y = 1\n", "# two\ny = 1\n")] {
+        for (name, old, new) in [("/t/a.py", "x = 1\n", "# one\nx = 1\n"), ("/t/b.py", "y = 1\n", "# two\n# three\n# four\ny = 1\n")] {
             let id = identity(Path::new(name));
             let before = seen_of(old, &[]);
             ledger.baseline_for(&id, before, Vec::new);

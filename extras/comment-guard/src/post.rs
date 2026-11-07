@@ -952,6 +952,7 @@ mod tests {
     #[test]
     fn a_regular_file_in_the_folder_is_trimmed_in_place_with_its_mode() {
         use std::os::unix::fs::PermissionsExt;
+        crate::limits::set_mode(crate::limits::Mode::Trim);
         let (root, cwd, ledger) = trim_rig("plain");
         let text = "x = 1\n# a\n# b\n# c\n# d\n";
         let file = cwd.join("a.py");

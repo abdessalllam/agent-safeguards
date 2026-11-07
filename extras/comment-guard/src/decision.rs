@@ -5,7 +5,6 @@ use crate::languages::{language_for_text, Language, CLIKE, GO, KOTLIN, PYTHON, R
 use crate::limits;
 use crate::locale::message;
 
-pub const MAX_BLOCKS: usize = 1;
 const REWRAP_FILL: usize = 24;
 
 const HISTORY_PHRASES: [&str; 8] = [
@@ -67,8 +66,8 @@ pub fn comment_lines(text: &str, lang: Language) -> Vec<String> {
 
 struct Aggregate<'a> {
     file: &'a str,
-    lines: usize,
-    blocks: usize,
+    excess: usize,
+    longest: usize,
     marker: Option<&'a str>,
     too_long: bool,
     first: Option<&'a str>,
@@ -99,7 +98,8 @@ pub fn evaluate_after(changes: &[Change]) -> Option<String> {
 
 struct Measure<'a> {
     net_lines: usize,
-    blocks: usize,
+    excess: usize,
+    longest: usize,
     too_long: bool,
     marker: Option<&'a str>,
     first: Option<&'a str>,
@@ -156,10 +156,11 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
             }
         }
     }
-    let mut running = false;
     let mut counted = false;
     let mut fresh_lines = 0usize;
-    let mut fresh_blocks = 0usize;
+    let mut run_fresh = 0usize;
+    let mut run_doc = false;
+    let mut runs: Vec<usize> = Vec::new();
     let mut fresh_long = 0usize;
     let mut first_fresh: Option<&str> = None;
     let mut first_long: Option<&str> = None;
@@ -167,18 +168,31 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
     let mut fresh_blank = 0usize;
     let mut fresh_text: Vec<&str> = Vec::new();
     let mut fresh_markers: Vec<&str> = Vec::new();
-    for kind in scan(&change.new, lang) {
+    let mut scanner = scan(&change.new, lang);
+    while let Some(kind) = scanner.next() {
         let (line, same_line) = match kind {
             LineKind::Comment(line) => (line, false),
             LineKind::Also(line) => (line, true),
             LineKind::Other => {
-                running = false;
                 counted = false;
+                if !scanner.is_blank() && run_fresh > 0 {
+                    runs.push(run_fresh);
+                    run_fresh = 0;
+                }
                 continue;
             }
         };
+        let coded = scanner.shares_line_with_code();
+        let doc = scanner.is_doc_line();
         if !same_line {
             counted = false;
+            if coded || doc != run_doc {
+                if run_fresh > 0 {
+                    runs.push(run_fresh);
+                    run_fresh = 0;
+                }
+                run_doc = doc && !coded;
+            }
         }
         let kept = match pool.get_mut(line) {
             Some(count) if *count > 0 => {
@@ -188,17 +202,17 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
             _ => false,
         };
         if kept {
-            if !same_line {
-                running = false;
-            }
             continue;
         }
         if !counted {
-            if !running {
-                fresh_blocks = fresh_blocks.saturating_add(1);
-                running = true;
-            }
             fresh_lines = fresh_lines.saturating_add(1);
+            if !doc && letters(line) > 0 {
+                run_fresh = run_fresh.saturating_add(1);
+            }
+            if coded && run_fresh > 0 {
+                runs.push(run_fresh);
+                run_fresh = 0;
+            }
             if letters(line) == 0 {
                 fresh_blank = fresh_blank.saturating_add(1);
             }
@@ -214,6 +228,9 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
         if let Some(marker) = history_marker(body(line)) {
             fresh_markers.push(marker);
         }
+    }
+    if run_fresh > 0 {
+        runs.push(run_fresh);
     }
     let mut removed_total = 0usize;
     let mut removed_long = 0usize;
@@ -249,9 +266,13 @@ fn measure(change: &Change, lang: Language) -> Measure<'_> {
             }
         }
     }
+    let limit = limits::current().lines;
+    let over: usize = runs.iter().map(|run| run.saturating_sub(limit)).sum();
+    let forgiven = fresh_lines.saturating_sub(net);
     Measure {
-        net_lines: net.saturating_add(change.carry),
-        blocks: fresh_blocks.min(net).saturating_add(usize::from(change.carry > 0)),
+        net_lines: net,
+        excess: over.saturating_sub(forgiven),
+        longest: runs.iter().copied().max().unwrap_or(0),
         too_long: fresh_long > removed_long,
         marker,
         first: first_fresh,
@@ -671,12 +692,22 @@ fn risky(text: &str, lang: Language) -> bool {
 }
 
 struct Piece {
+    run: usize,
     first: usize,
     last: usize,
     shown: Vec<String>,
     cost: usize,
     fine: bool,
     docstring: bool,
+}
+
+struct OpenBlock {
+    first: usize,
+    shown: Vec<String>,
+    fine: bool,
+    fresh: bool,
+    lettered: usize,
+    doc: bool,
 }
 
 struct OpenDoc {
@@ -794,6 +825,17 @@ pub fn trimmed_with(change: &Change, docstrings: bool) -> Option<Trimmed> {
     let mut logical: Vec<usize> = Vec::with_capacity(lines.len());
     let mut scanner = scan(&change.new, lang);
     let mut pieces: Vec<Piece> = Vec::new();
+    let mut run_id = 0usize;
+    let have_baseline = change.baseline.is_some() && !change.partial;
+    let mut baseline_pool: HashMap<&str, usize> = HashMap::new();
+    if have_baseline {
+        for line in change.baseline.iter().flatten() {
+            *baseline_pool.entry(line.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mut held: HashMap<usize, usize> = HashMap::new();
+    let mut last_doc: Option<bool> = None;
+    let mut block: Option<OpenBlock> = None;
     let mut open: Option<OpenDoc> = None;
     while let Some(kind) = scanner.next() {
         let index = scanner.line_index();
@@ -810,11 +852,32 @@ pub fn trimmed_with(change: &Change, docstrings: bool) -> Option<Trimmed> {
                 statement: scanner.at_statement(),
             });
         }
+        if scanner.block_start() {
+            block = Some(OpenBlock {
+                first: index,
+                shown: Vec::new(),
+                fine: true,
+                fresh: true,
+                lettered: 0,
+                doc: scanner.is_doc_line(),
+            });
+        }
         let found = match kind {
             LineKind::Comment(line) => Some((line, false)),
             LineKind::Also(line) => Some((line, true)),
             LineKind::Other => None,
         };
+        if open.is_none() && ((found.is_none() && !scanner.is_blank()) || (found.is_some() && scanner.shares_line_with_code())) {
+            run_id = run_id.saturating_add(1);
+            last_doc = None;
+        }
+        if let (Some((_, false)), true, true) = (found, open.is_none() && block.is_none(), !scanner.shares_line_with_code()) {
+            let now = scanner.is_doc_line();
+            if last_doc.is_some_and(|before| before != now) {
+                run_id = run_id.saturating_add(1);
+            }
+            last_doc = Some(now);
+        }
         if found.is_none() {
             let raw = lines.get(index).map_or("", |line| line.trim());
             if let Some(doc) = open.as_mut().filter(|_| !raw.is_empty() && !delimiter_only(raw)) {
@@ -829,53 +892,111 @@ pub fn trimmed_with(change: &Change, docstrings: bool) -> Option<Trimmed> {
                 }
                 _ => false,
             };
+            let from_baseline = match baseline_pool.get_mut(line) {
+                Some(count) if *count > 0 => {
+                    *count -= 1;
+                    true
+                }
+                _ => false,
+            };
+            if kept && !from_baseline && have_baseline && open.is_none() && !same_line && !scanner.shares_line_with_code() {
+                *held.entry(run_id).or_insert(0) += 1;
+            }
             if let Some(doc) = open.as_mut() {
                 let text = doc_text(line);
                 doc.fresh &= !kept && !protected(body(line)) && !protected(text);
                 doc.fine &= fits(line);
                 doc.shown.push(line.trim().to_owned());
+            } else if let Some(unit) = block.as_mut() {
+                let guarded = protected(body(line)) || (scanner.line_index() < 3 && directive_shaped(line));
+                unit.fresh &= !kept && !guarded;
+                unit.fine &= fits(line);
+                unit.shown.push(line.trim().to_owned());
+                if letters(line) > 0 && !scanner.is_doc_line() {
+                    unit.lettered = unit.lettered.saturating_add(1);
+                }
             } else {
                 let guarded = protected(body(line)) || (scanner.line_index() < 3 && directive_shaped(line));
                 if !kept && !same_line && scanner.standalone() && !guarded {
                     pieces.push(Piece {
+                        run: run_id,
                         first: index,
                         last: index,
                         shown: vec![line.trim().to_owned()],
-                        cost: 1,
+                        cost: usize::from(!scanner.is_doc_line() && letters(line) > 0),
                         fine: fits(line),
                         docstring: false,
                     });
                 }
             }
         }
+        if scanner.block_end() {
+            if let Some(unit) = block.take() {
+                if unit.fresh && scanner.block_pure() && !unit.shown.is_empty() {
+                    run_id = run_id.saturating_add(1);
+                    pieces.push(Piece {
+                        run: run_id,
+                        first: unit.first,
+                        last: index,
+                        cost: if unit.doc { 0 } else { unit.lettered },
+                        shown: unit.shown,
+                        fine: unit.fine,
+                        docstring: false,
+                    });
+                    run_id = run_id.saturating_add(1);
+                    last_doc = None;
+                }
+            }
+        }
         if scanner.doc_end() {
             if let Some(doc) = open.take() {
                 if docstrings && doc.fresh && !old_unclear && doc.statement && scanner.doc_pure() && !doc.shown.is_empty() {
+                    run_id = run_id.saturating_add(1);
                     pieces.push(Piece {
+                        run: run_id,
                         first: doc.first,
                         last: index,
-                        cost: doc.shown.len(),
+                        cost: 0,
                         shown: doc.shown,
                         fine: doc.fine,
                         docstring: true,
                     });
+                    run_id = run_id.saturating_add(1);
                 }
             }
         }
     }
-    if scanner.uncertain() || pieces.is_empty() {
+    if scanner.uncertain() || pieces.is_empty() || limits::mode() == limits::Mode::Block {
         return None;
     }
-    for keep in (0..=limits::kept_lines()).rev() {
-        let mut kept = 0usize;
+    let limit = limits::current().lines;
+    let mut cost_of: HashMap<usize, usize> = HashMap::new();
+    let mut unfit: HashSet<usize> = HashSet::new();
+    for piece in &pieces {
+        *cost_of.entry(piece.run).or_insert(0) += piece.cost;
+        if !piece.fine {
+            unfit.insert(piece.run);
+        }
+    }
+    let held_in = |run: usize| held.get(&run).copied().unwrap_or(0);
+    let over_limit = |run: usize| cost_of.get(&run).copied().unwrap_or(0).saturating_add(held_in(run)) > limit || unfit.contains(&run);
+    let mut plans: Vec<Vec<&Piece>> = Vec::new();
+    if limits::mode() == limits::Mode::Trim {
+        let mut kept: HashMap<usize, usize> = HashMap::new();
         let mut cut: Vec<&Piece> = Vec::new();
         for piece in &pieces {
-            if piece.fine && kept.saturating_add(piece.cost) <= keep {
-                kept = kept.saturating_add(piece.cost);
+            let used = kept.entry(piece.run).or_insert_with(|| held_in(piece.run));
+            let room = if piece.cost == 0 { *used < limit } else { used.saturating_add(piece.cost) <= limit };
+            if !over_limit(piece.run) || (piece.fine && room) {
+                *used = used.saturating_add(piece.cost);
             } else {
                 cut.push(piece);
             }
         }
+        plans.push(cut);
+    }
+    plans.push(pieces.iter().filter(|piece| over_limit(piece.run)).collect());
+    for cut in plans {
         if cut.is_empty() {
             continue;
         }
@@ -917,7 +1038,7 @@ pub fn net_lines(change: &Change) -> usize {
         return 0;
     };
     let lang = if change.partial { lang.fragment() } else { lang };
-    measure(change, lang).net_lines.saturating_sub(change.carry)
+    measure(change, lang).net_lines
 }
 
 fn evaluate_detail(changes: &[Change]) -> Option<String> {
@@ -933,8 +1054,8 @@ fn evaluate_detail(changes: &[Change]) -> Option<String> {
             None => {
                 order.push(Aggregate {
                     file: change.file.as_str(),
-                    lines: 0,
-                    blocks: 0,
+                    excess: 0,
+                    longest: 0,
                     marker: None,
                     too_long: false,
                     first: None,
@@ -949,8 +1070,8 @@ fn evaluate_detail(changes: &[Change]) -> Option<String> {
             continue;
         };
         let measured = measure(change, lang);
-        slot.lines = slot.lines.saturating_add(measured.net_lines);
-        slot.blocks = slot.blocks.saturating_add(measured.blocks);
+        slot.excess = slot.excess.saturating_add(measured.excess);
+        slot.longest = slot.longest.max(measured.longest);
         if measured.too_long {
             slot.too_long = true;
             slot.long = slot.long.or(measured.long);
@@ -977,16 +1098,14 @@ fn evaluate_detail(changes: &[Change]) -> Option<String> {
             );
             return Some(detail);
         }
-        if aggregate.lines > limits::current().lines || aggregate.blocks > MAX_BLOCKS {
-            let lines = aggregate.lines.to_string();
-            let blocks = aggregate.blocks.to_string();
+        if aggregate.excess > 0 {
+            let lines = aggregate.longest.to_string();
             let max_lines = limits::current().lines.to_string();
             let detail = message(
                 "comment_guard.detail.too_many",
                 &[
                     ("file", aggregate.file),
                     ("lines", lines.as_str()),
-                    ("blocks", blocks.as_str()),
                     ("max_lines", max_lines.as_str()),
                     ("line", excerpt(aggregate.first.unwrap_or("")).as_str()),
                 ],

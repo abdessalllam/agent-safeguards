@@ -70,7 +70,7 @@ fn comment_block(prefix: &str, count: usize) -> String {
 fn nine_line_python_block_is_denied() {
     let verdict = edit("a.py", "", &comment_block("#", 9));
     assert!(denied(&verdict));
-    assert!(reason(&verdict).contains("9 comment lines"));
+    assert!(reason(&verdict).contains("block of 9 lines"));
 }
 
 #[test]
@@ -79,10 +79,11 @@ fn single_comment_line_is_allowed() {
 }
 
 #[test]
-fn two_blocks_of_one_line_are_denied() {
-    let verdict = edit("a.py", "", "# one\nx = 1\n# two\n");
+fn separate_short_blocks_are_allowed_but_an_overlong_block_is_denied() {
+    assert!(!denied(&edit("a.py", "", "# one\nx = 1\n# two\n")));
+    let verdict = edit("a.py", "", "# one\n# two\n# three\nx = 1\n# four\n");
     assert!(denied(&verdict));
-    assert!(reason(&verdict).contains("2 block(s)"));
+    assert!(reason(&verdict).contains("block of 3 lines"));
 }
 
 #[test]
@@ -312,7 +313,7 @@ fn write_to_a_new_file_has_empty_old() {
 }
 
 #[test]
-fn multi_edit_edits_add_up() {
+fn multi_edit_allows_separate_short_blocks_but_catches_an_overlong_block() {
     let payload = json!({
         "tool_name": "MultiEdit",
         "tool_input": {
@@ -326,18 +327,41 @@ fn multi_edit_edits_add_up() {
     })
     .to_string();
     let verdict = run(&payload);
+    assert!(!denied(&verdict));
+    let overlong = json!({
+        "tool_name": "MultiEdit",
+        "tool_input": {
+            "file_path": "a.py",
+            "edits": [{ "old_string": "a", "new_string": "# one\n# two\n# three\na" }],
+        },
+    })
+    .to_string();
+    let verdict = run(&overlong);
     assert!(denied(&verdict));
-    assert!(reason(&verdict).contains("3 comment lines"));
+    assert!(reason(&verdict).contains("block of 3 lines"));
 }
 
 #[test]
-fn a_block_comment_of_four_lines_is_denied() {
-    assert!(denied(&edit("a.rs", "", "/*\n * one\n * two\n */\n")));
+fn a_block_comment_of_four_prose_lines_is_denied_and_delimiter_lines_do_not_count() {
+    assert!(denied(&edit("a.rs", "", "/*\n * one\n * two\n * three\n * four\n */\n")));
+    assert!(!denied(&edit("a.rs", "", "/*\n * one\n * two\n */\n")));
 }
 
 #[test]
-fn a_doc_comment_counts() {
-    assert!(denied(&edit("a.rs", "", "/// one\n/// two\n/// three\n")));
+fn a_doc_comment_is_exempt_from_the_line_cap_but_not_from_the_other_rules() {
+    assert!(!denied(&edit("a.rs", "", "/// one\n/// two\n/// three\n/// four\n")));
+    assert!(!denied(&edit("a.rs", "", "//! one\n//! two\n//! three\n")));
+    assert!(!denied(&edit("a.ts", "", "/**\n * one\n * two\n * three\n */\n")));
+    assert!(denied(&edit("a.rs", "", &format!("/// {}\n", "w".repeat(100)))));
+    assert!(denied(&edit("a.rs", "", "/// added on 2026-10-27\n")));
+    assert!(denied(&edit("a.rs", "", "// one\n// two\n// three\n/// doc\n")));
+}
+
+#[test]
+fn an_empty_comment_line_is_a_spacer_and_does_not_count() {
+    assert!(!denied(&edit("a.rs", "", "// one\n//\n// two\n//\n")));
+    assert!(denied(&edit("a.rs", "", "// one\n//\n// two\n//\n// three\n")));
+    assert!(!denied(&edit("a.py", "", "##########\n# Section\n##########\n")));
 }
 
 #[test]
@@ -365,12 +389,16 @@ fn patch_adding_a_file_is_judged() {
 }
 
 #[test]
-fn patch_with_two_hunks_counts_two_blocks() {
+fn patch_with_two_separate_short_hunks_is_allowed() {
     let verdict = patch(
-        "*** Begin Patch\n*** Update File: a.py\n@@\n-x = 1\n+# a\n@@\n-y = 1\n+# b\n*** End Patch\n",
+        "*** Begin Patch\n*** Update File: a.py\n@@\n-x = 1\n+# a\n+x = 1\n@@\n-y = 1\n+# b\n*** End Patch\n",
     );
-    assert!(denied(&verdict));
-    assert!(reason(&verdict).contains("2 block(s)"));
+    assert!(!denied(&verdict));
+    let overlong = patch(
+        "*** Begin Patch\n*** Update File: a.py\n@@\n-x = 1\n+# a\n+# b\n+# c\n+x = 1\n@@\n-y = 1\n+# d\n*** End Patch\n",
+    );
+    assert!(denied(&overlong));
+    assert!(reason(&overlong).contains("block of 3 lines"), "{}", reason(&overlong));
 }
 
 #[test]
@@ -436,7 +464,7 @@ fn hostile_single_long_line_is_denied() {
 
 #[test]
 fn hostile_many_block_openings_are_denied() {
-    let unit = format!("/*{}\n", " ".repeat(18));
+    let unit = format!("/* x{}\n", " ".repeat(16));
     let text = unit.repeat(100_000);
     let verdict = edit("a.rs", "", &text);
     assert!(denied(&verdict));
@@ -454,14 +482,16 @@ fn hostile_patch_with_many_files_is_allowed() {
 }
 
 #[test]
-fn a_blank_context_line_keeps_two_blocks_apart() {
+fn a_blank_context_line_does_not_split_a_comment_block() {
     let verdict = patch(
         "*** Begin Patch\n*** Update File: a.py\n@@\n+# first\n\n+# second\n*** End Patch\n",
     );
-    assert!(denied(&verdict));
-    assert!(reason(&verdict).contains("2 block(s)"));
+    assert!(!denied(&verdict));
     let added = patch("*** Begin Patch\n*** Add File: a.py\n+# first\n\n+# second\n*** End Patch\n");
-    assert!(denied(&added));
+    assert!(!denied(&added));
+    let three = patch("*** Begin Patch\n*** Add File: a.py\n+# first\n\n+# second\n\n+# third\n*** End Patch\n");
+    assert!(denied(&three));
+    assert!(reason(&three).contains("block of 3 lines"));
 }
 
 #[test]
@@ -470,22 +500,21 @@ fn a_byte_order_mark_does_not_hide_the_first_comment() {
 }
 
 #[test]
-fn updating_one_file_twice_counts_two_blocks() {
+fn updating_one_file_twice_allows_separate_short_blocks() {
     let verdict = patch(
         "*** Begin Patch\n*** Update File: a.py\n@@\n+# first\n*** Update File: a.py\n@@\n+# second\n*** End Patch\n",
     );
-    assert!(denied(&verdict));
-    assert!(reason(&verdict).contains("2 block(s)"));
+    assert!(!denied(&verdict));
 }
 
 #[test]
 fn a_move_after_a_hunk_still_judges_one_file() {
     let verdict = patch(
-        "*** Begin Patch\n*** Update File: old.py\n@@\n+# first\n*** Move to: new.py\n@@\n+# second\n*** End Patch\n",
+        "*** Begin Patch\n*** Update File: old.py\n@@\n+# first\n+# second\n+# third\n*** Move to: new.py\n@@\n+# fourth\n*** End Patch\n",
     );
     assert!(denied(&verdict));
     assert!(reason(&verdict).contains("new.py"));
-    assert!(reason(&verdict).contains("2 block(s)"));
+    assert!(reason(&verdict).contains("block of 4 lines"), "{}", reason(&verdict));
 }
 
 #[test]
@@ -504,7 +533,7 @@ fn the_first_violating_path_is_reported_with_its_own_rule() {
     );
     assert!(denied(&verdict));
     assert!(reason(&verdict).contains("a.py"));
-    assert!(reason(&verdict).contains("3 comment lines"));
+    assert!(reason(&verdict).contains("block of 3 lines"));
 }
 
 #[test]
@@ -549,6 +578,7 @@ fn feed(arguments: &[&str], input: &[u8]) -> std::process::Output {
         .args(arguments)
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "0")
+        .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_MODE")
         .env("XDG_CONFIG_HOME", "/nonexistent-comment-guard-config")
         .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES")
         .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS")
@@ -615,12 +645,16 @@ fn input_above_eight_mebibytes_is_allowed_with_a_note() {
 }
 
 #[test]
-fn a_repeated_add_file_counts_two_blocks() {
+fn a_repeated_add_file_combines_adjacent_comments() {
     let verdict = patch(
         "*** Begin Patch\n*** Add File: a.py\n+# one\n*** Add File: a.py\n+# two\n*** End Patch\n",
     );
-    assert!(denied(&verdict));
-    assert!(reason(&verdict).contains("2 block(s)"));
+    assert!(!denied(&verdict));
+    let overlong = patch(
+        "*** Begin Patch\n*** Add File: a.py\n+# one\n+# two\n+# three\n*** Add File: a.py\n+# four\n*** End Patch\n",
+    );
+    assert!(denied(&overlong));
+    assert!(reason(&overlong).contains("block of 4 lines"), "{}", reason(&overlong));
 }
 
 #[test]
@@ -628,15 +662,19 @@ fn a_move_before_any_hunk_still_joins_the_files() {
     let joined = patch(
         "*** Begin Patch\n*** Update File: b.py\n@@\n+# one\n*** Update File: a.py\n*** Move to: b.py\n@@\n+# two\n*** End Patch\n",
     );
-    assert!(denied(&joined));
-    assert!(reason(&joined).contains("b.py"));
-    assert!(reason(&joined).contains("2 block(s)"));
+    assert!(!denied(&joined));
+    let overlong = patch(
+        "*** Begin Patch\n*** Update File: b.py\n@@\n+# one\n+# two\n+# three\n*** Update File: a.py\n*** Move to: b.py\n@@\n+# four\n*** End Patch\n",
+    );
+    assert!(denied(&overlong));
+    assert!(reason(&overlong).contains("b.py"));
+    assert!(reason(&overlong).contains("block of 3 lines"), "{}", reason(&overlong));
     let split = patch(
         "*** Begin Patch\n*** Update File: a.py\n@@\n+# one\n+# two\n*** Update File: a.py\n*** Move to: c.py\n@@\n+# three\n+# four\n*** End Patch\n",
     );
     assert!(denied(&split));
     assert!(reason(&split).contains("c.py"));
-    assert!(reason(&split).contains("4 comment lines"));
+    assert!(reason(&split).contains("block of 4 lines"));
 }
 
 #[test]
@@ -715,6 +753,7 @@ fn hook_with(envs: &[(&str, &str)], config: Option<&str>, content: &str) -> Stri
         .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS")
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "0")
+        .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_MODE")
         .env("XDG_CONFIG_HOME", &dir);
     for (name, value) in envs {
         command.env(name, value);
@@ -735,7 +774,7 @@ fn the_comment_line_limit_can_be_tuned_by_environment_and_file() {
     assert!(hook_with(&[("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES", "3")], None, three).is_empty());
     assert!(hook_with(&[("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES", "5")], None, five).is_empty());
     let four = hook_with(&[("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES", "4")], None, five);
-    assert!(four.contains("deny") && four.contains("4 line(s)"), "{four}");
+    assert!(four.contains("deny") && four.contains("limit of 4 lines per block"), "{four}");
     assert!(hook_with(&[], Some("lines = 5\n"), five).is_empty());
     assert!(hook_with(&[("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES", "2")], Some("lines = 5\n"), five).contains("deny"));
     assert!(hook_with(&[], Some("lines = 99\n"), three).contains("deny"));
@@ -783,6 +822,7 @@ fn a_codex_trim_answers_with_the_documented_fields_only() {
         .args(["hook", "codex", "PreToolUse"])
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "1")
+        .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_MODE")
         .env("XDG_CONFIG_HOME", &dir)
         .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINES")
         .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_LINE_CHARS")
@@ -815,8 +855,8 @@ fn check_prints_the_limits_in_force() {
         }
         String::from_utf8_lossy(&command.output().expect("start").stdout).into_owned()
     };
-    assert!(run(None).contains("Limits: 3 comment line(s) per file, 50 characters per line."));
-    assert!(run(Some("7")).contains("Limits: 7 comment line(s) per file, 50 characters per line."));
+    assert!(run(None).contains("Limits: 3 comment line(s) per block, 50 characters per line."));
+    assert!(run(Some("7")).contains("Limits: 7 comment line(s) per block, 50 characters per line."));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -844,6 +884,7 @@ fn switch_env_var_turns_the_guard_on() {
         .arg("check")
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "YeS")
         .env("AGENT_SAFEGUARDS_COMMENT_GUARD_TRIM", "0")
+        .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD_MODE")
         .env("XDG_CONFIG_HOME", &dir)
         .output();
     let _ = std::fs::remove_dir_all(&dir);

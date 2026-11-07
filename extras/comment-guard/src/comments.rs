@@ -592,6 +592,11 @@ pub struct Scan<'a> {
     depth: u32,
     line_depth: u32,
     line_open: bool,
+    blank: bool,
+    coded: bool,
+    doc_line: bool,
+    block_doc: bool,
+    blk: DocEdge,
     doc: DocEdge,
 }
 
@@ -615,6 +620,11 @@ pub fn scan(text: &str, lang: Language) -> Scan<'_> {
         depth: 0,
         line_depth: 0,
         line_open: false,
+        blank: false,
+        coded: false,
+        doc_line: false,
+        block_doc: false,
+        blk: DocEdge::default(),
         doc: DocEdge::default(),
     }
 }
@@ -626,6 +636,9 @@ impl<'a> Iterator for Scan<'a> {
         loop {
             if let Some(text) = self.extra.pop_front() {
                 self.standalone = false;
+                self.blank = false;
+                self.doc_line = false;
+                self.blk = DocEdge::default();
                 self.doc = DocEdge::default();
                 if is_exempt(body(text)) || (self.lang.sentinel && is_sentinel(text)) {
                     continue;
@@ -636,6 +649,10 @@ impl<'a> Iterator for Scan<'a> {
             self.consumed = self.consumed.saturating_add(1);
             self.standalone = false;
             self.doc = DocEdge::default();
+            self.blank = line.trim().is_empty();
+            self.coded = false;
+            self.doc_line = false;
+            self.blk = DocEdge::default();
             self.line_depth = self.depth;
             self.line_open = !matches!(self.state, State::Code);
             return Some(match self.classify(line) {
@@ -675,6 +692,30 @@ impl<'a> Scan<'a> {
         self.doc.pure
     }
 
+    pub fn is_blank(&self) -> bool {
+        self.blank
+    }
+
+    pub fn is_doc_line(&self) -> bool {
+        self.doc_line
+    }
+
+    pub fn block_start(&self) -> bool {
+        self.blk.start
+    }
+
+    pub fn block_end(&self) -> bool {
+        self.blk.end
+    }
+
+    pub fn block_pure(&self) -> bool {
+        self.blk.pure
+    }
+
+    pub fn shares_line_with_code(&self) -> bool {
+        self.coded
+    }
+
     pub fn at_statement(&self) -> bool {
         self.line_depth == 0
     }
@@ -693,8 +734,12 @@ impl<'a> Scan<'a> {
                 let mut in_string = string;
                 let (left, end) =
                     block_scan(trimmed, open, close, self.lang.nested, depth, self.lang.comment_strings, &mut in_string);
+                self.doc_line = self.block_doc;
                 if left == 0 {
                     self.state = State::Code;
+                    self.block_doc = false;
+                    self.blk.end = true;
+                    self.blk.pure = trimmed.get(end..).is_none_or(|tail| tail.trim().is_empty());
                     self.trailing_after(trimmed.get(end..), close);
                     return LineKind::Comment(trimmed.get(..end).unwrap_or(trimmed));
                 }
@@ -758,6 +803,7 @@ impl<'a> Scan<'a> {
             self.state = State::Code;
         }
         if doc {
+            self.doc_line = true;
             if let Some(end) = closed {
                 let tail = trimmed.get(end.saturating_add(delim.len())..);
                 self.doc.end = true;
@@ -799,8 +845,12 @@ impl<'a> Scan<'a> {
                 }
                 let mut in_string = false;
                 let (left, end) = block_scan(rest, open, close, lang.nested, 1, lang.comment_strings, &mut in_string);
+                let is_doc = open == "/*" && (rest.starts_with('!') || (rest.starts_with('*') && !rest.starts_with("*/")));
+                self.doc_line = is_doc;
                 if left > 0 {
                     self.state = State::Block { open, close, depth: left, string: in_string };
+                    self.block_doc = is_doc;
+                    self.blk.start = !((open == "/*" && rest.starts_with(['+', '!', '#'])) || (open == "<!--" && rest.starts_with(['[', '#'])));
                     return Some(LineKind::Comment(trimmed));
                 }
                 let upto = open.len().saturating_add(end);
@@ -825,6 +875,8 @@ impl<'a> Scan<'a> {
                     self.state = State::Indent(line.len().saturating_sub(line.trim_start().len()));
                 }
                 self.standalone = !lang.markup && !lang.indent_block && !trimmed.ends_with('\\');
+                self.doc_line = marker == "//"
+                    && ((trimmed.starts_with("///") && !trimmed.starts_with("////")) || trimmed.starts_with("//!"));
                 return Some(LineKind::Comment(trimmed));
             }
         }
@@ -863,6 +915,7 @@ impl<'a> Scan<'a> {
             .copied()
             .find(|delim| stripped.starts_with(*delim))?;
         let after = stripped.get(delim.len()..)?;
+        self.doc_line = true;
         let leading = from.len() == trimmed.len() && self.lang.docstring;
         match find_unescaped(after, delim) {
             Some(end) => {
@@ -900,6 +953,7 @@ impl<'a> Scan<'a> {
     }
 
     fn code(&mut self, text: &'a str, start: Option<u8>) -> LineKind<'a> {
+        self.coded = true;
         let mut found: Vec<&'a str> = Vec::new();
         self.scan_code(text, start, &mut found);
         let mut found = found.into_iter();
@@ -992,6 +1046,7 @@ impl<'a> Scan<'a> {
                     let (left, end) = block_scan(tail, open, close, lang.nested, 1, lang.comment_strings, &mut in_string);
                     if left > 0 {
                         self.state = State::Block { open, close, depth: left, string: in_string };
+                        self.block_doc = false;
                         found.push(rest);
                         return;
                     }
