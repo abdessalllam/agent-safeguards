@@ -6,7 +6,7 @@ use guard_common::env;
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 
-use crate::{consts, keys, output};
+use crate::{consts, keys, output, startup_values};
 
 const MIN_CHARS: usize = 6;
 const MAX_VALUE_CHARS: usize = 4096;
@@ -285,18 +285,12 @@ fn from_files(home: &str) -> Collected {
     let (paths, mut complete) = startup_paths(home);
     let mut values = Vec::new();
     for path in paths {
-        let mut lines: Vec<String> = Vec::new();
-        let mut size = 0usize;
-        let read = keys::each_logical_line(&path, |line| {
-            size = size.saturating_add(line.len());
-            if size <= MAX_FILE_CHARS {
-                lines.push(line.to_owned());
-            }
-        });
-        if size > MAX_FILE_CHARS || matches!(read, Ok(keys::LineRead::Truncated)) {
+        let (text, read) = keys::read_text(&path, MAX_FILE_CHARS)
+            .unwrap_or((String::new(), keys::LineRead::Unreadable));
+        if matches!(read, keys::LineRead::Truncated) {
             complete = false;
         }
-        keys::values_in_lines(&lines, &mut values);
+        startup_values::values_in_text(&text, &mut values);
     }
     Collected { values, complete }
 }

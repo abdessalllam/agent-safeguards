@@ -19,4 +19,5 @@ pub mod redact;
 pub mod remote;
 pub mod selftest;
 pub mod startup;
+pub mod startup_values;
 pub mod words;

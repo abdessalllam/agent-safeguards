@@ -375,6 +375,72 @@ fn more_inline_forms_are_judged_by_what_they_read() {
 }
 
 #[test]
+fn multi_line_quotes_continuations_and_hashes_are_read_as_the_shell_reads_them() {
+    let protected = [
+        ("A='garden\npiano'\n", "garden\npiano"),
+        ("HELP='\n<<EOF\n'\nA=gardenpiano\ncat <<EOF\nhelp\nEOF\n", "gardenpiano"),
+        ("# sample command \\\nA=gardenpiano\n", "gardenpiano"),
+        ("A=gardenpiano\\\n", "gardenpiano"),
+        ("A='garden\\\npiano'\n", "garden\\\npiano"),
+        ("A=river#harp\n", "river#harp"),
+        ("A=$'garden\\cApiano'\n", "gardencApiano"),
+    ];
+    for (n, (rc, shown)) in protected.iter().enumerate() {
+        let h = home(&format!("shell{n}"), Some(rc));
+        let out = run(&h, "claude", "PostToolUse", &after("echo hi", &format!("{shown}\n")), &[]);
+        assert!(!allowed(&out), "fixture {n}: {out}");
+    }
+    let data = [
+        "HELP='\nA=always\n'\n",
+        "cat <<'EOF'\nA=always\nexample \\\nEOF\n",
+        "HELP=\"$(cat <<'EOF'\nA=always\nEOF\n)\"\n",
+        "cat <<''\nA=always\n\n",
+        "cat <<\"E\\\"OF\"\nA=always\nE\"OF\n",
+    ];
+    for (n, rc) in data.iter().enumerate() {
+        let h = home(&format!("data{n}"), Some(rc));
+        let out = run(&h, "claude", "PostToolUse", &after("echo hi", "this always succeeds\n"), &[]);
+        assert!(allowed(&out), "data fixture {n}: {out}");
+    }
+}
+
+#[test]
+fn local_declarations_and_assignments_inside_compound_commands_are_protected() {
+    let rcs = [
+        "setup() {\nlocal A=gardenpiano\nprintf '%s' \"$A\"\n}\nsetup\n",
+        "setup() { A=gardenpiano; }\nsetup\n",
+        "case yes in\n yes) A=gardenpiano;;\nesac\n",
+    ];
+    for (n, rc) in rcs.iter().enumerate() {
+        let h = home(&format!("compound{n}"), Some(rc));
+        let out = run(&h, "claude", "PostToolUse", &after("echo hi", "gardenpiano\n"), &[]);
+        assert!(withheld(&out, "gardenpiano"), "fixture {n}: {out}");
+    }
+}
+
+#[test]
+fn round_three_inline_forms_are_judged_by_what_they_read() {
+    let h = home("inline4", None);
+    for command in [
+        "python3 -c $'from os import environ\\nprint(dict(environ))'",
+        "node -e \"console.log(process[\\\"env\\\"])\"",
+        "node -e 'console.log(process.env.valueOf?.())'",
+        "node -e 'for (const k\n in process.env) console.log(process.env[k])'",
+    ] {
+        let out = run(&h, "claude", "PreToolUse", &before(command), &[]);
+        assert!(denied(&out), "{command}: {out}");
+    }
+    for command in [
+        "python3 -c 'import os; print(os.environ[\"env\"])'",
+        "ruby -e 'puts ENV[\"env\"]'",
+        "php -r 'echo getenv(name: \"FIXTURE_NAME\");'",
+    ] {
+        let out = run(&h, "claude", "PreToolUse", &before(command), &[]);
+        assert!(allowed(&out), "{command}: {out}");
+    }
+}
+
+#[test]
 fn spaced_inline_code_is_judged_like_the_compact_form() {
     let h = home("spaced", None);
     for command in [
