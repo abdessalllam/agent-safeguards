@@ -553,6 +553,47 @@ fn sources_the_text_does_not_fix_withhold_nothing_extra() {
 }
 
 #[test]
+fn globs_and_loop_variables_in_source_lines_are_followed() {
+    let lines = [
+        "for f in ~/.secrets.d/*.sh; do source \"$f\"; done",
+        "for name in alpha beta; do [ -f ~/.cfg/$name.env ] && . ~/.cfg/$name.env; done",
+        "for f in \"$HOME\"/.q/*; do . \"${f}\"; done",
+        "source ~/.more.d/*.env",
+    ];
+    let h = home("globs", Some(&format!("{}\n", lines.join("\n"))));
+    put(&h, ".secrets.d/one.sh", "export ONE_NAME=globvalue-one\n");
+    put(&h, ".secrets.d/two.sh", "export TWO_NAME=globvalue-two\n");
+    put(&h, ".secrets.d/.hidden.sh", "export HID_NAME=globvalue-hidden\n");
+    put(&h, ".secrets.d/skip.txt", "export TXT_NAME=globvalue-text\n");
+    put(&h, ".cfg/beta.env", "export BETA_NAME=loopvalue-beta\n");
+    put(&h, ".q/anything", "export Q_NAME=loopvalue-quoted\n");
+    put(&h, ".more.d/x.env", "export X_NAME=globvalue-direct\n");
+    for value in ["globvalue-one", "globvalue-two", "loopvalue-beta", "loopvalue-quoted", "globvalue-direct"] {
+        assert!(withheld(&shown(&h, &format!("{value}\n")), value), "{value}");
+    }
+    for value in ["globvalue-hidden", "globvalue-text"] {
+        assert!(allowed(&shown(&h, &format!("{value}\n"))), "{value}");
+    }
+}
+
+#[test]
+fn a_sourced_file_is_protected_completely_even_when_it_defines_functions() {
+    let program = [
+        "__prompt_part() {",
+        "  local r='|MERGING'",
+        "}",
+        "PROMPT_PART='|REBASING'",
+        "PLAIN_NAME=hunter2x",
+        "OPTIONS='--cached --directory --others'",
+    ];
+    let h = home("program", Some("source ~/.prog.sh\nfunction own() { :; }\nenvkey=value1\n"));
+    put(&h, ".prog.sh", &format!("{}\n", program.join("\n")));
+    for value in ["|MERGING", "|REBASING", "hunter2x", "--cached --directory --others", "value1"] {
+        assert!(withheld(&shown(&h, &format!("seen {value}\n")), value), "{value}");
+    }
+}
+
+#[test]
 fn sourced_values_follow_the_same_rules_as_startup_values() {
     let h = home("rules", Some("source ~/.rules\n"));
     let text = "export SHORT=ab12\nexport NUM=123456789\nexport WHERE=/usr/bin\nalias ll='ls -la'\n";

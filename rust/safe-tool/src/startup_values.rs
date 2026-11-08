@@ -362,6 +362,7 @@ pub struct Scan {
     pub values: Vec<(bool, String)>,
     pub sources: Vec<String>,
     pub vars: Vec<(String, String)>,
+    pub loops: Vec<(String, Vec<String>)>,
 }
 
 const OPENERS: [&str; 6] = ["then", "do", "else", "!", "{", "builtin"];
@@ -378,11 +379,15 @@ fn sourced_operand(command: &[Word]) -> Option<&str> {
     words.find(|word| !word.text.starts_with('-')).map(|word| word.text.as_str())
 }
 
-fn assignment(word: &Word) -> Option<(String, String)> {
+// The name before the `=` of an assignment word, without the `+` of `NAME+=value`.
+fn assigned_name(word: &Word) -> Option<&str> {
     let value = word.value.as_deref()?;
     let end = word.text.len().checked_sub(value.len())?.checked_sub(1)?;
-    let name = word.text.get(..end)?;
-    (!name.ends_with('+')).then(|| (name.to_owned(), value.to_owned()))
+    word.text.get(..end)
+}
+
+fn identifier(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn collect(commands: Vec<Vec<Word>>, scan: &mut Scan) {
@@ -403,9 +408,7 @@ fn collect(commands: Vec<Vec<Word>>, scan: &mut Scan) {
             }
             Some("set") => {
                 let mut operands = command.iter().skip(1).filter(|word| !word.text.starts_with('-'));
-                if let Some(name) = operands.next().filter(|name| {
-                    !name.text.is_empty() && name.text.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-                }) {
+                if let Some(name) = operands.next().filter(|name| identifier(&name.text)) {
                     let rest: Vec<&Word> = operands.collect();
                     if let Some(first_value) = rest.first() {
                         scan.vars.push((name.text.clone(), first_value.text.clone()));
@@ -413,14 +416,22 @@ fn collect(commands: Vec<Vec<Word>>, scan: &mut Scan) {
                     scan.values.extend(rest.iter().map(|word| (false, word.text.clone())));
                 }
             }
+            Some("for") if command.get(2).is_some_and(|word| word.text == "in") => {
+                if let Some(name) = command.get(1).filter(|name| identifier(&name.text)) {
+                    scan.loops.push((name.text.clone(), command.iter().skip(3).map(|word| word.text.clone()).collect()));
+                }
+            }
             _ => {}
         }
         if first != Some("alias") {
             for word in &command {
-                if let Some(value) = &word.value {
-                    scan.values.push((false, value.clone()));
+                let (Some(value), Some(name)) = (&word.value, assigned_name(word)) else {
+                    continue;
+                };
+                scan.values.push((false, value.clone()));
+                if !name.ends_with('+') {
+                    scan.vars.push((name.to_owned(), value.clone()));
                 }
-                scan.vars.extend(assignment(word));
             }
         }
     }
@@ -541,6 +552,15 @@ mod tests {
         assert!(sources("alias s='source ~/.x'\n").is_empty());
         assert!(sources("source\n").is_empty());
         assert!(sources("sourcefile ~/.x\n").is_empty());
+    }
+
+    #[test]
+    fn for_loops_record_the_variable_and_its_words() {
+        let scan = scanned("for f in ~/.a/*.sh \"$HOME/b\" c; do source \"$f\"; done\nfor x; do :; done\nfor (( i=0;i<3;i++ )); do :; done\n");
+        assert_eq!(scan.loops.len(), 1);
+        assert_eq!(scan.loops.first().map(|(name, _)| name.as_str()), Some("f"));
+        assert_eq!(scan.loops.first().map(|(_, words)| words.clone()), Some(vec!["~/.a/*.sh".to_owned(), "$HOME/b".to_owned(), "c".to_owned()]));
+        assert_eq!(scan.sources, ["$f"]);
     }
 
     #[test]
