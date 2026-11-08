@@ -6,7 +6,7 @@ use guard_common::env;
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 
-use crate::{consts, keys, output, startup_values};
+use crate::{consts, keys, output, sourced, startup_values};
 
 const MIN_CHARS: usize = 6;
 const MAX_VALUE_CHARS: usize = 4096;
@@ -283,16 +283,20 @@ fn build(collected: Collected, process: Vec<String>, home: &str) -> Matcher {
 
 fn from_files(home: &str) -> Collected {
     let (paths, mut complete) = startup_paths(home);
-    let mut values = Vec::new();
-    for path in paths {
-        let (text, read) = keys::read_text(&path, MAX_FILE_CHARS)
+    let mut scan = startup_values::Scan::default();
+    for path in &paths {
+        let (text, read) = keys::read_text(path, MAX_FILE_CHARS)
             .unwrap_or((String::new(), keys::LineRead::Unreadable));
         if matches!(read, keys::LineRead::Truncated) {
             complete = false;
         }
-        startup_values::values_in_text(&text, &mut values);
+        startup_values::scan_text(&text, &mut scan);
     }
-    Collected { values, complete }
+    let env = |name: &str| std::env::var(name).ok();
+    if !sourced::follow(home, &mut scan, &paths, MAX_FILE_CHARS, &sourced::STANDARD, &env) {
+        complete = false;
+    }
+    Collected { values: scan.values, complete }
 }
 
 fn from_process() -> Vec<String> {

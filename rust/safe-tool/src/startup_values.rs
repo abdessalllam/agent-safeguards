@@ -357,37 +357,77 @@ impl Lexer<'_> {
     }
 }
 
-fn collect(commands: Vec<Vec<Word>>, out: &mut Vec<(bool, String)>) {
+#[derive(Default)]
+pub struct Scan {
+    pub values: Vec<(bool, String)>,
+    pub sources: Vec<String>,
+    pub vars: Vec<(String, String)>,
+}
+
+const OPENERS: [&str; 6] = ["then", "do", "else", "!", "{", "builtin"];
+
+// The first operand of a `source` or `.` command, after words that only open a command.
+fn sourced_operand(command: &[Word]) -> Option<&str> {
+    let mut words = command
+        .iter()
+        .skip_while(|word| word.value.is_some() || OPENERS.contains(&word.text.as_str()));
+    let head = words.next()?;
+    if head.text != "source" && head.text != "." {
+        return None;
+    }
+    words.find(|word| !word.text.starts_with('-')).map(|word| word.text.as_str())
+}
+
+fn assignment(word: &Word) -> Option<(String, String)> {
+    let value = word.value.as_deref()?;
+    let end = word.text.len().checked_sub(value.len())?.checked_sub(1)?;
+    let name = word.text.get(..end)?;
+    (!name.ends_with('+')).then(|| (name.to_owned(), value.to_owned()))
+}
+
+fn collect(commands: Vec<Vec<Word>>, scan: &mut Scan) {
     for command in commands {
+        if let Some(operand) = sourced_operand(&command) {
+            scan.sources.push(operand.to_owned());
+        }
         let first = command.first().map(|word| word.text.as_str());
         match first {
             Some("alias") => {
                 for word in command.iter().skip(1).filter(|word| !word.text.starts_with('-')) {
                     if let Some((name, body)) = word.text.split_once('=') {
                         if !name.is_empty() {
-                            out.push((true, body.to_owned()));
+                            scan.values.push((true, body.to_owned()));
                         }
                     }
                 }
             }
             Some("set") => {
                 let mut operands = command.iter().skip(1).filter(|word| !word.text.starts_with('-'));
-                if operands.next().is_some_and(|name| {
+                if let Some(name) = operands.next().filter(|name| {
                     !name.text.is_empty() && name.text.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
                 }) {
-                    out.extend(operands.map(|word| (false, word.text.clone())));
+                    let rest: Vec<&Word> = operands.collect();
+                    if let Some(first_value) = rest.first() {
+                        scan.vars.push((name.text.clone(), first_value.text.clone()));
+                    }
+                    scan.values.extend(rest.iter().map(|word| (false, word.text.clone())));
                 }
             }
             _ => {}
         }
         if first != Some("alias") {
-            out.extend(command.iter().filter_map(|word| word.value.clone()).map(|value| (false, value)));
+            for word in &command {
+                if let Some(value) = &word.value {
+                    scan.values.push((false, value.clone()));
+                }
+                scan.vars.extend(assignment(word));
+            }
         }
     }
 }
 
-// Every unquoted NAME=value word and alias body, read as the shell reads the text.
-pub fn values_in_text(text: &str, out: &mut Vec<(bool, String)>) {
+// Every NAME=value word, alias body and `source` operand, read as the shell reads it.
+pub fn scan_text(text: &str, scan: &mut Scan) {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut exact: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut stripped: HashMap<&str, Vec<usize>> = HashMap::new();
@@ -413,18 +453,26 @@ pub fn values_in_text(text: &str, out: &mut Vec<(bool, String)>) {
             stripped: stripped.clone(),
             variant: *variant,
         };
-        collect(lexer.commands(), out);
+        collect(lexer.commands(), scan);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::values_in_text;
+    use super::{scan_text, Scan};
+
+    fn scanned(text: &str) -> Scan {
+        let mut scan = Scan::default();
+        scan_text(text, &mut scan);
+        scan
+    }
 
     fn values(text: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        values_in_text(text, &mut out);
-        out.into_iter().map(|(_, value)| value).collect()
+        scanned(text).values.into_iter().map(|(_, value)| value).collect()
+    }
+
+    fn sources(text: &str) -> Vec<String> {
+        scanned(text).sources
     }
 
     fn has(text: &str, value: &str) -> bool {
@@ -470,5 +518,38 @@ mod tests {
         assert!(has("A=$'garden\\cApiano'\n", "garden\u{1}piano"));
         assert!(has("A=$'garden\\cApiano'\n", "gardencApiano"));
         assert!(has("A=$'gardenpiano\\0tail'\n", "gardenpiano"));
+    }
+
+    #[test]
+    fn source_operands_are_found_where_a_command_can_start() {
+        assert_eq!(sources("source ~/.secrets\n"), ["~/.secrets"]);
+        assert_eq!(sources(". \"$HOME/.secrets\"\n"), ["$HOME/.secrets"]);
+        assert_eq!(sources("[ -f ~/.x ] && source ~/.x\n"), ["~/.x"]);
+        assert_eq!(sources("if [ -r ~/.x ]; then . ~/.x; fi\n"), ["~/.x"]);
+        assert_eq!(sources("f() { source ~/.x; }\n"), ["~/.x"]);
+        assert_eq!(sources("case a in a) source ~/.x ;; esac\n"), ["~/.x"]);
+        assert_eq!(sources("FOO=1 source ~/.x arg\n"), ["~/.x"]);
+        assert_eq!(sources("builtin source ~/.x\n"), ["~/.x"]);
+        assert_eq!(sources("source -- ~/.x\n"), ["~/.x"]);
+    }
+
+    #[test]
+    fn text_that_only_mentions_source_is_not_a_source_command() {
+        assert!(sources("echo source ~/.x\n").is_empty());
+        assert!(sources("# source ~/.x\n").is_empty());
+        assert!(sources("cat <<EOF\nsource ~/.x\nEOF\n").is_empty());
+        assert!(sources("alias s='source ~/.x'\n").is_empty());
+        assert!(sources("source\n").is_empty());
+        assert!(sources("sourcefile ~/.x\n").is_empty());
+    }
+
+    #[test]
+    fn assignments_are_recorded_as_names_and_values() {
+        let scan = scanned("export ZSH=\"$HOME/.zsh\"\nA+=more\nlocal B=two\nset -gx C three\n");
+        let has_var = |name: &str, value: &str| scan.vars.iter().any(|(n, v)| n == name && v == value);
+        assert!(has_var("ZSH", "$HOME/.zsh"));
+        assert!(has_var("B", "two"));
+        assert!(has_var("C", "three"));
+        assert!(!scan.vars.iter().any(|(name, _)| name.starts_with('A')));
     }
 }

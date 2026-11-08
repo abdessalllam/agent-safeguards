@@ -459,3 +459,122 @@ fn spaced_inline_code_is_judged_like_the_compact_form() {
         assert!(allowed(&out), "{command}: {out}");
     }
 }
+
+fn shown(h: &Home, text: &str) -> String {
+    run(h, "claude", "PostToolUse", &after("echo hi", text), &[])
+}
+
+#[test]
+fn values_in_a_sourced_file_are_withheld_and_key_names_are_not() {
+    let h = home("sourced", Some("source ~/.secrets\n"));
+    put(&h, ".secrets", "export SERVICE_NAME_X=orchardlantern94\nOTHER='lantern-vault-77'\n");
+    for value in ["orchardlantern94", "lantern-vault-77"] {
+        let out = shown(&h, &format!("seen {value} here\n"));
+        assert!(withheld(&out, value), "{value}: {out}");
+    }
+    assert!(allowed(&shown(&h, "SERVICE_NAME_X OTHER hello world\n")));
+    let read = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "tool_input": { "file_path": "/tmp/x" },
+        "tool_response": { "type": "text", "file": { "content": "line one\nexport K=orchardlantern94\n" } },
+    });
+    let out = run(&h, "claude", "PostToolUse", &read, &[]);
+    assert!(withheld(&out, "orchardlantern94"), "{out}");
+}
+
+#[test]
+fn every_way_to_write_a_source_that_the_text_fixes_is_followed() {
+    let forms: [(&str, &str); 12] = [
+        (". ~/.f0\n", ".f0"),
+        ("source \"$HOME/.f1\"\n", ".f1"),
+        ("[ -f ~/.f2 ] && source ~/.f2\n", ".f2"),
+        ("if [ -r $HOME/.f3 ]; then . $HOME/.f3; fi\n", ".f3"),
+        ("ZDIR=$HOME/.f4dir\nsource $ZDIR/env\n", ".f4dir/env"),
+        ("export BASE=\"$HOME/.f5\"\nexport TWO=$BASE/deeper\nsource \"${TWO}/env\"\n", ".f5/deeper/env"),
+        ("source ${XDG_CONFIG_HOME:-$HOME/.config}/f6/env\n", ".config/f6/env"),
+        ("source ./f7.env\n", "f7.env"),
+        ("f() { source ~/.f8; }\n", ".f8"),
+        ("source ~/.f9 extra args\n", ".f9"),
+        ("case $TERM in *) source ~/.f10 ;; esac\n", ".f10"),
+        ("builtin source ~/.f11\n", ".f11"),
+    ];
+    for (index, (rc, file)) in forms.iter().enumerate() {
+        let h = home(&format!("form{index}"), Some(rc));
+        let value = format!("sourcedvalue-form{index}");
+        put(&h, file, &format!("export FORM_NAME={value}\n"));
+        let out = shown(&h, &format!("{value}\n"));
+        assert!(withheld(&out, &value), "{rc:?}: {out}");
+    }
+    let h = home("absolute", None);
+    put(&h, ".zshrc", &format!("source {}/.abs\n", h.0.display()));
+    put(&h, ".abs", "export ABS_NAME=sourcedvalue-abs\n");
+    assert!(withheld(&shown(&h, "sourcedvalue-abs\n"), "sourcedvalue-abs"));
+    let h = home("linked", Some("source ~/.link\n"));
+    put(&h, ".real", "export LINK_NAME=sourcedvalue-link\n");
+    std::os::unix::fs::symlink(h.0.join(".real"), h.0.join(".link")).expect("symlink");
+    assert!(withheld(&shown(&h, "sourcedvalue-link\n"), "sourcedvalue-link"));
+}
+
+#[test]
+fn sourced_files_are_followed_through_several_levels_and_loops() {
+    let h = home("levels", Some("source ~/.l1\n"));
+    put(&h, ".l1", "source ~/.l2\n");
+    put(&h, ".l2", "source ~/.l3\nsource ~/.zshrc\nsource ~/.l1\nsource ~/.l2\n");
+    put(&h, ".l3", "export DEEP_NAME=deepvalue-123\nsource $LATER/env\nLATER=$HOME/.l4dir\n");
+    put(&h, ".l4dir/env", "export LATE_NAME=latevalue-456\n");
+    for value in ["deepvalue-123", "latevalue-456"] {
+        assert!(withheld(&shown(&h, &format!("{value}\n")), value), "{value}");
+    }
+}
+
+#[test]
+fn sources_the_text_does_not_fix_withhold_nothing_extra() {
+    let lines = [
+        "source ~/.missing",
+        "source $UNSET_NAME/x",
+        "source $(echo x)",
+        "source <(echo B=y)",
+        "for f in ~/.d/a*.sh; do source $f; done",
+        "source ~/.somedir",
+        "source /dev/null",
+        "echo source ~/.quoted",
+        "source ~/.pipe",
+        "source ~/.d/a.sh",
+    ];
+    let h = home("unfixed", Some(&format!("{}\n", lines.join("\n"))));
+    put(&h, ".quoted", "export Q_NAME=notfollowed-1\n");
+    put(&h, ".somedir/inner", "export S_NAME=notfollowed-2\n");
+    put(&h, ".d/a.sh", "export D_NAME=followed-three\n");
+    let fifo = std::process::Command::new("mkfifo").arg(h.0.join(".pipe")).status();
+    assert!(fifo.is_ok_and(|status| status.success()), "mkfifo");
+    assert!(allowed(&shown(&h, "hello world notfollowed-1 notfollowed-2\n")));
+    assert!(withheld(&shown(&h, "followed-three\n"), "followed-three"));
+}
+
+#[test]
+fn sourced_values_follow_the_same_rules_as_startup_values() {
+    let h = home("rules", Some("source ~/.rules\n"));
+    let text = "export SHORT=ab12\nexport NUM=123456789\nexport WHERE=/usr/bin\nalias ll='ls -la'\n";
+    put(&h, ".rules", text);
+    assert!(allowed(&shown(&h, "ab12 123456789 /usr/bin ls -la\n")));
+}
+
+#[test]
+fn sourced_files_too_large_to_check_withhold_every_result_and_say_why() {
+    let long = vec![(".s".to_owned(), format!("export HUGE={}\n", "y".repeat(5000)))];
+    let lines = vec![(".s".to_owned(), "# c\n".repeat(20001))];
+    let count: Vec<(String, String)> = (0..501)
+        .map(|n| (format!(".s/f{n:03}"), "# nothing\n".to_owned()))
+        .collect();
+    for (name, files) in [("long", long), ("lines", lines), ("count", count)] {
+        let rc: String = files.iter().map(|(file, _)| format!("source ~/{file}\n")).collect();
+        let h = home(name, Some(&rc));
+        for (file, text) in &files {
+            put(&h, file, text);
+        }
+        let out = shown(&h, "hello world\n");
+        assert!(withheld(&out, "hello world"), "{name}: {out}");
+        assert!(why_coverage(&out), "{name}: {out}");
+    }
+}

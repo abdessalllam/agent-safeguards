@@ -18,6 +18,7 @@ pub mod protected;
 pub mod redact;
 pub mod remote;
 pub mod selftest;
+pub mod sourced;
 pub mod startup;
 pub mod startup_values;
 pub mod words;
