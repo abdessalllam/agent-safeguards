@@ -460,6 +460,39 @@ fn spaced_inline_code_is_judged_like_the_compact_form() {
     }
 }
 
+fn denial(h: &Home, command: &str) -> String {
+    let out = run(h, "claude", "PreToolUse", &before(command), &[]);
+    let parsed: Value = serde_json::from_str(out.trim()).unwrap_or(Value::Null);
+    parsed["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap_or("").to_owned()
+}
+
+#[test]
+fn a_find_over_the_home_folder_in_a_pipe_is_refused_with_what_works_instead() {
+    let h = home("findmsg", None);
+    let base = h.0.display();
+    let find_message = guard_common::locale::message("safe_tool.deny.startup_find", &[]);
+    let file_message = guard_common::locale::message("safe_tool.deny.startup_file", &[]);
+    assert_ne!(find_message, file_message);
+    for command in [
+        format!("find {base} -xdev -type f -mtime -1 -size +200M -print | head -60 | while read f; do du -sk \"$f\"; done"),
+        format!("find {base} -type f | wc -l"),
+        format!("find {base} -type f -size +200M -print | xargs du -sk"),
+    ] {
+        assert_eq!(denial(&h, &command), find_message, "{command}");
+    }
+    for command in [format!("cat {base}/.zshrc | head"), format!("find {base} -name .zshrc | head; cat {base}/.zshrc")] {
+        assert_eq!(denial(&h, &command), file_message, "{command}");
+    }
+    for command in [
+        format!("find {base} -type f -size +200M -ls"),
+        format!("find {base} -type f -size +200M -print > {base}/list.txt"),
+        format!("sort {base}/list.txt | head"),
+        format!("du -d1 -k {base} | sort -rn | head"),
+    ] {
+        assert!(allowed(&run(&h, "claude", "PreToolUse", &before(&command), &[])), "{command}");
+    }
+}
+
 fn shown(h: &Home, text: &str) -> String {
     run(h, "claude", "PostToolUse", &after("echo hi", text), &[])
 }

@@ -67,6 +67,7 @@
   "safe_tool.deny.rtk": "RTK is required for this supported shell command. Rerun it through rtk.",
   "safe_tool.deny.sensitive": "Sensitive-output command blocked. Use safe-tool or ask the user to run it outside the agent.",
   "safe_tool.deny.startup_file": "Shell startup and history files can hold secrets, so they are not read. Reload one with `source <file>`, or check whether a key is set with `safe-tool has-key <NAME>`, which prints NAME=pass, NAME=fail or NAME=unknown and never the value.",
+  "safe_tool.deny.startup_find": "Shell startup and history files can hold secrets, so a `find` over a folder that holds some (your home folder, `.cache`) cannot feed a pipe, a loop or `-exec`: the list could be passed to `cat`. Run it without a pipe: `find <folder> -type f -size +200M -ls`, or `du -d1 -k <folder>`. To sort or cut the list, write it to a file with `> file` and run `sort file | head` as a separate command.",
   "safe_tool.deny.too_slow": "agent-safeguards could not finish checking this command in time and blocked it. Split it into smaller commands, or ask the user to run it outside the agent.",
   "safe_tool.redact.too_large": "[output larger than {kilobytes} KB, withheld]",
   "safe_tool.remote.reason.command": "`{name}` is not on the read list",

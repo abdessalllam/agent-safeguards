@@ -1992,7 +1992,12 @@ def _handle_event(runtime: str, event: str, payload: dict[str, Any]) -> None:
                 _deny_hook("safe_tool.deny.proxy")
             else:
                 if _blocked_only_by_startup_file(command):
-                    _deny_hook("safe_tool.deny.startup_file")
+                    find_alone = (
+                        _find_names_startup_file(command)
+                        and not _mentions_startup_file(command)
+                        and not _glob_names_startup_file(command)
+                    )
+                    _deny_hook("safe_tool.deny.startup_find" if find_alone else "safe_tool.deny.startup_file")
                 elif _blocked_by_git_format(command):
                     _deny_hook("safe_tool.deny.git_format")
                 else:

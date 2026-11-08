@@ -9,7 +9,7 @@ use guard_common::{env, locale, pyglob, secret_scan};
 use regex::bytes::Regex;
 use serde_json::{Map, Value};
 
-use crate::{command, consts, local_only, output, protected};
+use crate::{command, consts, local_only, output, protected, startup};
 
 pub const READ_DEFAULT_LINES: usize = 2_000;
 pub const READ_LINE_CHARACTERS: usize = 2_000;
@@ -325,7 +325,11 @@ pub fn handle_event(runtime: &str, event: &str, payload: &Value) -> Result<(), H
             } else if command::blocked_only_by_startup_file(text)
                 .map_err(|_| HookError::Internal)?
             {
-                "safe_tool.deny.startup_file"
+                if startup::blocked_by_find_alone(text).map_err(|_| HookError::Internal)? {
+                    "safe_tool.deny.startup_find"
+                } else {
+                    "safe_tool.deny.startup_file"
+                }
             } else if command::blocked_by_git_format(text).map_err(|_| HookError::Internal)? {
                 "safe_tool.deny.git_format"
             } else {

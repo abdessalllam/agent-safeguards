@@ -284,7 +284,12 @@ pub fn find_names_startup_file_at(
         }))
 }
 
-pub fn mentions_startup_file(text: &str) -> bool {
+// True when only the find rule fires: no startup file is named or globbed in the text.
+pub fn blocked_by_find_alone(text: &str) -> Result<bool, EmbeddedNul> {
+    Ok(find_names_startup_file(text)? && !mentions_startup_file(text) && !glob_names_startup_file(text)?)
+}
+
+pub fn mentions_startup_file(text:&str) -> bool {
     let joined = text.replace("\\\n", "");
     let stripped_dollar = DOLLAR_QUOTE.replace_all(&joined, "${1}");
     let plain = PLAIN_QUOTES.replace_all(&stripped_dollar, "");
