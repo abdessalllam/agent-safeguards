@@ -32,7 +32,7 @@ def record(name, args, call, fixture=""):
     ROWS.append({"fn": name, "args": replace(args, fixture), "ret": replace(result, fixture), "exc": exception})
 
 
-patterns = ["", "*", "?", "**", "a[b-d]?", "[!a]*", "[^a]*", "[]x]", "\\*a", "a[", "[z-a]", "a.b", "*a*b*", "*a*a*ab", "[[:digit:]]x", "[[:alpha:]]*", "[^[:upper:][:digit:]]*", "[[:bogus:]]*", "[[:punct:]]*", "[[:space:]]", "é?", "[αβ]", "[[:cntrl:]]", "[[:word:]]"]
+patterns = ["", "*", "?", "**", "a[b-d]?", "[!a]*", "[^a]*", "[]x]", "\\*a", "a[", "[z-a]", "[w-t]", "[\u00e9-t]", "[?-!]", "[a-m-c]", "[--+]", "[a-[:bogus:]", "x[z-a]y", "a.b", "*a*b*", "*a*a*ab", "[[:digit:]]x", "[[:alpha:]]*", "[^[:upper:][:digit:]]*", "[[:bogus:]]*", "[[:punct:]]*", "[[:space:]]", "é?", "[αβ]", "[[:cntrl:]]", "[[:word:]]"]
 names = ["", "a", "acx", "aex", "bcd", "abc", "]", "*a", "ba", "a[", "a.b", "axb", "xxaxxbxx", "aaaaaaaab", "aaaaaaaac", "7x", "ax", "éx", "α", "\n", "\x1c", ".hidden"]
 randomizer = random.Random(20261107)
 alphabet = "ab*?[]!^-:éα0 \n"

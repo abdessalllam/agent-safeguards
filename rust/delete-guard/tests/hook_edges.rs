@@ -76,6 +76,14 @@ fn the_recursion_budget_matches_python_for_eval_remote_and_substitution_chains()
 }
 
 #[test]
+fn a_word_with_a_backwards_bracket_range_is_not_an_internal_error() {
+    let home = home("ranges");
+    let heredoc = "python3 - <<'EOF'\nhandle.write(\"- [a how-to](f.md) the trash/delete table\")\nEOF\n";
+    assert!(!internal(&home, heredoc));
+    assert!(!internal(&home, "./[z-a]script.sh"));
+}
+
+#[test]
 fn an_empty_cwd_is_an_unknown_folder_and_a_relative_workdir_joins_it_as_python_does() {
     let home = home("cwd");
     let unknown = json!({ "cwd": "", "tool_input": { "command": "rm -r build" } });

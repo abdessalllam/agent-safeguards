@@ -765,6 +765,11 @@ def _glob_tokens(pattern: str) -> list[tuple[str, object]]:
                         members.append((POSIX_CLASSES_ASCII if negate else POSIX_CLASSES)[name])
                         position = end + 2
                         continue
+                # A backwards range matches nothing in a shell; take its characters as they stand.
+                if position + 2 < length and pattern[position + 1] == "-" and pattern[position + 2] != "]" and pattern[position] > pattern[position + 2]:
+                    members.append(re.escape(pattern[position]) + "\\-" + re.escape(pattern[position + 2]))
+                    position += 3
+                    continue
                 members.append("-" if pattern[position] == "-" else re.escape(pattern[position]))
                 position += 1
             if position >= length:

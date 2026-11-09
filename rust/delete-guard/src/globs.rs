@@ -330,6 +330,18 @@ pub fn glob_tokens(pattern: &str) -> Result<Vec<GlobToken>, GlobError> {
                             }
                         }
                     }
+                    if let (Some('-'), Some(&end)) = (
+                        chars.get(position.saturating_add(1)).copied(),
+                        chars.get(position.saturating_add(2)),
+                    ) {
+                        if end != ']' && ch > end {
+                            members.push_str(&python_escape(ch));
+                            members.push_str("\\-");
+                            members.push_str(&python_escape(end));
+                            position = position.saturating_add(3);
+                            continue;
+                        }
+                    }
                     if ch == '-' {
                         members.push('-')
                     } else {
@@ -425,9 +437,14 @@ mod tests {
     }
 
     #[test]
-    fn doubled_hyphens_keep_python_range_rules() {
-        assert!(glob_tokens("[a--]").is_err());
-        assert!(glob_tokens("[--*]").is_err());
+    fn a_backwards_range_is_its_own_characters_and_a_forward_one_stays_a_range() {
+        let backwards = glob_tokens("[a--]").expect("characters");
+        for (name, expected) in [("a", true), ("-", true), ("b", false)] {
+            assert_eq!(glob_match(&backwards, name).expect("match"), expected, "{name}");
+        }
+        let stars = glob_tokens("[--*]").expect("characters");
+        assert!(glob_match(&stars, "*").expect("match"));
+        assert!(!glob_match(&stars, "+").expect("match"));
         let range = glob_tokens("[--a]").expect("range");
         assert!(glob_match(&range, "0").expect("match"));
         assert!(!glob_match(&range, "é").expect("match"));
