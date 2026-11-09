@@ -119,42 +119,34 @@ pub fn check_resolved(
     {
         return Ok(());
     }
-    let root = repository_root(cwd);
-    let Some(root) = root else {
-        return Err(denial(
-            "delete_guard.reason.outside_repository",
-            &[("verb", path_value(verb)), ("path", path_value(resolved))],
-        ));
-    };
-    if !inside(resolved, &root) {
-        return Err(denial(
-            "delete_guard.reason.outside_repository",
-            &[("verb", path_value(verb)), ("path", path_value(resolved))],
-        ));
+    if let Some(root) = repository_root(cwd).filter(|root| inside(resolved, root)) {
+        if resolved == root {
+            return Err(denial(
+                "delete_guard.reason.repository_root",
+                &[("verb", path_value(verb)), ("path", path_value(resolved))],
+            ));
+        }
+        let git = format!("{root}/.git");
+        if resolved == git || inside(resolved, &git) {
+            return Err(denial(
+                "delete_guard.reason.git_metadata",
+                &[("verb", path_value(verb)), ("path", path_value(resolved))],
+            ));
+        }
+        if recursive
+            && fs::metadata(resolved).is_ok_and(|metadata| metadata.is_dir())
+            && fs::metadata(format!("{resolved}/.git")).is_ok_and(|metadata| metadata.is_file())
+        {
+            return Err(denial(
+                "delete_guard.reason.worktree",
+                &[("path", path_value(resolved))],
+            ));
+        }
     }
-    if resolved == root {
-        return Err(denial(
-            "delete_guard.reason.repository_root",
-            &[("verb", path_value(verb)), ("path", path_value(resolved))],
-        ));
-    }
-    let git = format!("{root}/.git");
-    if resolved == git || inside(resolved, &git) {
-        return Err(denial(
-            "delete_guard.reason.git_metadata",
-            &[("verb", path_value(verb)), ("path", path_value(resolved))],
-        ));
-    }
-    if recursive
-        && fs::metadata(resolved).is_ok_and(|metadata| metadata.is_dir())
-        && fs::metadata(format!("{resolved}/.git")).is_ok_and(|metadata| metadata.is_file())
-    {
-        return Err(denial(
-            "delete_guard.reason.worktree",
-            &[("path", path_value(resolved))],
-        ));
-    }
-    Ok(())
+    Err(denial(
+        "delete_guard.reason.permanent_delete",
+        &[("verb", path_value(verb)), ("path", path_value(resolved))],
+    ))
 }
 
 pub fn check_sendable(resolved: &str) -> Result<(), Stop> {

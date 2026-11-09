@@ -8,7 +8,7 @@ description: 'Use when a shell command is blocked by safe-tool or delete-guard, 
 Two hooks check every shell command before it runs. safe-tool also checks the output after it ran.
 
 - **safe-tool** blocks commands that print identity or credential data and withholds output that contains it, so it never reaches the transcript.
-- **delete-guard** blocks deletes that could wipe data outside the current repository or a temp folder.
+- **delete-guard** blocks permanent deletes outside a temp folder (use `trash <path>` for anything else) and refuses to remove or trash a whole repository.
 
 ## A block is a rewrite signal, not a stop
 
@@ -87,7 +87,7 @@ Two more decisions you may see:
 
 The refusal reads `Delete guard: <reason>.` It blocks:
 
-- recursive `rm`, `find ... -delete` or `-exec rm`, and `rsync --delete` whose target is outside the current repository, worktree, or a temp folder. Your home folder, its top-level folders, system folders, mount points, and the temp roots themselves (`/tmp`, `/var/folders`) are always refused, and so are the root and `.git` of the repository you are working in. A repository that lives inside a temp folder is exempt;
+- `rm`, `find ... -delete` or `-exec rm`, and `rsync --delete` whose target is not inside a temp folder, also inside the current repository or worktree. The refusal says to send the file or folder to the Trash with `trash <path>`. Your home folder, its top-level folders, system folders, mount points, and the temp roots themselves (`/tmp`, `/var/folders`) are always refused, and so are the root and `.git` of the repository you are working in. A repository that lives inside a temp folder is exempt;
 - recursive targets built from variables (`$X`), command substitution, or a bare glob such as `*`;
 - `xargs rm`, `git clean` (except a `-n` dry run), inline code that deletes folders recursively (`shutil.rmtree`, `fs.rmSync` with `recursive`), and disk-erase commands (`mkfs`, `shred`, `diskutil erase...`, `dd of=/dev/...`);
 - a recursive delete of a Git worktree folder, outside temp folders;

@@ -600,36 +600,47 @@ MAX_REPOSITORY_SCAN = 20000
 MAX_REPOSITORY_DEPTH = 3
 
 
-# Whether a folder is a Git repository or worktree (it has a `.git`), holds one within a few levels (a `.worktrees` folder, a
-# folder of projects), or is the `.git` folder itself. A folder that cannot be looked through completely is not shown to hold none.
-def _holds_repository(path: str) -> bool:
+# A repository or worktree (has a `.git`), a folder holding one within `levels`, a `.git`.
+# A folder too large or unreadable to search is not shown to hold one.
+def _holds_repository(path: str, levels: int = MAX_REPOSITORY_DEPTH) -> bool:
     if os.path.basename(path) == ".git":
         return True
     level = [path]
     visited = 0
-    for depth in range(MAX_REPOSITORY_DEPTH + 1):
+    for depth in range(levels + 1):
         following: list[str] = []
         for folder in level:
             try:
                 with os.scandir(folder) as entries:
                     for entry in entries:
                         visited += 1
-                        if visited > MAX_REPOSITORY_SCAN or entry.name == ".git":
+                        if entry.name == ".git":
                             return True
-                        if depth < MAX_REPOSITORY_DEPTH and entry.name not in REPOSITORY_SCAN_SKIP and entry.is_dir(follow_symlinks=False):
+                        if visited > MAX_REPOSITORY_SCAN:
+                            return False
+                        if depth < levels and entry.name not in REPOSITORY_SCAN_SKIP and entry.is_dir(follow_symlinks=False):
                             following.append(entry.path)
-            except (FileNotFoundError, NotADirectoryError):
-                continue
             except OSError:
-                return True
+                continue
         level = following
     return False
 
 
-# A scratch clone in a temp folder may be cleaned up; a project, a worktree or a folder of them is the user's to decide.
-def _ask_about_repository(resolved: str, verb: str) -> None:
-    if not any(_inside(resolved, root) for root in TEMP_ROOTS) and _holds_repository(resolved):
-        _ask("delete_guard.reason.trash_repository", verb=verb, path=resolved)
+def _inside_repository(path: str) -> bool:
+    folder = os.path.dirname(path)
+    while folder != os.path.dirname(folder) and folder != USER_HOME:
+        if os.path.lexists(os.path.join(folder, ".git")):
+            return True
+        folder = os.path.dirname(folder)
+    return False
+
+
+# Inside a repository only a root, or a folder directly holding one, is refused.
+def _check_repository(resolved: str, verb: str) -> None:
+    if any(_inside(resolved, root) for root in TEMP_ROOTS):
+        return
+    if _holds_repository(resolved, 1 if _inside_repository(resolved) else MAX_REPOSITORY_DEPTH):
+        raise Denied(message("delete_guard.reason.trash_repository", verb=verb, path=resolved))
 
 
 # A folder with a Trash directly inside it (the top of a volume) would take the Trash along when it is deleted or moved. A
@@ -827,14 +838,14 @@ def _check_resolved(resolved: str, cwd: str | None, recursive: bool, verb: str) 
     if any(_inside(resolved, root) for root in TEMP_ROOTS):
         return
     root = _repository_root(cwd)
-    if root is None or not _inside(resolved, root):
-        raise Denied(message("delete_guard.reason.outside_repository", verb=verb, path=resolved))
-    if resolved == root:
-        raise Denied(message("delete_guard.reason.repository_root", verb=verb, path=resolved))
-    if resolved == os.path.join(root, ".git") or _inside(resolved, os.path.join(root, ".git")):
-        raise Denied(message("delete_guard.reason.git_metadata", verb=verb, path=resolved))
-    if recursive and os.path.isdir(resolved) and os.path.isfile(os.path.join(resolved, ".git")):
-        raise Denied(message("delete_guard.reason.worktree", path=resolved))
+    if root is not None and _inside(resolved, root):
+        if resolved == root:
+            raise Denied(message("delete_guard.reason.repository_root", verb=verb, path=resolved))
+        if resolved == os.path.join(root, ".git") or _inside(resolved, os.path.join(root, ".git")):
+            raise Denied(message("delete_guard.reason.git_metadata", verb=verb, path=resolved))
+        if recursive and os.path.isdir(resolved) and os.path.isfile(os.path.join(resolved, ".git")):
+            raise Denied(message("delete_guard.reason.worktree", path=resolved))
+    raise Denied(message("delete_guard.reason.permanent_delete", verb=verb, path=resolved))
 
 
 def _check_sendable(resolved: str) -> None:
@@ -1130,11 +1141,11 @@ def _mv(words: list[str], cwd: str | None) -> None:
             if literal or _glob_base(variant) == variant:
                 resolved = _expand(variant, cwd)
                 if resolved is not None:
-                    _ask_about_repository(resolved, "mv")
+                    _check_repository(resolved, "mv")
             else:
                 # Only what the pattern matches is moved, not the folder it is read in.
                 for match in _glob_matches(variant, cwd, "mv"):
-                    _ask_about_repository(os.path.realpath(match), "mv")
+                    _check_repository(os.path.realpath(match), "mv")
 
 
 def _trash_one(target: str, cwd: str | None, literal: bool = False) -> None:
@@ -1144,7 +1155,7 @@ def _trash_one(target: str, cwd: str | None, literal: bool = False) -> None:
     if _is_computed(target):
         # A path that a command computes may be the whole project (an empty result, the parent of the folder it ran in).
         if re.search(r"\$\(|`", target):
-            _ask("delete_guard.reason.trash_computed", raw=target)
+            raise Denied(message("delete_guard.reason.trash_computed", raw=target))
         return
     resolved = _expand(target if literal else _glob_base(target), cwd)
     if resolved is None:
@@ -1155,10 +1166,10 @@ def _trash_one(target: str, cwd: str | None, literal: bool = False) -> None:
         if _names_trash(match) or (_is_folder_path(found, "trash", target) and _holds_trash(found)):
             raise Denied(message("delete_guard.reason.trash_inside", path=match))
         _check_sendable(found)
-        _ask_about_repository(found, "trash")
+        _check_repository(found, "trash")
     named = literal or _glob_base(target) == target
     if named:
-        _ask_about_repository(resolved, "trash")
+        _check_repository(resolved, "trash")
     if named and _is_folder_path(resolved, "trash", target) and _holds_trash(resolved):
         raise Denied(message("delete_guard.reason.trash_inside", path=resolved))
 
@@ -2254,7 +2265,6 @@ def _self_test() -> int:
         "rm -rf /tmp/agent-probe/build",
         "rm -rf /var/tmp/agent-probe",
         "rm -f /tmp/x.log",
-        "rmdir empty-dir",
         "trash /private/tmp/old",
         "trash-put /private/tmp/old",
         "gio trash /private/tmp/old",
@@ -2267,8 +2277,11 @@ def _self_test() -> int:
         "git clean -ndx",
         "git status --short",
     ]
+    blocked.append("rmdir empty-dir")
     if probe:
-        allowed.append(f"rm -rf {probe}/build/outputs")
+        allowed.append(f"trash {probe}/build/outputs")
+        blocked.append(f"rm -rf {probe}/build/outputs")
+        blocked.append(f"trash {probe}")
         blocked.append(f"rm -rf {probe}")
         blocked.append(f"rm -rf {probe}/.git")
     failures = []

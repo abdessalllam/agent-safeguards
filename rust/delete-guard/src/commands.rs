@@ -13,7 +13,7 @@ use crate::consts::{
 };
 use crate::errors::{Denied, Stop};
 use crate::globs::glob_matches;
-use crate::places::{ask_about_repository, glob_base, names_trash};
+use crate::places::{check_repository, glob_base, names_trash};
 use crate::targets::{
     check_match_mark, check_remote_trash_target, check_sendable, check_target, in_trash,
     is_folder_path, location_path, quoted_words, remote,
@@ -203,14 +203,15 @@ pub fn mv(words: &[String], cwd: Option<&str>) -> Result<(), Stop> {
         for variant in variants {
             if literal || glob_base(&variant) == variant {
                 if let Some(resolved) = expand(&variant, cwd)? {
-                    ask_about_repository(&resolved, "mv");
+                    check_repository(&resolved, "mv").map_err(Stop::from)?;
                 }
             } else {
                 for matched in glob_matches(&variant, cwd, "mv").map_err(Stop::from)? {
-                    ask_about_repository(
+                    check_repository(
                         &try_realpath(&matched).map_err(|_| Stop::Internal)?,
                         "mv",
-                    );
+                    )
+                    .map_err(Stop::from)?;
                 }
             }
         }
@@ -228,10 +229,10 @@ pub fn trash_one(target: &str, cwd: Option<&str>, literal: bool) -> Result<(), S
     check_match_mark(target, "trash")?;
     if is_computed(target) {
         if target.contains("$(") || target.contains('`') {
-            crate::decision::ask(
+            return Err(denied(
                 "delete_guard.reason.trash_computed",
                 &[("raw", value(target))],
-            );
+            ));
         }
         return Ok(());
     }
@@ -256,12 +257,12 @@ pub fn trash_one(target: &str, cwd: Option<&str>, literal: bool) -> Result<(), S
                 ));
             }
             check_sendable(&found)?;
-            ask_about_repository(&found, "trash");
+            check_repository(&found, "trash").map_err(Stop::from)?;
         }
     }
     let named = literal || glob_base(target) == target;
     if named {
-        ask_about_repository(&resolved, "trash");
+        check_repository(&resolved, "trash").map_err(Stop::from)?;
     }
     if named && is_folder_path(&resolved, "trash", target)? && crate::globs::holds_trash(&resolved)
     {

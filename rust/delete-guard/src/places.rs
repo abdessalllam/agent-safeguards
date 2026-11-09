@@ -1,14 +1,13 @@
 use std::fs;
-use std::io::ErrorKind;
 use std::sync::LazyLock;
 
 use guard_common::env::user_home;
-use guard_common::locale::FormatValue;
+use guard_common::locale::{message, FormatValue};
 use guard_common::sys::realpath;
 use regex::Regex;
 
 use crate::consts::{self, MOUNT_PARENTS, TRASH_FOLDER, TRASH_URI};
-use crate::decision;
+use crate::errors::Denied;
 
 pub const MAX_REPOSITORY_SCAN: usize = 20000;
 pub const MAX_REPOSITORY_DEPTH: usize = 3;
@@ -145,41 +144,37 @@ pub fn trash_roots() -> Vec<String> {
     unique
 }
 
-pub fn holds_repository(path: &str) -> bool {
+pub fn holds_repository(path: &str, levels: usize) -> bool {
     if path.rsplit('/').next() == Some(".git") {
         return true;
     }
     let mut level = vec![path.to_owned()];
     let mut visited = 0usize;
-    for depth in 0..=MAX_REPOSITORY_DEPTH {
+    for depth in 0..=levels {
         let mut following = Vec::new();
         for folder in level {
-            let entries = match fs::read_dir(&folder) {
-                Ok(entries) => entries,
-                Err(error)
-                    if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
-                {
-                    continue
-                }
-                Err(_) => return true,
+            let Ok(entries) = fs::read_dir(&folder) else {
+                continue;
             };
             for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(_) => return true,
+                let Ok(entry) = entry else {
+                    break;
                 };
                 visited = visited.saturating_add(1);
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if visited > MAX_REPOSITORY_SCAN || name == ".git" {
+                if name == ".git" {
                     return true;
                 }
-                if depth < MAX_REPOSITORY_DEPTH && !REPOSITORY_SCAN_SKIP.contains(&name.as_str()) {
+                if visited > MAX_REPOSITORY_SCAN {
+                    return false;
+                }
+                if depth < levels && !REPOSITORY_SCAN_SKIP.contains(&name.as_str()) {
                     match entry.file_type() {
                         Ok(kind) if kind.is_dir() => {
                             following.push(entry.path().to_string_lossy().into_owned())
                         }
                         Ok(_) => {}
-                        Err(_) => return true,
+                        Err(_) => break,
                     }
                 }
             }
@@ -189,20 +184,39 @@ pub fn holds_repository(path: &str) -> bool {
     false
 }
 
-pub fn ask_about_repository(resolved: &str, verb: &str) {
-    if !consts::temp_roots()
+pub fn inside_repository(path: &str) -> bool {
+    let mut folder = dirname(path);
+    while dirname(folder) != folder && folder != user_home() {
+        if fs::symlink_metadata(format!("{folder}/.git")).is_ok() {
+            return true;
+        }
+        folder = dirname(folder);
+    }
+    false
+}
+
+pub fn check_repository(resolved: &str, verb: &str) -> Result<(), Denied> {
+    if consts::temp_roots()
         .iter()
         .any(|root| inside(resolved, root))
-        && holds_repository(resolved)
     {
-        decision::ask(
+        return Ok(());
+    }
+    let levels = if inside_repository(resolved) {
+        1
+    } else {
+        MAX_REPOSITORY_DEPTH
+    };
+    if holds_repository(resolved, levels) {
+        return Err(Denied::new(message(
             "delete_guard.reason.trash_repository",
             &[
                 ("verb", FormatValue::Text(verb.to_owned())),
                 ("path", FormatValue::Text(resolved.to_owned())),
             ],
-        );
+        )));
     }
+    Ok(())
 }
 
 #[cfg(test)]

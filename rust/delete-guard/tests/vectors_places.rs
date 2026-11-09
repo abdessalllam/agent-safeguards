@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use delete_guard::{decision, places};
+use delete_guard::places;
+use guard_common::overrides;
 use serde_json::{json, Value};
 
 fn fixture() -> PathBuf {
@@ -16,13 +17,21 @@ fn fixture() -> PathBuf {
         "nested/one/two/three/.git",
         "too_deep/one/two/three/four/.git",
         "skipped/node_modules/pkg/.git",
+        "outer/.git",
+        "outer/plain",
+        "outer/cache/a/b/.git",
+        "outer/vendor/lib/.git",
+        "outer/.worktrees/w",
     ] {
         fs::create_dir_all(root.join(path)).expect("fixture folder");
     }
     fs::write(root.join("file"), "x").expect("fixture file");
-    fs::create_dir(root.join("limit")).expect("limit folder");
-    for index in 0..=places::MAX_REPOSITORY_SCAN {
-        fs::write(root.join("limit").join(index.to_string()), "").expect("limit file");
+    fs::write(root.join("outer/.worktrees/w/.git"), "gitdir: x").expect("worktree file");
+    for folder in ["limit", "outer/limit"] {
+        fs::create_dir(root.join(folder)).expect("limit folder");
+        for index in 0..=places::MAX_REPOSITORY_SCAN {
+            fs::write(root.join(folder).join(index.to_string()), "").expect("limit file");
+        }
     }
     #[cfg(unix)]
     std::os::unix::fs::symlink(root.join("repo"), root.join("symlink")).expect("fixture symlink");
@@ -49,6 +58,14 @@ fn vectors_match_python() {
                 .unwrap_or("")
                 .replace("{FIXTURE}", &fixture_text)
         };
+        if name == "check_repository" {
+            overrides::set_local("TEMP_ROOTS", json!([]));
+            let denied = places::check_repository(&arg(0), &arg(1)).is_err();
+            overrides::clear_local();
+            let expected = record.get("exc").and_then(Value::as_str) == Some("Denied");
+            assert!(denied == expected, "vector {index} {name} {} differed", arg(0));
+            continue;
+        }
         let actual = match name {
             "glob_base" => json!(places::glob_base(&arg(0))),
             "inside" => json!(places::inside(&arg(0), &arg(1))),
@@ -62,35 +79,21 @@ fn vectors_match_python() {
                 }
                 json!(places::trash_roots())
             }
-            "holds_repository" => json!(places::holds_repository(&arg(0))),
-            "ask_about_repository" => {
-                decision::set_pending_ask(None);
-                places::ask_about_repository(&arg(0), &arg(1));
-                json!([null, decision::pending_ask()])
-            }
+            "holds_repository" => json!(places::holds_repository(
+                &arg(0),
+                args.get(1)
+                    .and_then(Value::as_u64)
+                    .map_or(places::MAX_REPOSITORY_DEPTH, |levels| levels as usize)
+            )),
+            "inside_repository" => json!(places::inside_repository(&arg(0))),
             _ => panic!("unknown vector function {name}"),
         };
-        let expected = record.get("ret").expect("expected return");
-        let expected = if name == "ask_about_repository" {
-            let mut value = expected.clone();
-            if let Some(items) = value.as_array_mut() {
-                let message = items.get(1).and_then(Value::as_str).map(str::to_owned);
-                if let Some(message) = message {
-                    if let Some(slot) = items.get_mut(1) {
-                        *slot = json!(message.replace("{FIXTURE}", &fixture_text));
-                    }
-                }
-            }
-            value
-        } else {
-            expected.clone()
-        };
+        let expected = record.get("ret").expect("expected return").clone();
         assert!(
             record.get("exc").is_some_and(Value::is_null),
             "Python exception at vector {index} {name}"
         );
         assert!(actual == expected, "vector {index} {name} differed");
     }
-    decision::set_pending_ask(None);
     fs::remove_dir_all(root).expect("remove owned fixture");
 }

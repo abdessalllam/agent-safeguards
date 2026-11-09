@@ -17,8 +17,6 @@ def record(name, args, fixture=None):
     GUARD._PENDING_ASK[0] = None
     try:
         value = getattr(GUARD, name)(*args) if name != "_trash_roots" else GUARD._trash_roots()
-        if name == "_ask_about_repository":
-            value = [value, GUARD._PENDING_ASK[0]]
         if fixture is not None:
             args = [item.replace(fixture, "{FIXTURE}") if isinstance(item, str) else item for item in args]
             if isinstance(value, str):
@@ -27,6 +25,8 @@ def record(name, args, fixture=None):
                 value = [item.replace(fixture, "{FIXTURE}") if isinstance(item, str) else item for item in value]
         RECORDS.append({"fn": name[1:], "args": args, "ret": value, "exc": None})
     except Exception as error:
+        if fixture is not None:
+            args = [item.replace(fixture, "{FIXTURE}") if isinstance(item, str) else item for item in args]
         RECORDS.append({"fn": name[1:], "args": args, "ret": None, "exc": type(error).__name__})
 
 
@@ -71,11 +71,26 @@ with tempfile.TemporaryDirectory(prefix="d1-oracle-") as temporary:
         record("_holds_repository", [path], temporary)
         record("_protected", [path], temporary)
         record("_protected", [os.path.realpath(path)], temporary)
-    record("_ask_about_repository", [str(fixture / "repo"), "trash"], temporary)
+    (fixture / "outer" / ".git").mkdir(parents=True)
+    (fixture / "outer" / "plain").mkdir()
+    (fixture / "outer" / "cache" / "a" / "b" / ".git").mkdir(parents=True)
+    (fixture / "outer" / "vendor" / "lib" / ".git").mkdir(parents=True)
+    (fixture / "outer" / ".worktrees" / "w").mkdir(parents=True)
+    (fixture / "outer" / ".worktrees" / "w" / ".git").write_text("gitdir: x", encoding="utf-8")
+    (fixture / "outer" / "limit").mkdir()
+    for index in range(GUARD.MAX_REPOSITORY_SCAN + 1):
+        (fixture / "outer" / "limit" / str(index)).touch()
+    for name in ["clean", "repo", "nested", "too_deep", "skipped", "limit", "outer", "outer/plain", "outer/cache", "outer/vendor", "outer/.worktrees", "outer/.worktrees/w", "outer/limit", "outer/.git", "outer/missing"]:
+        path = str(fixture / name)
+        record("_holds_repository", [path, 1], temporary)
+        record("_inside_repository", [path], temporary)
+    GUARD.TEMP_ROOTS = ()
+    for name in ["clean", "repo", "repo/.git", "nested", "too_deep", "skipped", "limit", "symlink", "file", "missing", "outer", "outer/plain", "outer/cache", "outer/cache/a", "outer/vendor", "outer/vendor/lib", "outer/.worktrees", "outer/.worktrees/w", "outer/limit", "outer/.git", "outer/missing"]:
+        record("_check_repository", [str(fixture / name), "trash"], temporary)
 
 for path in [".git", ".git/", "missing", "/tmp/d1-absent", "/nonexistent/d1"]:
     record("_holds_repository", [path])
-    record("_ask_about_repository", [path, "trash"])
+    record("_check_repository", [path, "trash"])
 
 OUT.parent.mkdir(parents=True, exist_ok=True)
 OUT.write_text(json.dumps(RECORDS, ensure_ascii=True, separators=(",", ":")), encoding="utf-8")

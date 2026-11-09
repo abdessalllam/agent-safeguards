@@ -355,6 +355,7 @@ pub fn self_test() -> i32 {
         "rm -rf ~/.Trash/old",
         "rm ~/.local/share/Trash/files/old",
         "trash ~/.local/share/Trash/files/old",
+        "rmdir empty-dir",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -364,7 +365,6 @@ pub fn self_test() -> i32 {
         "rm -rf /tmp/agent-probe/build",
         "rm -rf /var/tmp/agent-probe",
         "rm -f /tmp/x.log",
-        "rmdir empty-dir",
         "trash /private/tmp/old",
         "trash-put /private/tmp/old",
         "gio trash /private/tmp/old",
@@ -381,7 +381,9 @@ pub fn self_test() -> i32 {
     .map(str::to_owned)
     .collect();
     if !probe.is_empty() {
-        allowed.push(format!("rm -rf {probe}/build/outputs"));
+        allowed.push(format!("trash {probe}/build/outputs"));
+        blocked.push(format!("rm -rf {probe}/build/outputs"));
+        blocked.push(format!("trash {probe}"));
         blocked.push(format!("rm -rf {probe}"));
         blocked.push(format!("rm -rf {probe}/.git"));
     }
