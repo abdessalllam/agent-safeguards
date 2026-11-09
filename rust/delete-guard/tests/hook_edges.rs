@@ -84,6 +84,30 @@ fn a_word_with_a_backwards_bracket_range_is_not_an_internal_error() {
 }
 
 #[test]
+fn a_quoted_here_document_read_by_a_data_tool_or_interpreter_is_not_commands() {
+    let home = home("heredocs");
+    let answer = |command: &str| run(&home, &payload(&home, command), 300.0, &home.0);
+    for command in [
+        "python3 - <<'EOF'\nx = 1\ngit clean -fdx\nEOF\n",
+        "node - <<'EOF'\ntrash ~/Documents\nEOF\n",
+        "git commit -F - <<'EOF'\ngit clean -fdx\nEOF\n",
+        "gh pr create --body-file - <<'EOF'\nrm -rf /\nEOF\n",
+        "tee notes.txt <<'EOF'\nrm -rf /\nEOF\n",
+    ] {
+        assert_eq!(answer(command), "", "{command}");
+    }
+    for command in [
+        "bash <<'EOF'\nrm -rf /\nEOF\n",
+        "python3 - <<'EOF'\nimport shutil\nshutil.rmtree('/x')\nEOF\n",
+        "python3 - <<EOF\n$(rm -rf /)\nEOF\n",
+        "python3 - <<'EOF'\nx = 1\nEOF\ngit clean -fdx\n",
+        "sudo python3 - <<'EOF'\nrm -rf /\nEOF\n",
+    ] {
+        assert!(answer(command).contains("deny"), "{command}");
+    }
+}
+
+#[test]
 fn an_empty_cwd_is_an_unknown_folder_and_a_relative_workdir_joins_it_as_python_does() {
     let home = home("cwd");
     let unknown = json!({ "cwd": "", "tool_input": { "command": "rm -r build" } });

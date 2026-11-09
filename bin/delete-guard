@@ -245,8 +245,8 @@ STDIN_OPERATORS = frozenset({"<", "<>"})
 QUOTED_TILDE = re.compile(r"(?:^|[\s;&|(])(?:(?:['\"]+|\\)~|~['\"\\])")
 # `f() {`, `f(){`, `f ( ) {` and `function f {` only define what follows.
 FUNCTION_HEADER = re.compile(r"(?:function[ \t]+)?[A-Za-z_][\w.:-]*[ \t]*(?:\([ \t]*\)[ \t]*)?\{?")
-# Text that a quoted here-document of cat only prints is not a list of commands.
-TEXT_HEREDOC_OWNER = re.compile(r"[ \t]*cat\b[^|;&<(`$\"'\\\n]*")
+# A quoted here-document read by a data tool or interpreter holds no commands.
+TEXT_HEREDOC_OWNER = re.compile(r"[ \t]*(?:cat|tee|git|gh|jq|grep|egrep|fgrep|rg|patch|base64|python[0-9.]*|node|deno|bun)\b[^|;&<(`$\"'\\\n]*")
 TEXT_HEREDOC_TAIL = re.compile(r"[|`]|\$\(|[<>]\(")
 RSYNC_VALUE_LETTERS = frozenset("efBTM@")
 RSYNC_VALUE_OPTIONS = frozenset(
@@ -1526,7 +1526,7 @@ def _read_regular_file(path: str, limit: int) -> bytes | None:
         os.close(descriptor)
 
 
-# The body of a quoted here-document that cat only prints is text, not commands.
+# A quoted here-document body that a data tool or interpreter reads is text.
 def _without_text_heredocs(text: str) -> str:
     pieces: list[str] = []
     position = 0
@@ -1535,6 +1535,11 @@ def _without_text_heredocs(text: str) -> str:
             continue
         head = re.split(r"&&|\|\||;|\||&", text[document.line_start : document.marker_start])[-1]
         if TEXT_HEREDOC_OWNER.fullmatch(head) and not TEXT_HEREDOC_TAIL.search(text[document.delimiter_end : document.line_end]):
+            owner = re.match(r"[ \t]*([A-Za-z0-9.]+)", head)
+            code = owner is not None and owner.group(1).rstrip("0123456789.") in INTERPRETERS
+            # Code that deletes recursively stays in the text, where the inline-code rule reads it.
+            if code and INLINE_RECURSIVE_DELETE.search(text[document.body_start : document.end]):
+                continue
             pieces.append(text[position : document.body_start])
             position = document.end
     pieces.append(text[position:])

@@ -145,6 +145,8 @@ Sending a whole Git repository to the Trash is refused, and the refusal tells th
 
 Temp folders are exempt from all of this, even when a repository lives inside one, so scratch clones can be cleaned up. The temp root itself is not: `rm -rf /tmp` and `rm -rf /tmp/*` are refused, while `rm -rf /tmp/agent-probe-*` is fine. `cd` is followed only when the target exists and the command has no grouping; otherwise relative delete targets are refused because the folder is unknown.
 
+The body of a here-document with a quoted marker (`<<'EOF'`) is text, not commands, when the line only feeds it to `cat`, `tee`, `git`, `gh`, `jq`, `grep`, `egrep`, `fgrep`, `rg`, `patch`, `base64`, `python`, `node`, `deno` or `bun`, so a line in it that looks like a refused command (`git clean -fdx` in a commit message) is not refused. A pipe, a substitution or more code after the marker keeps the ordinary check, and so does a body that a shell, `ssh`, `sudo` or any other command reads, a marker that is not quoted (the shell expands it), and code for an interpreter that deletes recursively (`shutil.rmtree`, `rm -rf`).
+
 Every refusal says what to do instead: `git worktree remove <path>` for a worktree, the Trash for everything else.
 
 ### comment-guard (optional)

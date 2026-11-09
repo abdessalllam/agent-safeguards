@@ -110,6 +110,12 @@ with tempfile.TemporaryDirectory(prefix="d4-scripts-") as temporary:
         "# delete-guard check-remote x\n", "sudo delete-guard check-remote x",
         "script=$(delete-guard check-remote x)", "echo $(delete-guard remote-preflight x)",
         "cat <<'EOF'\ntext\nEOF\nrm -rf /\n", "cat <<'EOF'\nrm -rf /\nEOF\nrm -rf /\n",
+        "python3 - <<'EOF'\nx = 1\ngit clean -fdx\nEOF\n", "python3.12 - <<'EOF'\nx = 1\nEOF\nrm -rf /\n",
+        "node - <<'EOF'\ntrash ~/Documents\nEOF\n", "git commit -F - <<'EOF'\ngit clean -fdx\nEOF\n",
+        "gh pr create --body-file - <<'EOF'\nrm -rf /\nEOF\n", "tee notes.txt <<'EOF'\nrm -rf /\nEOF\n",
+        "python3 - <<'EOF'\nimport shutil\nshutil.rmtree('/x')\nEOF\n", "python3 - <<EOF\n$(rm -rf /)\nEOF\n",
+        "perl - <<'EOF'\n`rm -rf /`\nEOF\n", "bash <<'EOF'\nrm -rf /\nEOF\n", "ssh host <<'EOF'\nrm -rf /\nEOF\n",
+        "python3 - <<'EOF' | sh\nrm -rf /\nEOF\n", "sudo python3 - <<'EOF'\nrm -rf /\nEOF\n",
     }
     for file in (ROOT / "tests").glob("test*.py"):
         try:

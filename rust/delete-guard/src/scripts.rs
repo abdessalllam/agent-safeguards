@@ -18,8 +18,8 @@ use regex::Regex;
 
 use crate::check::{check_command_weighted, NESTED_FRAMES};
 use crate::consts::{
-    self, MAX_SCRIPT_BYTES, MAX_SCRIPT_DEPTH, SHELL_SHEBANG, TEXT_HEREDOC_OWNER, TEXT_HEREDOC_TAIL,
-    VETTED_COMMANDS, VETTED_MENTION,
+    self, inline_recursive_delete_search, INTERPRETERS, MAX_SCRIPT_BYTES, MAX_SCRIPT_DEPTH,
+    SHELL_SHEBANG, TEXT_HEREDOC_OWNER, TEXT_HEREDOC_TAIL, VETTED_COMMANDS, VETTED_MENTION,
 };
 use crate::errors::{Denied, Stop};
 use crate::find::stdin_files;
@@ -204,6 +204,17 @@ pub fn without_text_heredocs(text: &str) -> String {
         if TEXT_OWNER_FULL.is_match(tail)
             && !TEXT_HEREDOC_TAIL.is_match(chars(text, document.delimiter_end, document.line_end))
         {
+            let name: String = tail
+                .trim_start_matches([' ', '\t'])
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '.')
+                .collect();
+            let code = INTERPRETERS
+                .contains(&name.trim_end_matches(|ch: char| ch.is_ascii_digit() || ch == '.'));
+            let body = chars(text, document.body_start, document.end);
+            if code && inline_recursive_delete_search(body).is_some() {
+                continue;
+            }
             pieces.push(chars(text, position, document.body_start));
             position = document.end;
         }
