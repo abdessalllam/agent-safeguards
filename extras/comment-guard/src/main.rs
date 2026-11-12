@@ -68,10 +68,10 @@ fn complain(text: &str) {
 }
 
 fn home_config() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    if home.is_empty() {
-        return None;
-    }
+    let home = ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.is_empty())?;
     Some(PathBuf::from(home).join(".config"))
 }
 

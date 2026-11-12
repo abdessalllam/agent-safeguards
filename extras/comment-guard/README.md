@@ -106,7 +106,7 @@ mkdir -p ~/.config/agent-safeguards && touch ~/.config/agent-safeguards/comment-
 comment-guard check
 ```
 
-`XDG_CONFIG_HOME` replaces `~/.config` when it is set to an absolute path. Remove the file (or unset the variable) to turn the guard off.
+`XDG_CONFIG_HOME` replaces `~/.config` when it is set to an absolute path. Remove the file (or unset the variable) to turn the guard off. On Windows, where `HOME` is not set, `~` is `%USERPROFILE%`, so the file is `%USERPROFILE%\.config\agent-safeguards\comment-guard`. A file a command wrote as UTF-16 with a byte order mark (Windows PowerShell 5.1 `>` and `Out-File`) is read and cut in that encoding.
 
 ## Register the hook
 

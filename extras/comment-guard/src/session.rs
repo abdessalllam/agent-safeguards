@@ -43,6 +43,11 @@ pub struct Ledger {
     pruned: Cell<bool>,
 }
 
+// Windows answers "access denied" for a lock file that is mid-delete, so retry then too.
+fn lock_busy(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::AlreadyExists || (cfg!(windows) && error.kind() == ErrorKind::PermissionDenied)
+}
+
 fn lock_is_stale(lock: &Path) -> bool {
     let Ok(modified) = fs::metadata(lock).and_then(|meta| meta.modified()) else {
         return false;
@@ -213,7 +218,7 @@ impl Ledger {
                     held = true;
                     break;
                 }
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                Err(error) if lock_busy(&error) => {
                     if lock_is_stale(&lock) {
                         let _ = fs::remove_file(&lock);
                     }

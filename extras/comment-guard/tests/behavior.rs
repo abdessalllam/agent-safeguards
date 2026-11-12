@@ -918,6 +918,30 @@ fn switch_file_turns_the_guard_on() {
 }
 
 #[test]
+fn the_config_folder_falls_back_to_the_user_profile_when_home_is_not_set() {
+    let dir = temp_dir("switch-profile");
+    let folder = dir.join(".config").join("agent-safeguards");
+    std::fs::create_dir_all(&folder).expect("folder");
+    std::fs::write(folder.join("comment-guard"), b"").expect("file");
+    let run = |profile: &std::path::Path| {
+        let output = Command::new(binary())
+            .arg("check")
+            .env_remove("AGENT_SAFEGUARDS_COMMENT_GUARD")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("HOME")
+            .env("USERPROFILE", profile)
+            .output()
+            .expect("could not start the binary");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let on = run(&dir);
+    let off = run(&dir.join("elsewhere"));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!on.contains("off"), "{on}");
+    assert!(off.contains("off"), "{off}");
+}
+
+#[test]
 fn hook_prints_nothing_when_off() {
     let dir = temp_dir("hook-off");
     let output = Command::new(binary())

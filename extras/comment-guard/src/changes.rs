@@ -206,7 +206,56 @@ pub fn read_old(path: &Path) -> Option<String> {
     if bytes.len() as u64 > MAX_OLD_FILE {
         return None;
     }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Some(decode_text(&bytes).0)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Wide {
+    Little,
+    Big,
+}
+
+// PowerShell 5.1 `>` and Out-File write BOM-marked UTF-16, so only that is decoded.
+pub fn decode_text(bytes: &[u8]) -> (String, Option<Wide>) {
+    let lossy = || (String::from_utf8_lossy(bytes).into_owned(), None);
+    let (order, body) = match bytes {
+        [0xFF, 0xFE, 0, 0, ..] => return lossy(),
+        [0xFF, 0xFE, body @ ..] => (Wide::Little, body),
+        [0xFE, 0xFF, body @ ..] => (Wide::Big, body),
+        _ => return lossy(),
+    };
+    if body.len() % 2 != 0 {
+        return lossy();
+    }
+    let units: Vec<u16> = body
+        .chunks_exact(2)
+        .map(|pair| match (order, pair) {
+            (Wide::Little, [low, high]) => u16::from_le_bytes([*low, *high]),
+            (Wide::Big, [high, low]) => u16::from_be_bytes([*high, *low]),
+            _ => 0,
+        })
+        .collect();
+    match String::from_utf16(&units) {
+        Ok(text) => (text, Some(order)),
+        Err(_) => lossy(),
+    }
+}
+
+pub fn encode_text(text: &str, wide: Option<Wide>) -> Vec<u8> {
+    let Some(order) = wide else {
+        return text.as_bytes().to_vec();
+    };
+    let mut out = match order {
+        Wide::Little => vec![0xFF, 0xFE],
+        Wide::Big => vec![0xFE, 0xFF],
+    };
+    for unit in text.encode_utf16() {
+        out.extend_from_slice(&match order {
+            Wide::Little => unit.to_le_bytes(),
+            Wide::Big => unit.to_be_bytes(),
+        });
+    }
+    out
 }
 
 fn current_text(path: &Path) -> Option<String> {

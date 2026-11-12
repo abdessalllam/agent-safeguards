@@ -407,6 +407,7 @@ fn init_repo(dir: &Path) {
     git(dir, &["config", "user.name", "Test User"]);
     git(dir, &["config", "user.email", "test@example.com"]);
     git(dir, &["config", "commit.gpgsign", "false"]);
+    git(dir, &["config", "core.autocrlf", "false"]);
 }
 
 fn commit_file(dir: &Path, name: &str, content: &str) -> PathBuf {
@@ -2900,6 +2901,34 @@ fn the_state_folder_is_found_from_windows_variables_when_home_is_not_set() {
         let _ = child.wait_with_output().expect("wait");
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "x = 1\n", "{variable}");
     }
+}
+
+#[test]
+fn a_utf16_file_a_command_wrote_is_judged_and_cut_in_its_own_encoding() {
+    let wide = |text: &str, big: bool| -> Vec<u8> {
+        let mut out = if big { vec![0xFE, 0xFF] } else { vec![0xFF, 0xFE] };
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&if big { unit.to_be_bytes() } else { unit.to_le_bytes() });
+        }
+        out
+    };
+    for big in [false, true] {
+        let rig = Rig::new("bash-trim-wide");
+        let file = rig.cwd.join("a.py");
+        std::fs::write(&file, wide("x = 1\r\n# a\r\n# b\r\n# c\r\n# d\r\n", big)).expect("write");
+        let out = after_trimming(&rig, "codex", "'x' > a.py");
+        assert_eq!(std::fs::read(&file).expect("read"), wide("x = 1\r\n# a\r\n# b\r\n", big), "{big}: {out}");
+    }
+    let rig = Rig::new("bash-trim-wide-bad");
+    let file = rig.cwd.join("a.py");
+    let odd = [vec![0xFF, 0xFE], b"#\0 \0a\0\n\0#\0 \0b\0\n\0#\0 \0c\0\n\0x".to_vec()].concat();
+    std::fs::write(&file, &odd).expect("write");
+    let _ = after_trimming(&rig, "codex", "'x' > a.py");
+    assert_eq!(std::fs::read(&file).expect("read"), odd);
+    let latin = b"x = 1\n# a\n# b\n# c\n# d\n# \xe9\n".to_vec();
+    std::fs::write(&file, &latin).expect("write");
+    let _ = after_trimming(&rig, "codex", "'x' > a.py");
+    assert_eq!(std::fs::read(&file).expect("read"), latin);
 }
 
 #[test]

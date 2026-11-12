@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Map, Value};
 
-use crate::changes::{read_source, resolve, MAX_OLD_FILE};
+use crate::changes::{decode_text, encode_text, read_source, resolve, MAX_OLD_FILE};
 use crate::decision::{comment_lines, evaluate, evaluate_after, trimmed_with, widen_with_headers, Change};
 use crate::git::{drop_marked, inside_repository, run_git};
 use crate::languages::language_for_file;
@@ -191,12 +191,14 @@ fn trim_on_disk(change: &Change, cwd: &Path, ledger: &Ledger) -> Option<String> 
         return None;
     }
     let cut = trimmed_with(change, false)?;
-    if fs::read(path).ok()? != change.new.as_bytes() {
+    let bytes = fs::read(path).ok()?;
+    let (current, wide) = decode_text(&bytes);
+    if current != change.new || encode_text(&current, wide) != bytes {
         return None;
     }
     let name = path.file_name()?.to_string_lossy().into_owned();
     let temp = path.with_file_name(format!(".{name}.comment-guard-{}", std::process::id()));
-    let written = fs::write(&temp, cut.text.as_bytes()).is_ok() && fs::set_permissions(&temp, meta.permissions()).is_ok();
+    let written = fs::write(&temp, encode_text(&cut.text, wide)).is_ok() && fs::set_permissions(&temp, meta.permissions()).is_ok();
     if !written || fs::rename(&temp, path).is_err() {
         let _ = fs::remove_file(&temp);
         return None;
@@ -263,7 +265,11 @@ pub fn refresh_named(payload: &Map<String, Value>, ledger: &Ledger) {
 }
 
 fn home() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var("HOME").ok()?);
+    let value = ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.is_empty())?;
+    let path = PathBuf::from(value);
     path.is_absolute().then_some(path)
 }
 
@@ -970,17 +976,24 @@ mod tests {
 
     #[test]
     fn a_regular_file_in_the_folder_is_trimmed_in_place_with_its_mode() {
-        use std::os::unix::fs::PermissionsExt;
         crate::limits::set_mode(crate::limits::Mode::Trim);
         let (root, cwd, ledger) = trim_rig("plain");
         let text = "x = 1\n# a\n# b\n# c\n# d\n";
         let file = cwd.join("a.py");
         std::fs::write(&file, text).expect("write");
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o750)).expect("mode");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o750)).expect("mode");
+        }
         let note = super::trim_on_disk(&judged_file(&file, text), &cwd, &ledger).expect("trimmed");
         assert!(note.contains("# c | # d"));
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "x = 1\n# a\n# b\n");
-        assert_eq!(std::fs::metadata(&file).expect("meta").permissions().mode() & 0o777, 0o750);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&file).expect("meta").permissions().mode() & 0o777, 0o750);
+        }
         assert_eq!(std::fs::read_dir(&cwd).expect("dir").count(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -991,9 +1004,12 @@ mod tests {
         let text = "x = 1\n# a\n# b\n# c\n# d\n";
         let real = cwd.join("real.py");
         std::fs::write(&real, text).expect("write");
-        let link = cwd.join("link.py");
-        std::os::unix::fs::symlink(&real, &link).expect("link");
-        assert!(super::trim_on_disk(&judged_file(&link, text), &cwd, &ledger).is_none());
+        #[cfg(unix)]
+        {
+            let link = cwd.join("link.py");
+            std::os::unix::fs::symlink(&real, &link).expect("link");
+            assert!(super::trim_on_disk(&judged_file(&link, text), &cwd, &ledger).is_none());
+        }
         let outside = root.join("outside.py");
         std::fs::write(&outside, text).expect("write");
         assert!(super::trim_on_disk(&judged_file(&outside, text), &cwd, &ledger).is_none());
