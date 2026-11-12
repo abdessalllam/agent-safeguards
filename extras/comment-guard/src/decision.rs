@@ -818,21 +818,23 @@ fn still_open(opened: Option<usize>, closed: Option<usize>) -> bool {
     opened.is_some_and(|at| closed.is_none_or(|end| at > end))
 }
 
+fn last_tag(lower: &str, pattern: &str) -> Option<usize> {
+    lower
+        .match_indices(pattern)
+        .filter(|(at, _)| {
+            let rest = lower.get(at.saturating_add(pattern.len())..).unwrap_or("");
+            rest.chars().next().is_none_or(|next| next.is_whitespace() || next == '>' || next == '/')
+        })
+        .map(|(at, _)| at)
+        .last()
+}
+
 fn raw_text_open(before: &str) -> bool {
     let lower = before.to_ascii_lowercase();
     still_open(lower.rfind("<![cdata["), lower.rfind("]]>"))
-        || ["script", "style", "textarea", "title", "xmp"].iter().any(|tag| {
-            let open = format!("<{tag}");
-            let last_open = lower
-                .match_indices(open.as_str())
-                .filter(|(at, _)| {
-                    let rest = lower.get(at.saturating_add(open.len())..).unwrap_or("");
-                    rest.chars().next().is_none_or(|next| next.is_whitespace() || next == '>' || next == '/')
-                })
-                .map(|(at, _)| at)
-                .last();
-            still_open(last_open, lower.rfind(&format!("</{tag}")))
-        })
+        || ["script", "style", "textarea", "title", "xmp"]
+            .iter()
+            .any(|tag| still_open(last_tag(&lower, &format!("<{tag}")), last_tag(&lower, &format!("</{tag}"))))
 }
 
 // A plain `<!--` outside raw text is cut; scripts and template tags hold code.

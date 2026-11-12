@@ -2443,6 +2443,11 @@ fn an_html_comment_block_is_cut_outside_raw_text_elements_and_refused_where_it_c
     refused("server side include", "<!--#include virtual=\"/a.html\"\n one\n two\n three\n four\n-->\n");
     refused("line comments", "<p>x</p>\n// one\n// two\n// three\n// four\n<p>y</p>\n");
     refused("reopened script", &format!("<script>a</script>\n<script>\n{block}</script>\n"));
+    refused("closer text inside a script string", &format!("<script>\nvar s = \"</script\";\n{block}</script>\n"));
+    refused("closer prefix of another tag", &format!("<script>\nvar s = \"</scripts>\";\n{block}</script>\n"));
+    let spaced = format!("<script>a</script >\n{block}<p>x</p>\n");
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join("s.html"), &spaced), Provider::Claude));
+    assert_eq!(input["content"], "<script>a</script >\n<p>x</p>\n");
     refused("cdata", "<svg><text><![CDATA[\n<!--\n one\n two\n three\n four\n-->\n]]></text></svg>\n");
     refused("template tag in the comment", "<!--\n{% include \"a\" %}\n one\n two\n three\n-->\n");
     refused("template output in the comment", "<!--\n one {{ name }}\n two\n three\n four\n-->\n");
