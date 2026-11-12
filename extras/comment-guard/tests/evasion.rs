@@ -2873,6 +2873,36 @@ fn after_trimming(rig: &Rig, host: &str, command: &str) -> String {
 }
 
 #[test]
+fn the_state_folder_is_found_from_windows_variables_when_home_is_not_set() {
+    for variable in ["LOCALAPPDATA", "USERPROFILE"] {
+        let rig = Rig::new("windows-state");
+        let file = rig.cwd.join("a.py");
+        std::fs::write(&file, "x = 1\n# a\n# b\n# c\n# d\n").expect("write");
+        let payload = json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "win",
+            "cwd": rig.cwd.to_string_lossy(),
+            "tool_name": "Bash",
+            "tool_input": { "command": "Set-Content -Path a.py -Value 'x'" },
+            "tool_response": {},
+        });
+        let mut child = Command::new(binary())
+            .args(["hook", "codex", "PostToolUse"])
+            .env_clear()
+            .env("AGENT_SAFEGUARDS_COMMENT_GUARD", "1")
+            .env("AGENT_SAFEGUARDS_COMMENT_GUARD_MODE", "drop")
+            .env(variable, &rig.state)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start");
+        let _ = child.stdin.take().expect("stdin").write_all(payload.to_string().as_bytes());
+        let _ = child.wait_with_output().expect("wait");
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "x = 1\n", "{variable}");
+    }
+}
+
+#[test]
 fn a_file_a_command_wrote_loses_its_extra_comment_lines() {
     let rig = Rig::new("bash-trim");
     let five = "x = 1\n# a\n# b\n# c\n# d\n";

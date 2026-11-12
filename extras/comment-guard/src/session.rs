@@ -94,10 +94,10 @@ fn absolute_dir(variable: &str) -> Option<PathBuf> {
 }
 
 pub fn state_dir() -> Option<PathBuf> {
-    let root = match absolute_dir("XDG_STATE_HOME") {
-        Some(path) => path,
-        None => absolute_dir("HOME")?.join(".local").join("state"),
-    };
+    let root = absolute_dir("XDG_STATE_HOME")
+        .or_else(|| absolute_dir("HOME").map(|home| home.join(".local").join("state")))
+        .or_else(|| absolute_dir("LOCALAPPDATA"))
+        .or_else(|| absolute_dir("USERPROFILE").map(|home| home.join("AppData").join("Local")))?;
     Some(root.join("agent-safeguards").join("comment-guard"))
 }
 
