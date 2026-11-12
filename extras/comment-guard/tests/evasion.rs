@@ -2391,6 +2391,41 @@ fn an_edit_that_only_adds_a_long_comment_block_is_refused_with_the_fix_not_rewri
 }
 
 #[test]
+fn an_html_comment_block_is_cut_outside_raw_text_elements_and_refused_where_it_could_be_text() {
+    let dir = temp_dir("trim-html");
+    let path = dir.join("index.html");
+    let block = "<!--\n  one\n  two\n  three\n  four\n-->\n";
+    let page = format!("<!doctype html>\n{block}<html>\n<body>\n<p>hi</p>\n</body>\n</html>\n");
+    let plain = "<!doctype html>\n<html>\n<body>\n<p>hi</p>\n</body>\n</html>\n";
+    for mode in [Mode::Drop, Mode::Trim] {
+        let (input, note) = cut(trimming_in(mode, None, None, "Write", written(&path, &page), Provider::Claude));
+        assert_eq!(input["content"], plain);
+        assert!(note.contains("four"), "{note}");
+    }
+    let closed = format!("<script>var a = 1;</script>\n{block}<p>hi</p>\n");
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Write", written(&path, &closed), Provider::Claude));
+    assert_eq!(input["content"], "<script>var a = 1;</script>\n<p>hi</p>\n");
+    std::fs::write(&path, "<p>hi</p>\n").expect("write");
+    let edit = json!({ "file_path": path.to_string_lossy(), "old_string": "<p>hi</p>", "new_string": "<!--\n a\n b\n c\n-->\n<p>bye</p>" });
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Edit", edit, Provider::Claude));
+    assert_eq!(input["new_string"], "<p>bye</p>");
+    let refused = |name: &str, text: &str| {
+        let verdict = trimming_in(Mode::Drop, None, None, "Write", written(&dir.join("r.html"), text), Provider::Claude);
+        assert!(denied(&verdict), "{name} was not refused");
+    };
+    refused("script", &format!("<script>\nvar a = `\n{block}`;\n</script>\n"));
+    refused("script upper case", &format!("<SCRIPT type=\"module\">\n{block}</SCRIPT>\n"));
+    refused("style", "<style>\n/*\n one\n two\n three\n four\n*/\n</style>\n");
+    refused("textarea", &format!("<textarea>\n{block}</textarea>\n"));
+    refused("title", &format!("<title>\n{block}</title>\n"));
+    refused("star block in the body", "<p>x</p>\n/*\n one\n two\n three\n four\n*/\n<p>y</p>\n");
+    refused("conditional comment", "<!--[if IE]>\n<p>one</p>\n<p>two</p>\n<p>three</p>\n<p>four</p>\n<![endif]-->\n");
+    refused("server side include", "<!--#include virtual=\"/a.html\"\n one\n two\n three\n four\n-->\n");
+    refused("line comments", "<p>x</p>\n// one\n// two\n// three\n// four\n<p>y</p>\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn comments_that_cannot_be_cut_safely_are_still_refused() {
     let dir = temp_dir("trim-refuse");
     let unrefused = std::cell::RefCell::new(Vec::new());

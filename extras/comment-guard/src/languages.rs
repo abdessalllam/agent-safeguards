@@ -107,7 +107,7 @@ pub const HASKELL: Language = Language {
 };
 
 const HTML_BLOCKS: &[(&str, &str)] = &[("<!--", "-->"), ("/*", "*/")];
-pub const HTML: Language = Language { line: &["//"], block: HTML_BLOCKS, markup: true, ..BASE };
+pub const HTML: Language = Language { line: &["//"], block: HTML_BLOCKS, markup: true, trim: true, ..BASE };
 pub const COMPONENT: Language = Language {
     line: &["//"],
     block: HTML_BLOCKS,
