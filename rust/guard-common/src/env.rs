@@ -34,16 +34,8 @@ struct Paths {
 static PATHS: LazyLock<Paths> = LazyLock::new(|| {
     let user_home = home_directory();
     let plugin_root = plugin_root_of_executable();
-    let mut trusted_dirs = vec![
-        "/usr/bin".to_owned(),
-        "/bin".to_owned(),
-        "/usr/local/bin".to_owned(),
-        "/opt/homebrew/bin".to_owned(),
-        "/usr/sbin".to_owned(),
-        "/sbin".to_owned(),
-    ];
-    trusted_dirs.push(join_dir(&user_home, ".local/bin"));
-    let trusted_path = trusted_dirs.join(":");
+    let trusted_dirs = default_trusted_dirs(&user_home);
+    let trusted_path = trusted_dirs.join(&PATH_SEPARATOR.to_string());
     Paths {
         user_home,
         plugin_root,
@@ -51,6 +43,42 @@ static PATHS: LazyLock<Paths> = LazyLock::new(|| {
         trusted_path,
     }
 });
+
+const PATH_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
+
+#[cfg(unix)]
+fn default_trusted_dirs(user_home: &str) -> Vec<String> {
+    let mut dirs = vec![
+        "/usr/bin".to_owned(),
+        "/bin".to_owned(),
+        "/usr/local/bin".to_owned(),
+        "/opt/homebrew/bin".to_owned(),
+        "/usr/sbin".to_owned(),
+        "/sbin".to_owned(),
+    ];
+    dirs.push(join_dir(user_home, ".local/bin"));
+    dirs
+}
+
+#[cfg(windows)]
+fn default_trusted_dirs(user_home: &str) -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    for (variable, rest) in [
+        ("SystemRoot", "System32"),
+        ("ProgramFiles", "Git\\cmd"),
+        ("ProgramFiles(x86)", "Git\\cmd"),
+        ("LOCALAPPDATA", "Programs\\Git\\cmd"),
+    ] {
+        let Ok(root) = std::env::var(variable) else {
+            continue;
+        };
+        if std::path::Path::new(&root).is_absolute() {
+            dirs.push(join_dir(&root, rest));
+        }
+    }
+    dirs.push(join_dir(user_home, ".local\\bin"));
+    dirs
+}
 
 /// Passwd home when the account exists, otherwise `HOME`, otherwise `/`, then realpath.
 pub fn home_directory() -> String {
@@ -98,12 +126,14 @@ fn plugin_root_of_executable() -> String {
 }
 
 fn join_dir(root: &str, rest: &str) -> String {
-    if rest.starts_with('/') {
+    let separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+    let glue = if cfg!(windows) { '\\' } else { '/' };
+    if rest.starts_with('/') || (cfg!(windows) && std::path::Path::new(rest).is_absolute()) {
         rest.to_owned()
-    } else if root.is_empty() || root.ends_with('/') {
+    } else if root.is_empty() || root.ends_with(separator) {
         format!("{root}{rest}")
     } else {
-        format!("{root}/{rest}")
+        format!("{root}{glue}{rest}")
     }
 }
 
@@ -117,7 +147,7 @@ pub fn env_flag(name: &str) -> bool {
 pub fn env_list(name: &str) -> Option<Vec<String>> {
     let raw = std::env::var(name).ok()?;
     Some(
-        raw.split(':')
+        raw.split(PATH_SEPARATOR)
             .filter(|entry| !entry.is_empty())
             .map(|entry| entry.to_owned())
             .collect(),
@@ -128,11 +158,26 @@ pub fn fail_open() -> bool {
     env_flag("AGENT_SAFEGUARDS_FAIL_OPEN")
 }
 
+#[cfg(unix)]
+fn executable_names(name: &str) -> Vec<String> {
+    vec![name.to_owned()]
+}
+
+#[cfg(windows)]
+fn executable_names(name: &str) -> Vec<String> {
+    if std::path::Path::new(name).extension().is_some() {
+        return vec![name.to_owned()];
+    }
+    sys::executable_extensions().iter().map(|extension| format!("{name}{extension}")).collect()
+}
+
 pub fn find_executable(name: &str) -> Option<String> {
     for directory in trusted_dirs() {
-        let candidate = join_dir(directory, name);
-        if sys::access_executable(&candidate) {
-            return Some(candidate);
+        for file in executable_names(name) {
+            let candidate = join_dir(directory, &file);
+            if sys::access_executable(&candidate) {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -186,7 +231,8 @@ mod tests {
         assert!(!fail_open());
         unsafe {
             std::env::set_var(flag, " YES ");
-            std::env::set_var(list, "a::b:");
+            let colon = super::PATH_SEPARATOR;
+            std::env::set_var(list, format!("a{colon}{colon}b{colon}"));
             std::env::set_var(fail, "1");
         }
         assert!(env_flag(flag));
@@ -206,6 +252,23 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn home_plugin_root_and_trusted_dirs_are_stable_on_windows() {
+        let home = user_home();
+        assert!(std::path::Path::new(home).is_absolute(), "{home}");
+        assert_eq!(home, home_directory());
+        assert!(plugin_root().contains(':') || plugin_root().is_empty() || plugin_root() == ".");
+        let dirs = trusted_dirs();
+        assert!(dirs.iter().any(|dir| dir.to_ascii_lowercase().ends_with("system32")), "{dirs:?}");
+        assert!(dirs.last().is_some_and(|dir| dir.ends_with("\\.local\\bin")), "{dirs:?}");
+        assert_eq!(trusted_path(), dirs.join(";"));
+        let found = find_executable("cmd");
+        assert!(found.as_ref().is_some_and(|path| path.to_ascii_lowercase().ends_with("\\cmd.exe")), "{found:?}");
+        assert_eq!(find_executable("no-such-guard-binary-b2"), None);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn home_plugin_root_and_trusted_dirs_are_stable() {
         let home = user_home();

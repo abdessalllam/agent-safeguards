@@ -1,8 +1,13 @@
+#[cfg(unix)]
 use std::collections::HashMap;
 use std::fs;
+#[cfg(unix)]
 use std::path::Path;
 
-use guard_common::pyglob::{fnmatchcase, iglob};
+use guard_common::pyglob::fnmatchcase;
+#[cfg(unix)]
+use guard_common::pyglob::iglob;
+#[cfg(unix)]
 use serde_json::Value;
 
 fn unhex(text: &str) -> String {
@@ -33,6 +38,7 @@ fn fnmatch_rows_match_python() {
     assert!(bad.is_empty(), "{} rows differ, first: {bad:?}", bad.len());
 }
 
+#[cfg(unix)]
 fn build_tree(root: &Path) {
     for folder in ["a/sub/.dothidden", "b", "ab", ".hidden", "sp ace", "link-target"] {
         fs::create_dir_all(root.join(folder)).expect("folder");
@@ -48,6 +54,7 @@ fn build_tree(root: &Path) {
     std::os::unix::fs::symlink("missing", root.join("dangling")).expect("link");
 }
 
+#[cfg(unix)]
 #[test]
 fn iglob_records_match_python() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/pyglob.json");

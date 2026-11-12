@@ -13,5 +13,9 @@ pub mod pyre;
 pub mod secret_scan;
 pub mod shell;
 pub mod shlex;
+#[cfg(unix)]
 #[allow(unsafe_code)]
+pub mod sys;
+#[cfg(windows)]
+#[path = "sys_windows.rs"]
 pub mod sys;

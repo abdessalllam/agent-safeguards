@@ -1,6 +1,9 @@
+#[cfg(unix)]
 use guard_common::pyglob::expanduser;
+#[cfg(unix)]
 use serde_json::Value;
 
+#[cfg(unix)]
 #[test]
 fn expanduser_records_match_python() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/expanduser.json");
