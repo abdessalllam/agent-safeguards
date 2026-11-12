@@ -199,10 +199,16 @@ fn multi_edit_input(input: &Map<String, Value>, change: &Change, cut: &Trimmed) 
         return None;
     }
     let mut edits: Vec<Value> = Vec::new();
-    for (item, (_, to)) in items.iter().zip(&rewritten) {
+    for ((item, (from, to)), (_, original)) in items.iter().zip(&rewritten).zip(&pairs) {
+        if to == from && original != from {
+            continue;
+        }
         let mut map = item.as_object()?.clone();
         map.insert("new_string".to_owned(), Value::String(to.clone()));
         edits.push(Value::Object(map));
+    }
+    if edits.is_empty() {
+        return None;
     }
     let mut out = input.clone();
     out.insert("edits".to_owned(), Value::Array(edits));
@@ -245,6 +251,22 @@ fn plus_lines(command: &str) -> Vec<Plus> {
     out
 }
 
+fn section_changes(command: &str) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for raw in command.split('\n') {
+        let line = raw.trim_end_matches('\r');
+        let header = ["*** Add File:", "*** Update File:", "*** Delete File:"].iter().any(|mark| line.starts_with(mark));
+        if header {
+            out.push(usize::from(line.starts_with("*** Delete File:")));
+        } else if line.starts_with("*** Move to:") || (!line.starts_with("***") && (line.starts_with('+') || line.starts_with('-'))) {
+            if let Some(last) = out.last_mut() {
+                *last = last.saturating_add(1);
+            }
+        }
+    }
+    out
+}
+
 fn patch_input(input: &Map<String, Value>, changes: &[Change], cuts: &[Option<Trimmed>]) -> Option<Map<String, Value>> {
     let command = text(input, "command")?;
     let pluses = plus_lines(command);
@@ -280,7 +302,11 @@ fn patch_input(input: &Map<String, Value>, changes: &[Change], cuts: &[Option<Tr
         .filter(|(index, _)| !remove.contains(index))
         .map(|(_, line)| line)
         .collect();
-    Some(with(input, "command", kept.join("\n")))
+    let patch = kept.join("\n");
+    if section_changes(command).iter().zip(section_changes(&patch)).any(|(before, after)| after == 0 && *before > 0) {
+        return None;
+    }
+    Some(with(input, "command", patch))
 }
 
 pub fn rewritten_input(

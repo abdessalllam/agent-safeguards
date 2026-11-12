@@ -2391,6 +2391,26 @@ fn an_edit_that_only_adds_a_long_comment_block_is_refused_with_the_fix_not_rewri
 }
 
 #[test]
+fn a_patch_whose_sections_would_be_left_with_no_change_is_refused() {
+    let dir = temp_dir("trim-patch-nothing");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "x = 1\ny = 2\n").expect("write");
+    let notes = "+# n1\n+# n2\n+# n3\n";
+    let patch = |body: &str| json!({ "command": format!("*** Begin Patch\n{body}*** End Patch\n") });
+    let update = patch(&format!("*** Update File: {}\n@@\n x = 1\n{notes} y = 2\n", path.display()));
+    let verdict = trimming_in(Mode::Drop, None, None, "apply_patch", update.clone(), Provider::Codex);
+    assert!(matches!(verdict, Verdict::Deny(_)));
+    let (input, _) = cut(trimming(None, None, "apply_patch", update, Provider::Codex));
+    assert!(input["command"].as_str().is_some_and(|text| text.contains("+# n1\n+# n2\n") && !text.contains("# n3")));
+    let added = patch(&format!("*** Add File: {}\n{notes}", dir.join("b.py").display()));
+    assert!(matches!(trimming_in(Mode::Drop, None, None, "apply_patch", added, Provider::Codex), Verdict::Deny(_)));
+    let mixed = patch(&format!("*** Update File: {}\n@@\n x = 1\n{notes}+z = 3\n y = 2\n", path.display()));
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "apply_patch", mixed, Provider::Codex));
+    assert!(input["command"].as_str().is_some_and(|text| text.contains("+z = 3") && !text.contains("# n")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn an_html_comment_block_is_cut_outside_raw_text_elements_and_refused_where_it_could_be_text() {
     let dir = temp_dir("trim-html");
     let path = dir.join("index.html");
@@ -2807,6 +2827,11 @@ fn a_multi_edit_is_written_without_the_extra_comment_lines() {
     assert_eq!(input["edits"][1]["new_string"], "c = 3\n# c1\n# c2");
     let (input, _) = cut(trimming_in(Mode::Drop, None, None, "MultiEdit", two.clone(), Provider::Claude));
     assert_eq!(apply_edits(start, &input), "# a1\n# a2\na = 1\nb = 2\nc = 3\nd = 4\n");
+    assert_eq!(input["edits"].as_array().map(Vec::len), Some(1));
+    let only = json!({ "file_path": file, "edits": [{ "old_string": "b = 2", "new_string": "b = 2\n# x1\n# x2\n# x3" }] });
+    assert!(matches!(trimming_in(Mode::Drop, None, None, "MultiEdit", only.clone(), Provider::Claude), Verdict::Deny(_)));
+    let (input, _) = cut(trimming(None, None, "MultiEdit", only, Provider::Claude));
+    assert_eq!(input["edits"][0]["new_string"], "b = 2\n# x1\n# x2");
     let chained = json!({ "file_path": file, "edits": [
         { "old_string": "b = 2", "new_string": "b = 2\n# x1\n# x2\n# x3\n# x4" },
         { "old_string": "# x4", "new_string": "# y4" },
@@ -2946,13 +2971,13 @@ fn a_docstring_in_an_edit_is_cut_inside_its_replacement() {
     let (input, _) = cut(trimming(None, None, "Edit", ahead, Provider::Claude));
     assert_eq!(input["new_string"], "def f():\n    return 2\n");
     let patch = format!(
-        "*** Begin Patch\n*** Update File: {}\n@@\n def f():\n+    \"\"\"One.\n+    Two 2026-10-27.\n+    Three.\n+    \"\"\"\n     return 1\n*** End Patch\n",
+        "*** Begin Patch\n*** Update File: {}\n@@\n def f():\n+    \"\"\"One.\n+    Two 2026-10-27.\n+    Three.\n+    \"\"\"\n-    return 1\n+    return 2\n*** End Patch\n",
         path.display()
     );
     let (input, _) = cut(trimming(None, None, "apply_patch", json!({ "command": patch }), Provider::Codex));
     assert_eq!(
         input["command"],
-        format!("*** Begin Patch\n*** Update File: {}\n@@\n def f():\n     return 1\n*** End Patch\n", path.display())
+        format!("*** Begin Patch\n*** Update File: {}\n@@\n def f():\n-    return 1\n+    return 2\n*** End Patch\n", path.display())
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
