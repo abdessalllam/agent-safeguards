@@ -2422,6 +2422,11 @@ fn an_html_comment_block_is_cut_outside_raw_text_elements_and_refused_where_it_c
     refused("conditional comment", "<!--[if IE]>\n<p>one</p>\n<p>two</p>\n<p>three</p>\n<p>four</p>\n<![endif]-->\n");
     refused("server side include", "<!--#include virtual=\"/a.html\"\n one\n two\n three\n four\n-->\n");
     refused("line comments", "<p>x</p>\n// one\n// two\n// three\n// four\n<p>y</p>\n");
+    refused("reopened script", &format!("<script>a</script>\n<script>\n{block}</script>\n"));
+    refused("cdata", "<svg><text><![CDATA[\n<!--\n one\n two\n three\n four\n-->\n]]></text></svg>\n");
+    refused("template tag in the comment", "<!--\n{% include \"a\" %}\n one\n two\n three\n-->\n");
+    refused("template output in the comment", "<!--\n one {{ name }}\n two\n three\n four\n-->\n");
+    refused("server tag in the comment", "<!--\n one <?php echo 1; ?>\n two\n three\n four\n-->\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

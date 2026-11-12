@@ -814,29 +814,32 @@ fn risky(text: &str, lang: Language) -> bool {
         || (lang == SCRIPT && (nested_template(text) || jsx_like(text)))
 }
 
-fn raw_text_open(before: &str) -> bool {
-    let lower = before.to_ascii_lowercase();
-    ["script", "style", "textarea", "title", "xmp"].iter().any(|tag| {
-        let open = format!("<{tag}");
-        let last_open = lower
-            .match_indices(open.as_str())
-            .filter(|(at, _)| {
-                let rest = lower.get(at.saturating_add(open.len())..).unwrap_or("");
-                rest.chars().next().is_none_or(|next| next.is_whitespace() || next == '>' || next == '/')
-            })
-            .map(|(at, _)| at)
-            .last();
-        match (last_open, lower.rfind(&format!("</{tag}"))) {
-            (Some(opened), Some(closed)) => opened > closed,
-            (Some(_), None) => true,
-            _ => false,
-        }
-    })
+fn still_open(opened: Option<usize>, closed: Option<usize>) -> bool {
+    opened.is_some_and(|at| closed.is_none_or(|end| at > end))
 }
 
-// Only `<!--` outside raw-text elements is cut; script strings can hold any text.
-fn html_cuttable(lines: &[&str], first: usize) -> bool {
-    lines.get(first).is_some_and(|line| line.trim_start().starts_with("<!--"))
+fn raw_text_open(before: &str) -> bool {
+    let lower = before.to_ascii_lowercase();
+    still_open(lower.rfind("<![cdata["), lower.rfind("]]>"))
+        || ["script", "style", "textarea", "title", "xmp"].iter().any(|tag| {
+            let open = format!("<{tag}");
+            let last_open = lower
+                .match_indices(open.as_str())
+                .filter(|(at, _)| {
+                    let rest = lower.get(at.saturating_add(open.len())..).unwrap_or("");
+                    rest.chars().next().is_none_or(|next| next.is_whitespace() || next == '>' || next == '/')
+                })
+                .map(|(at, _)| at)
+                .last();
+            still_open(last_open, lower.rfind(&format!("</{tag}")))
+        })
+}
+
+// A plain `<!--` outside raw text is cut; scripts and template tags hold code.
+fn html_cuttable(lines: &[&str], first: usize, last: usize) -> bool {
+    let block = lines.get(first..=last).unwrap_or(&[]);
+    block.first().is_some_and(|line| line.trim_start().starts_with("<!--"))
+        && !block.iter().any(|line| ["{%", "{{", "<%", "<?", "${"].iter().any(|mark| line.contains(mark)))
         && lines.get(..first).is_some_and(|before| !raw_text_open(&before.join("\n")))
 }
 
@@ -1086,7 +1089,7 @@ pub fn trimmed_with(change: &Change, docstrings: bool) -> Option<Trimmed> {
         }
         if scanner.block_end() {
             if let Some(unit) = block.take() {
-                if unit.fresh && scanner.block_pure() && !unit.shown.is_empty() && (lang != HTML || html_cuttable(&lines, unit.first)) {
+                if unit.fresh && scanner.block_pure() && !unit.shown.is_empty() && (lang != HTML || html_cuttable(&lines, unit.first, index)) {
                     run_id = run_id.saturating_add(1);
                     pieces.push(Piece {
                         run: run_id,
