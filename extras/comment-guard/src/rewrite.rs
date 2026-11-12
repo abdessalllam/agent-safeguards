@@ -96,7 +96,11 @@ fn edit_input(input: &Map<String, Value>, change: &Change, cut: &Trimmed) -> Opt
     if change.new.get(start..end) != Some(new_string) {
         return None;
     }
-    Some(with(input, "new_string", region(change, cut, start, end)?))
+    let kept = region(change, cut, start, end)?;
+    if kept == old_string {
+        return None;
+    }
+    Some(with(input, "new_string", kept))
 }
 
 fn notebook_input(input: &Map<String, Value>, change: &Change, cut: &Trimmed, base: &Path) -> Option<Map<String, Value>> {

@@ -1286,13 +1286,13 @@ fn a_blank_line_that_was_already_in_the_file_stays_when_an_edit_is_cut() {
     let dir = temp_dir("tidy-edit");
     let path = dir.join("a.py");
     std::fs::write(&path, "a = 1\n\nb = 2\n").expect("write");
-    let beside = json!({ "file_path": path.to_string_lossy(), "old_string": "a = 1\n\nb = 2", "new_string": "a = 1\n\n# one\n# two\n# three\n\nb = 2" });
+    let beside = json!({ "file_path": path.to_string_lossy(), "old_string": "a = 1\n\nb = 2", "new_string": "a = 1\n\n# one\n# two\n# three\n\nb = 3" });
     let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Edit", beside, Provider::Claude));
-    assert_eq!(input["new_string"], "a = 1\n\nb = 2");
+    assert_eq!(input["new_string"], "a = 1\n\nb = 3");
     std::fs::write(&path, "def f():\n    return 1\n").expect("write");
-    let opener = json!({ "file_path": path.to_string_lossy(), "old_string": "def f():\n", "new_string": "def f():\n    # one\n    # two\n\n    # three\n" });
+    let opener = json!({ "file_path": path.to_string_lossy(), "old_string": "def f():\n    return 1\n", "new_string": "def f():\n    # one\n    # two\n\n    # three\n    return 2\n" });
     let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Edit", opener, Provider::Claude));
-    assert_eq!(input["new_string"], "def f():\n");
+    assert_eq!(input["new_string"], "def f():\n    return 2\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2365,10 +2365,28 @@ fn an_edit_with_too_many_comments_is_trimmed_inside_its_replacement() {
     assert_eq!(input["new_string"], "# n1\n# n2\nx = 2");
     let middle = json!({ "file_path": path.to_string_lossy(), "old_string": "y = 2\n", "new_string": "# n1\ny = 3\n# n2\n# n3\n" });
     assert!(matches!(trimming(None, None, "Edit", middle, Provider::Claude), Verdict::Allow));
-    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Edit", at_end.clone(), Provider::Claude));
-    assert_eq!(input["new_string"], "y = 2");
     let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Edit", at_start, Provider::Claude));
     assert_eq!(input["new_string"], "x = 2");
+    let with_code = json!({ "file_path": path.to_string_lossy(), "old_string": "y = 2", "new_string": "# n1\n# n2\n# n3\ny = 3" });
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Edit", with_code, Provider::Claude));
+    assert_eq!(input["new_string"], "y = 3");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_edit_that_only_adds_a_long_comment_block_is_refused_with_the_fix_not_rewritten_to_a_no_op() {
+    let dir = temp_dir("trim-edit-noop");
+    let path = dir.join("a.py");
+    std::fs::write(&path, "x = 1\ny = 2\n").expect("write");
+    let only_comments = json!({ "file_path": path.to_string_lossy(), "old_string": "y = 2", "new_string": "y = 2\n# n1\n# n2\n# n3\n# n4" });
+    for mode in [Mode::Drop, Mode::Trim] {
+        let verdict = trimming_in(mode, None, None, "Edit", only_comments.clone(), Provider::Claude);
+        match (mode, verdict) {
+            (Mode::Trim, verdict) => assert_eq!(cut(verdict).0["new_string"], "y = 2\n# n1\n# n2"),
+            (_, Verdict::Deny(reason)) => assert!(reason.contains("shorter comment blocks"), "{reason}"),
+            (_, _) => panic!("expected a refusal"),
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2874,19 +2892,19 @@ fn a_docstring_in_an_edit_is_cut_inside_its_replacement() {
     std::fs::write(&path, "class E(Exception):\n    pass\n\nx = 1\n").expect("write");
     let sole = json!({
         "file_path": path.to_string_lossy(),
-        "old_string": "class E(Exception):\n    pass",
-        "new_string": format!("class E(Exception):\n    {}", q3(&long)),
+        "old_string": "class E(Exception):\n    pass\n\nx = 1",
+        "new_string": format!("class E(Exception):\n    {}\n\nx = 2", q3(&long)),
     });
     let (input, _) = cut(trimming(None, None, "Edit", sole, Provider::Claude));
-    assert_eq!(input["new_string"], "class E(Exception):\n    pass");
+    assert_eq!(input["new_string"], "class E(Exception):\n    pass\n\nx = 2");
     std::fs::write(&path, "def f():\n    return 1\n").expect("write");
     let ahead = json!({
         "file_path": path.to_string_lossy(),
-        "old_string": "def f():\n",
-        "new_string": "def f():\n    \"\"\"One.\n    Two 2026-10-27.\n    Three.\n    \"\"\"\n",
+        "old_string": "def f():\n    return 1\n",
+        "new_string": "def f():\n    \"\"\"One.\n    Two 2026-10-27.\n    Three.\n    \"\"\"\n    return 2\n",
     });
     let (input, _) = cut(trimming(None, None, "Edit", ahead, Provider::Claude));
-    assert_eq!(input["new_string"], "def f():\n");
+    assert_eq!(input["new_string"], "def f():\n    return 2\n");
     let patch = format!(
         "*** Begin Patch\n*** Update File: {}\n@@\n def f():\n+    \"\"\"One.\n+    Two 2026-10-27.\n+    Three.\n+    \"\"\"\n     return 1\n*** End Patch\n",
         path.display()
@@ -2951,17 +2969,17 @@ fn what_the_docstring_review_found_is_refused_or_cut_safely() {
     let (input, _) = cut(write(&format!("def f():\n\u{0c}    {}\n", q3(&long))));
     assert_eq!(input["content"], "def f():\n\u{0c}    pass\n");
     std::fs::write(&path, "x = 1\r\ndef f():\r\n    pass\r\ny = 2\r\n").expect("write");
-    let sole = json!({ "file_path": path.to_string_lossy(), "old_string": "    pass", "new_string": format!("    {}", q3(&long)) });
+    let sole = json!({ "file_path": path.to_string_lossy(), "old_string": "    pass\r\ny = 2", "new_string": format!("    {}\r\ny = 3", q3(&long)) });
     let (input, _) = cut(trimming(None, None, "Edit", sole, Provider::Claude));
-    assert_eq!(input["new_string"], "    pass");
+    assert_eq!(input["new_string"], "    pass\r\ny = 3");
     std::fs::write(&path, "def f():\r\n    return 1\r\n").expect("write");
     let many = json!({
         "file_path": path.to_string_lossy(),
-        "old_string": "def f():",
-        "new_string": "def f():\r\n    \"\"\"One.\r\n    Two 2026-10-27.\r\n    Three.\r\n    \"\"\"",
+        "old_string": "def f():\r\n    return 1",
+        "new_string": "def f():\r\n    \"\"\"One.\r\n    Two 2026-10-27.\r\n    Three.\r\n    \"\"\"\r\n    return 2",
     });
     let (input, _) = cut(trimming(None, None, "Edit", many, Provider::Claude));
-    assert_eq!(input["new_string"], "def f():");
+    assert_eq!(input["new_string"], "def f():\r\n    return 2");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3205,8 +3223,7 @@ fn what_a_trimmed_call_keeps_counts_only_when_the_next_edit_is_adjacent() {
     let again = json!({ "file_path": path.to_string_lossy(), "old_string": "y = 2", "new_string": "y = 2\n# b1\n# b2" });
     assert!(matches!(trimming(Some(&state), Some("ts"), "Edit", again, Provider::Claude), Verdict::Allow));
     let adjacent = json!({ "file_path": path.to_string_lossy(), "old_string": "# a2", "new_string": "# a2\n# b1\n# b2" });
-    let (input, _) = cut(trimming(Some(&state), Some("ts"), "Edit", adjacent, Provider::Claude));
-    assert_eq!(input["new_string"], "# a2");
+    assert!(denied(&trimming(Some(&state), Some("ts"), "Edit", adjacent, Provider::Claude)));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&state);
 }
