@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use guard_common::locale::{message, FormatValue};
 use serde_json::Value;
 

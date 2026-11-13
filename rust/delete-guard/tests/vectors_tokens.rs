@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use std::collections::HashSet;
 
 use delete_guard::tokens;

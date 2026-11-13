@@ -134,10 +134,12 @@ pub fn run_hook(runtime: &str) -> i32 {
     let Some(command) = tool_input.get("command").and_then(Value::as_str) else {
         return 0;
     };
+    let translated = guard_common::powershell::for_guards(command);
+    let command = translated.as_str();
     let mut cwd = payload
         .get("cwd")
         .and_then(Value::as_str)
-        .map(str::to_owned);
+        .map(guard_common::powershell::cwd_form);
     if let Some(workdir) = tool_input
         .get("workdir")
         .and_then(Value::as_str)
@@ -145,7 +147,7 @@ pub fn run_hook(runtime: &str) -> i32 {
     {
         cwd = Some(match cwd.as_deref() {
             Some(base) if !Path::new(workdir).is_absolute() => join_path(base, workdir),
-            _ => workdir.to_owned(),
+            _ => guard_common::powershell::cwd_form(workdir),
         });
     }
     set_pending_ask(None);

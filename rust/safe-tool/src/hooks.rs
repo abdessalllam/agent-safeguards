@@ -318,6 +318,12 @@ pub fn handle_event(runtime: &str, event: &str, payload: &Value) -> Result<(), H
         }
         return Ok(());
     };
+    let translated = guard_common::powershell::for_guards(text);
+    let text = translated.as_str();
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(guard_common::powershell::cwd_form);
     if event == "PreToolUse" {
         if command::sensitive_command(text, true).map_err(|_| HookError::Internal)? {
             let reason = if command::blocked_only_by_proxy(text).map_err(|_| HookError::Internal)? {
@@ -339,10 +345,7 @@ pub fn handle_event(runtime: &str, event: &str, payload: &Value) -> Result<(), H
         } else if command::require_rtk() && command::rtk_required(text) {
             command::deny_hook("safe_tool.deny.rtk");
         } else if runtime == "claude"
-            && local_only::requires_local_artifact_approval(
-                text,
-                payload.get("cwd").and_then(Value::as_str),
-            )
+            && local_only::requires_local_artifact_approval(text, cwd.as_deref())
             .map_err(|_| HookError::Internal)?
         {
             command::ask_local_artifact_hook();

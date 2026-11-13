@@ -88,7 +88,10 @@ pub fn names_trash(path: &str) -> bool {
 }
 
 fn normpath(path: &str) -> String {
-    let initial_slashes = if path.starts_with("//") && !path.starts_with("///") {
+    let drive = if guard_common::pathform::has_drive(path) && cfg!(windows) { path.get(..2) } else { None };
+    let initial_slashes = if drive.is_some() {
+        ""
+    } else if path.starts_with("//") && !path.starts_with("///") {
         "//"
     } else if path.starts_with('/') {
         "/"
@@ -96,21 +99,22 @@ fn normpath(path: &str) -> String {
         ""
     };
     let mut components = Vec::new();
-    for part in path.split('/') {
+    for part in path.get(drive.map_or(0, str::len)..).unwrap_or("").split('/') {
         if part.is_empty() || part == "." {
             continue;
         }
         if part == ".." {
             if components.last().is_some_and(|last| *last != "..") {
                 components.pop();
-            } else if initial_slashes.is_empty() {
+            } else if initial_slashes.is_empty() && drive.is_none() {
                 components.push(part);
             }
         } else {
             components.push(part);
         }
     }
-    let result = format!("{initial_slashes}{}", components.join("/"));
+    let root = drive.map_or_else(|| initial_slashes.to_owned(), |letter| format!("{letter}/"));
+    let result = format!("{root}{}", components.join("/"));
     if result.is_empty() {
         ".".to_owned()
     } else {
@@ -130,8 +134,16 @@ pub fn trash_roots() -> Vec<String> {
     let home = user_home();
     let mut roots = vec![join(home, ".Trash"), join(home, ".local/share/Trash")];
     if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
-        if data_home.starts_with('/') {
+        if guard_common::pathform::is_absolute(&data_home) {
             roots.push(join(&normpath(&data_home), "Trash"));
+        }
+    }
+    if cfg!(windows) {
+        let mut drives: Vec<String> = Vec::new();
+        drives.extend(home.get(..2).filter(|_| guard_common::pathform::has_drive(home)).map(str::to_owned));
+        drives.extend(std::env::var("SystemDrive").ok());
+        for drive in drives {
+            roots.push(format!("{drive}/$Recycle.Bin"));
         }
     }
     let resolved: Vec<String> = roots.iter().map(|root| realpath(root)).collect();

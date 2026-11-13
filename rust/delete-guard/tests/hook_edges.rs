@@ -61,6 +61,7 @@ fn internal(home: &Home, command: &str) -> bool {
     run(home, &payload(home, command), 300.0, &home.0).contains("internal error")
 }
 
+#[cfg(unix)]
 #[test]
 fn the_recursion_budget_matches_python_for_eval_remote_and_substitution_chains() {
     let home = home("recursion");
@@ -83,6 +84,7 @@ fn a_word_with_a_backwards_bracket_range_is_not_an_internal_error() {
     assert!(!internal(&home, "./[z-a]script.sh"));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_quoted_here_document_read_by_a_data_tool_or_interpreter_is_not_commands() {
     let home = home("heredocs");
@@ -107,6 +109,7 @@ fn a_quoted_here_document_read_by_a_data_tool_or_interpreter_is_not_commands() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn an_empty_cwd_is_an_unknown_folder_and_a_relative_workdir_joins_it_as_python_does() {
     let home = home("cwd");

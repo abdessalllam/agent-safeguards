@@ -77,7 +77,7 @@ fn default_trusted_dirs(user_home: &str) -> Vec<String> {
         }
     }
     dirs.push(join_dir(user_home, ".local\\bin"));
-    dirs
+    dirs.iter().map(|dir| dir.replace('/', "\\")).collect()
 }
 
 /// Passwd home when the account exists, otherwise `HOME`, otherwise `/`, then realpath.

@@ -4,8 +4,6 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use std::os::unix::process::ExitStatusExt;
-
 use crate::consts::{MAX_OUTPUT_BYTES, SAFE_ENV_KEYS};
 
 pub struct ProcessResult {
@@ -78,7 +76,8 @@ fn status_code(status: std::process::ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
     }
-    if let Some(signal) = status.signal() {
+    #[cfg(unix)]
+    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
         return -signal;
     }
     1
@@ -155,6 +154,7 @@ mod tests {
     use crate::consts::MAX_OUTPUT_BYTES;
     use std::time::Instant;
 
+    #[cfg(unix)]
     #[test]
     fn echo_returns_bytes() {
         let result = run(
@@ -168,6 +168,7 @@ mod tests {
         assert!(result.stderr.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn false_returns_one() {
         let result = run(&["/usr/bin/false".to_owned()], "/tmp", 5).expect("false");

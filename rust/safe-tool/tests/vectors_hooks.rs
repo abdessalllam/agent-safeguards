@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use std::io::{Read, Write};
 use std::ops::Deref;
 use std::process::{Command, Stdio};

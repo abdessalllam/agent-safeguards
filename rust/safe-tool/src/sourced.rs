@@ -394,7 +394,7 @@ pub fn follow(home: &str, scan: &mut Scan, read: &[String], max_chars: usize, li
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{expand_glob, follow, glob_matches, loop_texts, resolve, tokens, Limits, Scope};
     use crate::startup_values::{scan_text, Scan};

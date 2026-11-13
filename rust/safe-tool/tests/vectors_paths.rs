@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use safe_tool::{consts, paths};
 use serde_json::{json, Value};
 

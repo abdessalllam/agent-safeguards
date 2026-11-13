@@ -5,6 +5,8 @@ pub mod emit;
 pub mod env;
 pub mod locale;
 pub mod overrides;
+pub mod pathform;
+pub mod powershell;
 pub mod pyengine;
 pub mod pychars;
 pub mod pyglob;

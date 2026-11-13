@@ -439,7 +439,7 @@ pub fn expand(path: &str, cwd: Option<&str>) -> Result<Option<String>, ExpandErr
     if path.starts_with('~') {
         return Ok(None);
     }
-    let path = if path.starts_with('/') {
+    let path = if guard_common::pathform::is_absolute(&path) {
         path
     } else {
         let Some(cwd) = cwd else { return Ok(None) };

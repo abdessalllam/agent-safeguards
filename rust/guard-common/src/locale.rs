@@ -13,8 +13,25 @@ pub enum FormatValue {
     Float(f64),
 }
 
+fn platform_template(key: &str) -> String {
+    if crate::powershell::active() {
+        let mut options: Vec<String> = Vec::new();
+        if crate::env::env_flag("AGENT_SAFEGUARDS_RECYCLE_OK") {
+            options.push(format!("{key}.windows_recycle"));
+        }
+        options.push(format!("{key}.windows"));
+        for option in options {
+            let found = template_for(&option);
+            if found != option {
+                return found;
+            }
+        }
+    }
+    template_for(key)
+}
+
 pub fn message(key: &str, values: &[(&str, FormatValue)]) -> String {
-    let template = template_for(key);
+    let template = platform_template(key);
     match render(&template, values) {
         Ok(rendered) => rendered,
         Err(()) => template,

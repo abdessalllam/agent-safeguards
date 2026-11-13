@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;

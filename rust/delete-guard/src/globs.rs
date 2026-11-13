@@ -106,7 +106,7 @@ pub fn glob_matches(raw: &str, cwd: Option<&str>, verb: &str) -> Result<Vec<Stri
         return Ok(Vec::new());
     }
     let mut pattern = home_expanded(raw);
-    if !pattern.starts_with('/') {
+    if !guard_common::pathform::is_absolute(&pattern) {
         let Some(cwd) = cwd else {
             return Ok(Vec::new());
         };

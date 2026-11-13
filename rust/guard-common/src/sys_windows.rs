@@ -103,13 +103,15 @@ pub struct EmbeddedNul;
 
 fn plain(path: &Path) -> String {
     let text = path.to_string_lossy().into_owned();
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        return format!(r"\\{rest}");
-    }
-    match text.strip_prefix(r"\\?\") {
-        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_owned(),
-        _ => text,
-    }
+    let stripped = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        match text.strip_prefix(r"\\?\") {
+            Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_owned(),
+            _ => text,
+        }
+    };
+    stripped.replace('\\', "/")
 }
 
 /// Python `os.path.realpath` on Windows: resolve links and keep a missing tail.
@@ -225,9 +227,9 @@ mod tests {
         let real = dir.join("real");
         fs::create_dir_all(&real).expect("folder");
         let canonical = realpath(&real.to_string_lossy());
-        assert!(!canonical.starts_with(r"\\?\"), "{canonical}");
+        assert!(!canonical.starts_with(r"\\?\") && !canonical.contains('\\'), "{canonical}");
         let missing = format!("{}\\no-such\\..\\file.txt", real.display());
-        assert_eq!(realpath(&missing), format!("{canonical}\\file.txt"));
+        assert_eq!(realpath(&missing), format!("{canonical}/file.txt"));
         assert_eq!(realpath(&format!("{}/sub/../", real.display())), canonical);
         assert_eq!(try_realpath("a\0b"), Err(EmbeddedNul));
         if std::os::windows::fs::symlink_dir(&real, dir.join("link")).is_ok() {

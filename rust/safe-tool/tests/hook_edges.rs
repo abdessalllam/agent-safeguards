@@ -27,6 +27,7 @@ fn home(name: &str) -> Home {
 struct Run {
     code: Option<i32>,
     stdout: String,
+    #[cfg_attr(not(unix), allow(dead_code))]
     seconds: f64,
 }
 
@@ -104,6 +105,7 @@ fn a_command_nested_past_the_recursion_limit_is_an_internal_denial() {
     assert!(denied_with(&run, "safe_tool.deny.internal"), "{}", run.stdout);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_read_blocked_on_a_pipe_ends_with_the_timeout_denial() {
     let home = home("fifo");

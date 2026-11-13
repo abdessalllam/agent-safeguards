@@ -2,7 +2,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
@@ -254,6 +255,20 @@ pub fn check_script(raw: &str, cwd: Option<&str>, shell: bool) -> Result<(), Sto
     Ok(())
 }
 
+#[cfg(unix)]
+fn modified_ns(status: &fs::Metadata) -> i128 {
+    use std::os::unix::fs::MetadataExt;
+    i128::from(status.mtime())
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i128::from(status.mtime_nsec()))
+}
+
+#[cfg(not(unix))]
+fn modified_ns(status: &fs::Metadata) -> i128 {
+    let since_epoch = status.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+    since_epoch.map_or(0, |elapsed| i128::try_from(elapsed.as_nanos()).unwrap_or(0))
+}
+
 pub fn check_script_file(raw: &str, cwd: Option<&str>, shell: bool) -> Result<(), Stop> {
     let Some(resolved) = expand(raw, cwd).map_err(Stop::from)? else {
         return Ok(());
@@ -288,9 +303,7 @@ pub fn check_script_file(raw: &str, cwd: Option<&str>, shell: bool) -> Result<()
     let key = ScriptKey {
         path: resolved.clone(),
         size: status.len(),
-        mtime_ns: i128::from(status.mtime())
-            .saturating_mul(1_000_000_000)
-            .saturating_add(i128::from(status.mtime_nsec())),
+        mtime_ns: modified_ns(&status),
         cwd: cwd.map(str::to_owned),
         stdin: stdin_files(),
         variables,

@@ -37,7 +37,7 @@ pub fn startup_key_file(requested: Option<&str>) -> Result<Option<String>, Embed
     let expanded = requested
         .strip_prefix("~/")
         .map_or_else(|| requested.to_owned(), |rest| format!("{home}/{rest}"));
-    if !expanded.starts_with('/')
+    if !guard_common::pathform::is_absolute(&expanded)
         || sys::try_realpath(dirname(&expanded))? != home
         || !consts::STARTUP_KEY_FILES.contains(&basename(&expanded))
     {

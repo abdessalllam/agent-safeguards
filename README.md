@@ -161,7 +161,7 @@ Read this before relying on it.
 - It parses commands heuristically. It is a safety net against mistakes and prompt injection, not a sandbox, and a determined agent can find commands it does not recognize.
 - **A hook that times out or crashes before answering does not block the command.** This is how both hosts work. The hooks catch their own internal errors and block in that case, the launcher blocks when `python3` is missing, and `safe-tool` stops its own check after 3 seconds and blocks, so a command that is too large or too slow to check is refused, but a host-level timeout of another hook, or a machine so loaded that Python cannot start in time, still lets the command through.
 - The settings below are plain environment variables. An agent that can change your environment or your agent settings file can change them, so protect those files the way you protect the hooks themselves.
-- Windows is not supported.
+- Windows: the Rust guards in `rust/` and `extras/comment-guard` build and pass their tests on Windows PowerShell 5.1, and on Windows `safe-tool` and `delete-guard` read PowerShell and `cmd` commands (`Remove-Item`, `del`, `rd`, `Get-Content`, `type`, `Select-String`, `Get-ChildItem Env:`, .NET `File` and `Directory` calls). The plugin launcher and the install steps below are still macOS and Linux only. On Windows the Recycle Bin is not offered as a way to delete unless the host sets `AGENT_SAFEGUARDS_RECYCLE_OK=1`, because a Recycle Bin call from inside a sandbox can delete for good.
 
 ## Install
 

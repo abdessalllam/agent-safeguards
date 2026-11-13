@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileTypeExt;
 use std::path::{Component, Path, PathBuf};
 
 use guard_common::{env, shell, sys};
@@ -117,10 +116,22 @@ pub fn git_exclude_path(root: &str) -> Option<String> {
     let value = python_strip(raw);
     let path = absolute_path(root, value);
     let rendered = path.to_string_lossy().into_owned();
-    if !rendered.ends_with("/info/exclude") {
+    let unified = if cfg!(windows) { rendered.replace('\\', "/") } else { rendered.clone() };
+    if !unified.ends_with("/info/exclude") {
         return None;
     }
     Some(rendered)
+}
+
+#[cfg(unix)]
+fn is_pipe_or_socket(kind: std::fs::FileType) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    kind.is_fifo() || kind.is_socket()
+}
+
+#[cfg(not(unix))]
+fn is_pipe_or_socket(_kind: std::fs::FileType) -> bool {
+    false
 }
 
 pub fn open_without_symlinks(path: &str) -> Result<File, OpenError> {
@@ -144,7 +155,7 @@ pub fn ensure_local_excludes(cwd: &str) -> Result<bool, EnsureError> {
     let Some(path) = git_exclude_path(&root) else {
         return Ok(false);
     };
-    if sys::realpath(&path) != path {
+    if guard_common::pathform::slashed(&sys::realpath(&path)) != guard_common::pathform::slashed(&path) {
         return Ok(false);
     }
     let mut handle = match open_without_symlinks(&path) {
@@ -155,7 +166,7 @@ pub fn ensure_local_excludes(cwd: &str) -> Result<bool, EnsureError> {
     let Ok(metadata) = handle.metadata() else {
         return Ok(false);
     };
-    if !metadata.is_file() || metadata.file_type().is_fifo() || metadata.file_type().is_socket() {
+    if !metadata.is_file() || is_pipe_or_socket(metadata.file_type()) {
         return Ok(false);
     }
     if handle.lock().is_err() {
@@ -321,10 +332,11 @@ pub fn requires_local_artifact_approval(
 mod tests {
     use super::{
         decoded_paths, ensure_local_excludes, is_force_git_add, is_safe_tool_commit,
-        open_without_symlinks, requires_local_artifact_approval, EnsureError,
+        requires_local_artifact_approval, EnsureError,
     };
     use crate::git::{assert_mock_consumed, mock_git_calls};
     use crate::process::ProcessResult;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
@@ -379,8 +391,10 @@ mod tests {
         assert!(decoded_paths(Some(&invalid)).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn opens_plain_file_but_rejects_links() {
+        use super::open_without_symlinks;
         let parent = std::env::var("CARGO_TARGET_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::temp_dir());

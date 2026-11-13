@@ -416,6 +416,17 @@ pub fn temp_roots() -> &'static [String] {
     }
     static CACHE: LazyLock<Vec<String>> = LazyLock::new(|| {
         let mut paths = Vec::new();
+        if cfg!(windows) {
+            for name in ["TEMP", "TMP", "TMPDIR"] {
+                if let Some(value) = std::env::var_os(name) {
+                    paths.push(guard_common::sys::realpath(&value.to_string_lossy()));
+                }
+            }
+            if let Some(root) = std::env::var_os("SystemRoot") {
+                paths.push(guard_common::sys::realpath(&format!("{}/Temp", root.to_string_lossy())));
+            }
+            return paths;
+        }
         for path in ["/tmp", "/private/tmp", "/var/tmp", "/var/folders", "/private/var/folders"] {
             paths.push(guard_common::sys::realpath(path));
         }
@@ -437,13 +448,36 @@ pub fn etc_paths() -> &'static [String] {
 pub fn system_root_paths() -> &'static [String] {
     static CACHE: LazyLock<Vec<String>> = LazyLock::new(|| {
         let mut paths = BTreeSet::new();
-        for path in SYSTEM_ROOTS {
-            paths.insert((*path).to_string());
+        let listed: Vec<String> = if cfg!(windows) {
+            windows_system_roots()
+        } else {
+            SYSTEM_ROOTS.iter().map(|path| (*path).to_string()).collect()
+        };
+        for path in &listed {
+            paths.insert(path.clone());
             paths.insert(guard_common::sys::realpath(path));
         }
         paths.into_iter().collect()
     });
     CACHE.as_slice()
+}
+
+fn windows_system_roots() -> Vec<String> {
+    let mut roots: Vec<String> = ('A'..='Z')
+        .map(|letter| format!("{letter}:/"))
+        .filter(|root| std::path::Path::new(root).exists())
+        .collect();
+    for name in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData", "PUBLIC"] {
+        if let Some(value) = std::env::var_os(name) {
+            roots.push(guard_common::sys::realpath(&value.to_string_lossy()));
+        }
+    }
+    let home = guard_common::env::user_home();
+    if let Some((parent, _)) = home.rsplit_once('/') {
+        roots.push(format!("{parent}/"));
+        roots.push(parent.to_owned());
+    }
+    roots
 }
 
 pub fn in_system_root_path(path: &str) -> bool {

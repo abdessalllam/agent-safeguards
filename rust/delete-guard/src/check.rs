@@ -794,8 +794,10 @@ pub fn check_chunks(command: &str, cwd: Option<&str>) -> Result<(), Stop> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::{check_command, git_clean, pattern_word, writes_a_file};
 
+    #[cfg(unix)]
     #[test]
     fn device_and_git_guards() {
         assert!(!writes_a_file(">&", "2"));

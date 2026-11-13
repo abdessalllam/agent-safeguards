@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use serde_json::{json, Value};
 use std::io::ErrorKind;
 use std::os::unix::fs::symlink;

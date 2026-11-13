@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use guard_common::shell::HereDocument;
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;

@@ -105,7 +105,7 @@ pub fn deny_text(denial: &Denied) -> String {
 }
 
 fn accept_root(entry: &str) -> bool {
-    let anchored = entry.starts_with("~/") || entry.starts_with('/');
+    let anchored = entry.starts_with("~/") || guard_common::pathform::is_absolute(entry);
     let parts: Vec<&str> = entry.split('/').collect();
     let mut rest_ok = true;
     match parts.get(1..) {
@@ -128,7 +128,10 @@ fn accept_root(entry: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ask, ask_text, deny_text, pending_ask, remote_roots, set_pending_ask};
+    #[cfg(unix)]
+    use super::deny_text;
+    use super::{ask, ask_text, pending_ask, remote_roots, set_pending_ask};
+    #[cfg(unix)]
     use crate::errors::Denied;
     use guard_common::locale::FormatValue;
 
@@ -155,6 +158,7 @@ mod tests {
         assert!(text.contains("the whole project"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn deny_text_uses_the_remote_wording_only_for_remote_denials() {
         let local = deny_text(&Denied::new("outside the repository"));

@@ -82,7 +82,7 @@ pub fn covers_home_at(operand: &str, home: &str, cwd: &str) -> Result<bool, Embe
     if expanded.starts_with('~') {
         expanded = pyglob::expanduser(&expanded)?;
     }
-    if !expanded.starts_with('/') {
+    if !guard_common::pathform::is_absolute(&expanded) {
         expanded = if cwd.is_empty() || cwd.ends_with('/') {
             format!("{cwd}{expanded}")
         } else {
@@ -492,6 +492,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn recursive_home_search_and_sensitive_path_policy() {
         let home = "/private/tmp/s2-home";

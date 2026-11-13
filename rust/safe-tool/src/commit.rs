@@ -52,7 +52,7 @@ pub fn commit_hook_exists(root: &str) -> bool {
         .iter()
         .any(|name| {
             let path = folder.join(name);
-            path.is_file() && sys::access_executable(&path.to_string_lossy())
+            path.is_file() && (cfg!(windows) || sys::access_executable(&path.to_string_lossy()))
         })
 }
 
@@ -304,6 +304,7 @@ mod tests {
     use crate::git::{assert_mock_consumed, mock_git_calls};
     use crate::process::ProcessResult;
     use serde_json::{json, Value};
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::PathBuf;
 
@@ -574,13 +575,11 @@ mod tests {
         let hooks = root.join("hooks");
         std::fs::create_dir_all(&hooks).expect("fixture hooks");
         let hook = hooks.join("pre-commit");
-        let opened = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o755)
-            .open(&hook)
-            .expect("fixture hook");
-        drop(opened);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o755);
+        drop(options.open(&hook).expect("fixture hook"));
         mock_git_calls(vec![(
             vec!["rev-parse".into(), "--git-path".into(), "hooks".into()],
             finished(0, b"hooks\n", b""),
