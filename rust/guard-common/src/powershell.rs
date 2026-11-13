@@ -1065,6 +1065,62 @@ fn change_directory(words: &[Word]) -> String {
     with_tail("cd", &paths_text(&targets))
 }
 
+fn slash_options(words: &[Word]) -> (Vec<Word>, Vec<String>) {
+    let mut operands: Vec<Word> = Vec::new();
+    let mut options: Vec<String> = Vec::new();
+    for word in words {
+        match word.literal() {
+            Some(text) if text.len() > 1 && text.starts_with('/') => options.push(text.to_ascii_lowercase()),
+            _ => operands.push(word.clone()),
+        }
+    }
+    (operands, options)
+}
+
+fn robocopy(words: &[Word]) -> String {
+    let (operands, options) = slash_options(words);
+    let [source, target, ..] = operands.as_slice() else {
+        return generic(words);
+    };
+    let has = |wanted: &[&str]| options.iter().any(|option| wanted.contains(&option.split(':').next().unwrap_or("")));
+    if has(&["/mir", "/purge"]) {
+        return with_tail("rm -rf", &target.emit_path());
+    }
+    let verb = if has(&["/move", "/mov"]) { "mv" } else { "cp -r" };
+    with_tail(verb, &with_tail(&source.emit_path(), &target.emit_path()))
+}
+
+fn xcopy(words: &[Word]) -> String {
+    let (operands, options) = slash_options(words);
+    let flags = if options.iter().any(|option| option == "/y") { "-rf" } else { "-r" };
+    let tail = operands.iter().take(2).map(Word::emit_path).collect::<Vec<_>>().join(" ");
+    with_tail(&with_tail("cp", flags), &tail)
+}
+
+fn clear_recycle_bin(words: &[Word]) -> String {
+    let args = parse_args(
+        &[
+            param("driveletter", &[], true),
+            param("force", &[], false),
+            param("confirm", &["cf"], false),
+            param("whatif", &["wi"], false),
+        ],
+        words,
+    );
+    if args.flags.contains("whatif") {
+        return "true".to_owned();
+    }
+    let mut drives: Vec<String> = named(&args, &["driveletter"]).iter().filter_map(Word::literal).collect();
+    if drives.is_empty() {
+        drives.push(std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_owned()));
+    }
+    let commands: Vec<String> = drives
+        .iter()
+        .map(|drive| format!("rm -rf {}", quote(&format!("{}:/$Recycle.Bin", drive.trim_end_matches([':', '/', '\\'])))))
+        .collect();
+    commands.join(" ; ")
+}
+
 const WRITE: [Param; 18] = [
     param("path", &[], true),
     param("filepath", &["fp"], true),
@@ -1421,6 +1477,9 @@ fn dispatch(words: &[Word], depth: usize, piped: bool) -> String {
         "set-location" | "sl" | "cd" | "chdir" | "push-location" | "pushd" => change_directory(rest),
         "set-content" | "sc" | "out-file" | "clear-content" | "clc" | "tee-object" | "tee" | "export-csv" | "export-clixml" => write(rest, false),
         "add-content" | "ac" => write(rest, true),
+        "robocopy" => robocopy(rest),
+        "xcopy" => xcopy(rest),
+        "clear-recyclebin" => clear_recycle_bin(rest),
         "new-item" | "ni" => new_item(rest),
         "rename-item" | "rni" | "ren" => rename(rest),
         "start-process" | "start" | "saps" => start_process(rest, depth),
@@ -1791,6 +1850,14 @@ mod tests {
             (r"icm -ComputerName srv1 -ScriptBlock { Remove-Item /srv/x -Recurse }", "ssh srv1 'rm -r /srv/x'"),
             (r"Start-Job { Remove-Item C:\x }", "bash -c 'rm C:/x'"),
             (r"Invoke-Command -FilePath C:\s.ps1", "bash C:/s.ps1"),
+            (r"robocopy C:\src D:\dst /MIR", "rm -rf D:/dst"),
+            (r"robocopy C:\src D:\dst *.txt /PURGE /XD bin", "rm -rf D:/dst"),
+            (r"robocopy C:\src D:\dst /E /LOG:x.log", "cp -r C:/src D:/dst"),
+            (r"robocopy C:\src D:\dst /MOVE", "mv C:/src D:/dst"),
+            (r"xcopy C:\src D:\dst /E /Y", "cp -rf C:/src D:/dst"),
+            (r"xcopy C:\a.txt D:\", "cp -r C:/a.txt D:/"),
+            (r"Clear-RecycleBin -DriveLetter D -Force", "rm -rf 'D:/$Recycle.Bin'"),
+            (r"Clear-RecycleBin -DriveLetter C: -WhatIf", "true"),
             (r".\run.ps1 -Force", "bash ./run.ps1"),
             (r"& 'C:\my tools\clean.bat' arg", "bash 'C:/my tools/clean.bat'"),
         ]);

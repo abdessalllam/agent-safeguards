@@ -89,6 +89,29 @@ fn script_files_run_by_path_are_read_and_judged_even_when_saved_as_utf16() {
 }
 
 #[test]
+fn mirrors_and_an_emptied_recycle_bin_are_refused_and_a_temp_mirror_is_allowed() {
+    let home = profile();
+    let temp = temp();
+    for command in [
+        format!("robocopy C:\\src '{home}\\Documents\\old' /MIR"),
+        "robocopy C:\\src C:\\Users /PURGE".to_owned(),
+        "Clear-RecycleBin -Force".to_owned(),
+        "Clear-RecycleBin -DriveLetter C -Force".to_owned(),
+    ] {
+        let (decision, reason) = verdict(&command);
+        assert_eq!(decision, "deny", "{command}: {reason}");
+    }
+    for command in [
+        format!("robocopy C:\\src '{temp}\\mirror-x' /MIR"),
+        format!("xcopy C:\\src '{temp}\\x' /E /Y"),
+        "Clear-RecycleBin -Force -WhatIf".to_owned(),
+    ] {
+        let (decision, reason) = verdict(&command);
+        assert_eq!(decision, "allow", "{command}: {reason}");
+    }
+}
+
+#[test]
 fn protected_folders_and_the_profile_itself_are_refused() {
     let home = profile();
     for command in ["Remove-Item C:\\Windows -Recurse".to_owned(), "Remove-Item C:\\ -Recurse -Force".to_owned(), format!("Remove-Item '{home}' -Recurse")] {
