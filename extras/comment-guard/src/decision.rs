@@ -824,9 +824,16 @@ fn tag_boundary(rest: &str) -> bool {
     rest.chars().next().is_none_or(|next| next.is_ascii_whitespace() || next == '>' || next == '/')
 }
 
-fn tag_name(rest: &str) -> &str {
-    let length = rest.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | ':'))).unwrap_or(rest.len());
-    rest.get(..length).unwrap_or("")
+fn raw_text_tag(rest: &str) -> Option<&'static str> {
+    RAW_TEXT_TAGS.iter().copied().find(|tag| rest.strip_prefix(tag).is_some_and(tag_boundary))
+}
+
+fn last_tag(lower: &str, pattern: &str) -> Option<usize> {
+    lower
+        .match_indices(pattern)
+        .filter(|(at, _)| tag_boundary(lower.get(at.saturating_add(pattern.len())..).unwrap_or("")))
+        .map(|(at, _)| at)
+        .last()
 }
 
 // A `>` inside a quoted attribute value does not end the opening tag.
@@ -850,27 +857,24 @@ fn closer_end(rest: &str, tag: &str) -> Option<usize> {
         .map(|(at, _)| at.saturating_add(pattern.len()))
 }
 
-// Walks comments and tags in order, so markup in an attribute or a comment opens nothing.
+// Malformed markup can fool either check alone, so both must say closed.
 fn raw_text_open(before: &str) -> bool {
     let lower = before.to_ascii_lowercase();
     if still_open(lower.rfind("<![cdata["), lower.rfind("]]>")) {
         return true;
     }
+    let unmatched = RAW_TEXT_TAGS
+        .iter()
+        .any(|tag| still_open(last_tag(&lower, &format!("<{tag}")), last_tag(&lower, &format!("</{tag}"))));
+    if unmatched {
+        return true;
+    }
     let mut rest = lower.as_str();
     while let Some(start) = rest.find('<') {
         rest = rest.get(start.saturating_add(1)..).unwrap_or("");
-        if let Some(inside) = rest.strip_prefix("!--") {
-            let Some(end) = inside.find("-->") else { return true };
-            rest = inside.get(end.saturating_add(3)..).unwrap_or("");
-            continue;
-        }
-        if !rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
-            continue;
-        }
-        let name = tag_name(rest);
-        let Some(opened) = rest.get(name.len()..).and_then(tag_end) else { return true };
-        rest = rest.get(name.len().saturating_add(opened)..).unwrap_or("");
-        let Some(tag) = RAW_TEXT_TAGS.iter().copied().find(|raw| *raw == name) else { continue };
+        let Some(tag) = raw_text_tag(rest) else { continue };
+        let Some(opened) = rest.get(tag.len()..).and_then(tag_end) else { return true };
+        rest = rest.get(tag.len().saturating_add(opened)..).unwrap_or("");
         match closer_end(rest, tag) {
             Some(end) => rest = rest.get(end..).unwrap_or(""),
             None => return true,
