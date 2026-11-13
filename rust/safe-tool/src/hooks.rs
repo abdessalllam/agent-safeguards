@@ -325,7 +325,9 @@ pub fn handle_event(runtime: &str, event: &str, payload: &Value) -> Result<(), H
         .and_then(Value::as_str)
         .map(guard_common::powershell::cwd_form);
     if event == "PreToolUse" {
-        if command::sensitive_command(text, true).map_err(|_| HookError::Internal)? {
+        if guard_common::powershell::unjudgeable(text) {
+            command::deny_hook("safe_tool.deny.unjudgeable");
+        } else if command::sensitive_command(text, true).map_err(|_| HookError::Internal)? {
             let reason = if command::blocked_only_by_proxy(text).map_err(|_| HookError::Internal)? {
                 "safe_tool.deny.proxy"
             } else if command::blocked_only_by_startup_file(text)

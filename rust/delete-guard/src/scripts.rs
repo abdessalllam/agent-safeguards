@@ -282,7 +282,7 @@ pub fn check_script_file(raw: &str, cwd: Option<&str>, shell: bool) -> Result<()
     let Some(data) = read_regular_file(&resolved, MAX_SCRIPT_BYTES)? else {
         return Ok(());
     };
-    let wide = guard_common::powershell::has_wide_bom(&data);
+    let wide = guard_common::powershell::active() && guard_common::powershell::has_wide_bom(&data);
     if data.len() > MAX_SCRIPT_BYTES || (!wide && data.get(..data.len().min(1024)).unwrap_or(&[]).contains(&0))
     {
         return Ok(());

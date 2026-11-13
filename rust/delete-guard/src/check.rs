@@ -658,6 +658,9 @@ fn check_substitution(command: &str, cwd: Option<&str>) -> Result<(), Stop> {
 }
 
 fn check_command_level(command: &str, cwd: Option<&str>) -> Result<(), Stop> {
+    if guard_common::powershell::unjudgeable(command) {
+        return Err(denied("delete_guard.deny_unjudgeable", &[]));
+    }
     let command_owned = if command.contains("<<") {
         without_text_heredocs(command)
     } else {

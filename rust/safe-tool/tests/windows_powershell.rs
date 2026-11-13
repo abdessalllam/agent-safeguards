@@ -39,6 +39,10 @@ fn powershell_and_cmd_reads_of_keys_and_environment_are_refused() {
         "cmd /c type %USERPROFILE%\\.ssh\\id_rsa".to_owned(),
         format!("[IO.File]::ReadAllText('{home}\\.ssh\\id_rsa')"),
         format!("Select-String -Path '{home}\\.env' -Pattern TOKEN"),
+        format!("Set-Content -Path $env:TEMP\\out.txt -Value (Get-Content '{home}\\.ssh\\id_rsa')"),
+        "Invoke-Expression -Command 'Get-Content ~\\.ssh\\id_rsa'".to_owned(),
+        "Get-Item -Path Env:EXAMPLE_TOKEN".to_owned(),
+        "powershell -EncodedCommand !!!".to_owned(),
     ] {
         assert_eq!(decision(&command), "deny", "{command}");
     }

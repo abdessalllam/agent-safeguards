@@ -5,6 +5,12 @@ use crate::shlex::quote;
 const COMMA: char = '\u{1f}';
 const MAX_DEPTH: usize = 6;
 const MAX_TOKENS: usize = 20_000;
+const UNJUDGEABLE: &str = "eval \"${undecodable}\"";
+
+/// True when the translation gave up, so the command cannot be judged.
+pub fn unjudgeable(converted: &str) -> bool {
+    active() && converted.contains(UNJUDGEABLE)
+}
 const KEYWORDS: [&str; 17] = [
     "if", "elseif", "else", "while", "for", "foreach", "switch", "do", "until", "try", "catch", "finally", "begin",
     "process", "end", "foreach-object", "%",
@@ -21,6 +27,7 @@ enum Part {
 struct Word {
     parts: Vec<Part>,
     quoted: bool,
+    opens_quoted: bool,
     call: bool,
 }
 
@@ -213,6 +220,12 @@ impl Lexer {
     fn run(mut self) -> Vec<Tok> {
         while let Some(c) = self.peek(0) {
             if self.out.len() > MAX_TOKENS {
+                self.sep(";");
+                self.out.push(Tok::Word(Word::lit("eval")));
+                self.out.push(Tok::Word(Word {
+                    parts: vec![Part::Var("undecodable".to_owned())],
+                    ..Word::default()
+                }));
                 break;
             }
             match c {
@@ -385,7 +398,36 @@ impl Lexer {
         Some(self.chars.get(begin..self.pos).map(|slice| slice.iter().collect()).unwrap_or_default())
     }
 
-    fn here_string(&mut self) -> Option<String> {
+    fn expandable(&self, text: &str) -> Vec<Part> {
+        let mut inner = Lexer {
+            chars: text.chars().collect(),
+            pos: 0,
+            out: Vec::new(),
+            start: false,
+            closers: Vec::new(),
+            depth: self.depth,
+        };
+        let mut parts: Vec<Part> = Vec::new();
+        let mut lit = String::new();
+        while let Some(c) = inner.peek(0) {
+            if c == '$' {
+                inner.expansion(&mut parts, &mut lit);
+            } else if c == '`' {
+                inner.pos += 1;
+                if let Some(next) = inner.peek(0) {
+                    inner.pos += 1;
+                    lit.push(next);
+                }
+            } else {
+                lit.push(c);
+                inner.pos += 1;
+            }
+        }
+        flush(&mut parts, &mut lit);
+        parts
+    }
+
+    fn here_string(&mut self) -> Option<(String, bool)> {
         let begin = self.pos;
         let quote_char = self.peek(1)?;
         self.pos += 2;
@@ -412,13 +454,13 @@ impl Lexer {
                 if text.ends_with('\r') {
                     text.pop();
                 }
-                return Some(text);
+                return Some((text, is_double(quote_char)));
             }
             line_start = c == '\n';
             text.push(c);
             self.pos += 1;
         }
-        Some(text)
+        Some((text, is_double(quote_char)))
     }
 
     fn expansion(&mut self, parts: &mut Vec<Part>, lit: &mut String) {
@@ -513,11 +555,13 @@ impl Lexer {
 
     fn word(&mut self) {
         let at_start = self.start;
+        let opens_quoted = self.peek(0).is_some_and(|c| is_single(c) || is_double(c));
         if self.peek(0) == Some('[') {
             if let Some(call) = self.static_call() {
                 self.out.push(Tok::Word(Word {
                     parts: vec![Part::Lit(call)],
                     quoted: false,
+                    opens_quoted: false,
                     call: true,
                 }));
                 self.start = false;
@@ -525,10 +569,12 @@ impl Lexer {
             }
         }
         if self.peek(0) == Some('@') && self.peek(1).is_some_and(|q| is_single(q) || is_double(q)) {
-            if let Some(text) = self.here_string() {
+            if let Some((text, expands)) = self.here_string() {
+                let parts = if expands { self.expandable(&text) } else { vec![Part::Lit(text)] };
                 self.out.push(Tok::Word(Word {
-                    parts: vec![Part::Lit(text)],
+                    parts,
                     quoted: true,
+                    opens_quoted: true,
                     call: false,
                 }));
                 self.start = false;
@@ -599,6 +645,7 @@ impl Lexer {
         let word = Word {
             parts,
             quoted,
+            opens_quoted,
             call: false,
         };
         if at_start && !quoted {
@@ -731,28 +778,51 @@ fn resolve<'a>(spec: &'a [Param], name: &str) -> Option<&'a Param> {
     }
 }
 
+// `-Name:value` carries its value inline, quoted or not; a quote-led word is an argument.
+fn parameter_shape(word: &Word) -> Option<(String, Option<Word>)> {
+    if word.opens_quoted {
+        return None;
+    }
+    let Some(Part::Lit(head)) = word.parts.first() else {
+        return None;
+    };
+    let body = head.strip_prefix('-').filter(|rest| rest.chars().next().is_some_and(|c| c.is_alphabetic()))?;
+    let Some((name, rest)) = body.split_once(':') else {
+        return word.literal().map(|_| (body.to_owned(), None));
+    };
+    let mut parts: Vec<Part> = Vec::new();
+    if !rest.is_empty() {
+        parts.push(Part::Lit(rest.to_owned()));
+    }
+    parts.extend(word.parts.iter().skip(1).cloned());
+    if parts.is_empty() {
+        return Some((name.to_owned(), None));
+    }
+    Some((
+        name.to_owned(),
+        Some(Word {
+            parts,
+            quoted: word.quoted,
+            opens_quoted: false,
+            call: false,
+        }),
+    ))
+}
+
 fn parse_args(spec: &[Param], words: &[Word]) -> Args {
     let mut args = Args::default();
     let mut index = 0usize;
     while let Some(word) = words.get(index) {
         index += 1;
-        let literal = if word.quoted { None } else { word.literal() };
-        let body = literal
-            .as_deref()
-            .and_then(|text| text.strip_prefix('-'))
-            .filter(|rest| rest.chars().next().is_some_and(|c| c.is_alphabetic()));
-        let Some(body) = body else {
+        let Some((name, inline)) = parameter_shape(word) else {
             args.positional.push(word.clone());
             continue;
         };
-        let (name, inline) = match body.split_once(':') {
-            Some((name, value)) => (name, Some(value)),
-            None => (body, None),
-        };
+        let name = name.as_str();
         match resolve(spec, name) {
             Some(found) if found.value => {
                 let value = match inline {
-                    Some(text) => Some(Word::lit(text)),
+                    Some(value) => Some(value),
                     None => {
                         let next = words.get(index).cloned();
                         index += usize::from(next.is_some());
@@ -764,7 +834,8 @@ fn parse_args(spec: &[Param], words: &[Word]) -> Args {
                 }
             }
             Some(found) => {
-                if !matches!(inline.map(str::to_ascii_lowercase).as_deref(), Some("false" | "0")) {
+                let off = inline.and_then(|value| value.literal()).map(|text| text.to_ascii_lowercase());
+                if !matches!(off.as_deref(), Some("false" | "0")) {
                     args.flags.insert(found.name);
                 }
             }
@@ -789,6 +860,7 @@ fn split_commas(word: Word) -> Vec<Word> {
                         out.push(Word {
                             parts: std::mem::take(&mut current),
                             quoted: word.quoted,
+                            opens_quoted: word.opens_quoted,
                             call: false,
                         });
                     }
@@ -804,6 +876,7 @@ fn split_commas(word: Word) -> Vec<Word> {
         out.push(Word {
             parts: current,
             quoted: word.quoted,
+            opens_quoted: word.opens_quoted,
             call: false,
         });
     }
@@ -868,6 +941,12 @@ fn env_query(name: &str) -> String {
 fn env_target(words: &[Word]) -> Option<String> {
     let text = words.first()?.literal()?;
     strip_prefix_ignore_case(&text, "env:").map(env_query)
+}
+
+fn item_env(words: &[Word]) -> Option<String> {
+    let args = parse_args(&[param("path", &[], true), param("literalpath", &["lp", "pspath"], true)], words);
+    let target = first_target(&args, &["path", "literalpath"]).into_iter().next()?;
+    strip_prefix_ignore_case(&target.literal()?, "env:").map(env_query)
 }
 
 const REMOVE: [Param; 12] = [
@@ -1083,6 +1162,9 @@ fn robocopy(words: &[Word]) -> String {
         return generic(words);
     };
     let has = |wanted: &[&str]| options.iter().any(|option| wanted.contains(&option.split(':').next().unwrap_or("")));
+    if has(&["/l"]) {
+        return "true".to_owned();
+    }
     if has(&["/mir", "/purge"]) {
         return with_tail("rm -rf", &target.emit_path());
     }
@@ -1092,6 +1174,9 @@ fn robocopy(words: &[Word]) -> String {
 
 fn xcopy(words: &[Word]) -> String {
     let (operands, options) = slash_options(words);
+    if options.iter().any(|option| option == "/l") {
+        return "true".to_owned();
+    }
     let flags = if options.iter().any(|option| option == "/y") { "-rf" } else { "-r" };
     let tail = operands.iter().take(2).map(Word::emit_path).collect::<Vec<_>>().join(" ");
     with_tail(&with_tail("cp", flags), &tail)
@@ -1246,6 +1331,9 @@ fn start_process(words: &[Word], depth: usize) -> String {
     let mut command = vec![program];
     command.extend(list);
     let mut out = dispatch(&command, depth, false);
+    if let Some(folder) = named(&args, &["workingdirectory"]).first() {
+        out = format!("cd {} && {out}", folder.emit_path());
+    }
     for key in ["redirectstandardoutput", "redirectstandarderror"] {
         if let Some(target) = named(&args, &[key]).first() {
             out.push_str(&format!(" > {}", target.emit_path()));
@@ -1336,6 +1424,20 @@ fn joined_text(words: &[Word]) -> String {
 }
 
 fn powershell(words: &[Word], depth: usize) -> String {
+    let folder = words.iter().enumerate().skip(1).find_map(|(at, word)| {
+        let text = word.literal()?.to_ascii_lowercase();
+        let flag = text.strip_prefix('-')?;
+        let is_folder = flag == "wd" || (flag.len() > 1 && "workingdirectory".starts_with(flag));
+        words.get(at.saturating_add(1)).filter(|_| is_folder).map(Word::emit_path)
+    });
+    let out = powershell_flags(words, depth);
+    match folder {
+        Some(folder) => format!("cd {folder} && {out}"),
+        None => out,
+    }
+}
+
+fn powershell_flags(words: &[Word], depth: usize) -> String {
     let mut index = 1usize;
     while let Some(word) = words.get(index) {
         index += 1;
@@ -1352,7 +1454,7 @@ fn powershell(words: &[Word], depth: usize) -> String {
             let value = words.get(index).map(Word::text).unwrap_or_default();
             return match decode_utf16_base64(&value) {
                 Some(inner) => nested(&inner, depth),
-                None => "eval \"$undecodable\"".to_owned(),
+                None => UNJUDGEABLE.to_owned(),
             };
         }
         if is("file") && name.starts_with('f') {
@@ -1399,6 +1501,41 @@ fn unquoted(raw: &str) -> Word {
     }
 }
 
+fn call_args(inner: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut depth = 0usize;
+    for c in inner.chars() {
+        match quote {
+            Some(open) => {
+                current.push(c);
+                if (is_single(open) && is_single(c)) || (is_double(open) && is_double(c)) {
+                    quote = None;
+                }
+            }
+            None if is_single(c) || is_double(c) => {
+                quote = Some(c);
+                current.push(c);
+            }
+            None if matches!(c, '(' | '[' | '{') => {
+                depth += 1;
+                current.push(c);
+            }
+            None if matches!(c, ')' | ']' | '}') => {
+                depth = depth.saturating_sub(1);
+                current.push(c);
+            }
+            None if c == ',' && depth == 0 => out.push(std::mem::take(&mut current)),
+            None => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() || !out.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
 fn static_call_text(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
     let Some((kind, rest)) = lower.split_once("]::") else {
@@ -1408,16 +1545,16 @@ fn static_call_text(raw: &str) -> String {
     let method = rest.split('(').next().unwrap_or("");
     let offset = raw.find('(').map_or(raw.len(), |at| at + 1);
     let inner = raw.get(offset..raw.len().saturating_sub(1)).unwrap_or("");
-    let (first, second) = match inner.split_once(',') {
-        Some((first, second)) => (first, second.trim().to_ascii_lowercase()),
-        None => (inner, String::new()),
-    };
+    let args = call_args(inner);
+    let first = args.first().map_or("", String::as_str);
+    let second = args.get(1).map(|arg| arg.trim().to_ascii_lowercase()).unwrap_or_default();
     let target = unquoted(first);
     match (kind, method) {
         ("environment", "getenvironmentvariable") => env_query(&target.literal().unwrap_or_default()),
         ("environment", _) => "env".to_owned(),
         ("filesystem", "deletefile" | "deletedirectory") => {
-            let recycle = lower.contains("sendtorecyclebin");
+            let asked = args.get(2).is_some_and(|arg| arg.to_ascii_lowercase().contains("sendtorecyclebin"));
+            let recycle = asked && crate::env::env_flag("AGENT_SAFEGUARDS_RECYCLE_OK");
             let verb = match (recycle, method) {
                 (true, _) => "trash",
                 (false, "deletefile") => "rm -f",
@@ -1466,11 +1603,11 @@ fn dispatch(words: &[Word], depth: usize, piped: bool) -> String {
         return with_tail("bash", &first.emit_path());
     }
     let rest = words.get(1..).unwrap_or(&[]);
-    match name_of(first).as_str() {
+    let out = match name_of(first).as_str() {
         "remove-item" | "ri" | "rm" | "rmdir" | "rd" | "del" | "erase" => remove(rest, piped),
         "get-content" | "gc" | "cat" | "type" | "more" => read(rest, piped),
         "get-childitem" | "gci" | "dir" | "ls" => list(rest),
-        "get-item" | "gi" => env_target(rest).unwrap_or_else(|| generic(words)),
+        "get-item" | "gi" => item_env(rest).unwrap_or_else(|| generic(words)),
         "copy-item" | "cpi" | "cp" | "copy" => transfer(rest, "cp"),
         "move-item" | "mi" | "mv" | "move" => transfer(rest, "mv"),
         "select-string" | "sls" => search(rest),
@@ -1486,12 +1623,29 @@ fn dispatch(words: &[Word], depth: usize, piped: bool) -> String {
         "invoke-command" | "icm" | "start-job" | "sajb" => script_block(rest, depth),
         "powershell" | "pwsh" | "powershell_ise" => powershell(words, depth),
         "cmd" => cmd_wrapper(words, depth),
-        "invoke-expression" | "iex" => match rest.first().and_then(Word::literal) {
-            Some(inner) => nested(&inner.replace(COMMA, ","), depth),
-            None => format!("eval {}", rest.iter().map(Word::emit).collect::<Vec<_>>().join(" ")),
-        },
+        "invoke-expression" | "iex" => {
+            let args = parse_args(&[param("command", &[], true)], rest);
+            match named(&args, &["command"]).first().cloned().or_else(|| args.positional.first().cloned()).and_then(|word| word.literal()) {
+                Some(inner) => nested(&inner.replace(COMMA, ","), depth),
+                None => format!("eval {}", rest.iter().map(Word::emit).collect::<Vec<_>>().join(" ")),
+            }
+        }
         _ => generic(words),
+    };
+    keep_subexpressions(rest, out)
+}
+
+// An argument's subexpression still runs when the verb mapping drops the argument.
+fn keep_subexpressions(words: &[Word], mut out: String) -> String {
+    for part in words.iter().flat_map(|word| word.parts.iter()) {
+        if let Part::Sub(inner) = part {
+            if !out.contains(&format!("$({inner})")) {
+                out.push_str(" ; ");
+                out.push_str(inner);
+            }
+        }
     }
+    out
 }
 
 fn generic(words: &[Word]) -> String {
@@ -1572,6 +1726,7 @@ fn cmd_items(line: &str) -> Vec<Item> {
             stage.words.push(Word {
                 parts: std::mem::take(parts),
                 quoted,
+                opens_quoted: false,
                 call: false,
             });
             *open = false;
@@ -1588,7 +1743,7 @@ fn cmd_items(line: &str) -> Vec<Item> {
                 open = true;
                 at += 1;
             }
-        } else if c == '%' && !quoted {
+        } else if c == '%' {
             let end = chars.get(at..).and_then(|rest| rest.iter().position(|x| *x == '%'));
             match end {
                 Some(len) if len > 0 => {
@@ -1633,14 +1788,14 @@ fn cmd_items(line: &str) -> Vec<Item> {
 
 fn cmd_convert(line: &str, depth: usize) -> String {
     if depth > MAX_DEPTH {
-        return format!("eval {}", quote(line));
+        return UNJUDGEABLE.to_owned();
     }
     render(cmd_items(line), depth)
 }
 
 fn convert(command: &str, depth: usize) -> String {
     if depth > MAX_DEPTH {
-        return format!("eval {}", quote(command));
+        return UNJUDGEABLE.to_owned();
     }
     let lexer = Lexer {
         chars: command.chars().collect(),
@@ -1687,10 +1842,10 @@ fn decoded_script(bytes: &[u8]) -> String {
 
 /// A script as the guards read it; `.ps1`, `.cmd` and `.bat` are rewritten on Windows.
 pub fn script_text(path: &str, bytes: &[u8]) -> String {
-    let text = decoded_script(bytes);
     if !active() {
-        return text;
+        return String::from_utf8_lossy(bytes).into_owned();
     }
+    let text = decoded_script(bytes);
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".ps1") || lower.ends_with(".psm1") {
         return to_bash(&text);
@@ -1783,7 +1938,9 @@ mod tests {
             (r"[System.IO.Directory]::Delete('C:\x', $true)", "rm -rf C:/x"),
             (r"[IO.Directory]::Delete('C:\x')", "rmdir C:/x"),
             (r"[IO.File]::Delete('C:\x\a')", "rm -f C:/x/a"),
-            (r"[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('C:\x\a','OnlyErrorDialogs','SendToRecycleBin')", "trash C:/x/a"),
+            (r"[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('C:\x\a','OnlyErrorDialogs','SendToRecycleBin')", "rm -f C:/x/a"),
+            (r"[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('C:\x\SendToRecycleBin.txt','OnlyErrorDialogs','DeletePermanently')", "rm -f C:/x/SendToRecycleBin.txt"),
+            (r"[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('C:\x\a,SendToRecycleBin','OnlyErrorDialogs','DeletePermanently')", "rm -f C:/x/a,SendToRecycleBin"),
             (r"[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('C:\x','OnlyErrorDialogs','DeletePermanently')", "rm -rf C:/x"),
             (r"Copy-Item C:\a.txt C:\b.txt", "cp C:/a.txt C:/b.txt"),
             (r"cp -Recurse -Force -Path C:\a -Destination D:\b", "cp -rf C:/a D:/b"),
@@ -1866,6 +2023,58 @@ mod tests {
         assert_eq!(super::decoded_script(&wide), "Rm");
         assert_eq!(super::decoded_script(&[0xFE, 0xFF, 0, b'R']), "R");
         assert_eq!(super::decoded_script("\u{feff}Rm".as_bytes()), "Rm");
+    }
+
+    #[test]
+    fn what_the_verb_mapping_drops_still_reaches_the_engines() {
+        check(&[
+            (r"Remove-Item -LiteralPath:'C:\Users\me\Documents\old' -Recurse -Force", "rm -rf C:/Users/me/Documents/old"),
+            (r"Remove-Item -Path:$env:USERPROFILE\old -Recurse", "rm -r \"${HOME}/old\""),
+            (
+                r"Set-Content -Path C:\Temp\out.txt -Value (Remove-Item -LiteralPath C:\Users\me\Documents\old -Recurse -Force)",
+                "tee C:/Temp/out.txt ; rm -rf C:/Users/me/Documents/old",
+            ),
+            (
+                r"Set-Content -Path C:\Temp\out.txt -Value (Get-Content C:\Users\me\.ssh\id_rsa)",
+                "tee C:/Temp/out.txt ; cat C:/Users/me/.ssh/id_rsa",
+            ),
+            (
+                "Write-Output @\"\n$(Remove-Item -LiteralPath C:\\Users\\me\\Documents\\old -Recurse -Force)\n\"@",
+                "Write-Output \"$(rm -rf C:/Users/me/Documents/old)\"",
+            ),
+            ("Write-Output @'\n$(Remove-Item x)\n'@", "Write-Output '$(Remove-Item x)'"),
+            (r"Invoke-Expression -Command 'Remove-Item C:\Users\me\Documents\old -Recurse -Force'", "bash -c 'rm -rf C:/Users/me/Documents/old'"),
+            (r#"cmd /c 'rd /s /q "%USERPROFILE%\Documents\old"'"#, "bash -c 'rm -r \"${HOME}/Documents/old\"'"),
+            (
+                r"Start-Process -FilePath powershell -WorkingDirectory 'C:\Users\me\Documents' -ArgumentList '-Command Remove-Item .\old -Recurse -Force' -Wait",
+                "cd C:/Users/me/Documents && bash -c 'rm -rf ./old'",
+            ),
+            (r"pwsh -WorkingDirectory C:\x -Command Remove-Item .\old", "cd C:/x && bash -c 'rm ./old'"),
+            (r"Get-Item -Path Env:EXAMPLE_TOKEN", "printenv EXAMPLE_TOKEN"),
+            (r"gi -LiteralPath Env:X", "printenv X"),
+            (r"robocopy C:\src C:\Users\me\Documents\backup /MIR /L", "true"),
+            (r"xcopy C:\a D:\b /L", "true"),
+        ]);
+    }
+
+    #[test]
+    fn input_the_front_end_cannot_follow_is_left_for_the_engines_to_refuse() {
+        let long = format!("{}Remove-Item C:\\Users\\me\\Documents\\old -Recurse -Force", "Get-Date;".repeat(11_000));
+        assert!(to_bash(&long).ends_with("eval \"${undecodable}\""));
+        let mut nested = String::from(r"Remove-Item C:\x -Recurse");
+        for _ in 0..8 {
+            nested = format!("Invoke-Command -ScriptBlock {{ {nested} }}");
+        }
+        assert!(to_bash(&nested).contains("eval \"${undecodable}\""));
+        assert_eq!(to_bash("powershell -EncodedCommand !!!"), "eval \"${undecodable}\"");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_script_read_is_unchanged_when_the_front_end_is_not_active() {
+        let wide = [0xFF, 0xFE, b'R', 0, b'm', 0];
+        assert_eq!(super::script_text("a.ps1", &wide), String::from_utf8_lossy(&wide));
+        assert_eq!(super::script_text("a.sh", "\u{feff}rm x".as_bytes()), "\u{feff}rm x");
     }
 
     #[test]

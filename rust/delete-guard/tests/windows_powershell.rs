@@ -122,6 +122,27 @@ fn protected_folders_and_the_profile_itself_are_refused() {
 }
 
 #[test]
+fn argument_forms_the_mapping_could_drop_are_still_judged() {
+    let home = profile();
+    for command in [
+        format!("Remove-Item -LiteralPath:'{home}\\Documents\\old' -Recurse -Force"),
+        format!("Set-Content -Path C:\\Temp\\out.txt -Value (Remove-Item -LiteralPath '{home}\\Documents\\old' -Recurse -Force)"),
+        format!("Invoke-Expression -Command 'Remove-Item \"{home}\\Documents\\old\" -Recurse -Force'"),
+        "cmd /c 'rd /s /q \"%USERPROFILE%\\Documents\\old\"'".to_owned(),
+        format!("Start-Process -FilePath powershell -WorkingDirectory '{home}\\Documents' -ArgumentList '-Command Remove-Item .\\old -Recurse -Force' -Wait"),
+        format!("[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('{home}\\a','OnlyErrorDialogs','SendToRecycleBin')"),
+        format!("[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('{home}\\SendToRecycleBin.txt','OnlyErrorDialogs','DeletePermanently')"),
+    ] {
+        let (decision, reason) = verdict(&command);
+        assert_eq!(decision, "deny", "{command}: {reason}");
+    }
+    let (decision, reason) = verdict("powershell -EncodedCommand !!!");
+    assert!(decision == "deny" && reason.contains("could not check"), "{reason}");
+    let (decision, reason) = verdict(&format!("robocopy C:\\src '{home}\\Documents\\backup' /MIR /L"));
+    assert_eq!(decision, "allow", "{reason}");
+}
+
+#[test]
 fn a_temp_folder_a_preview_and_a_read_are_allowed() {
     let temp = temp();
     let home = profile();
