@@ -818,23 +818,55 @@ fn still_open(opened: Option<usize>, closed: Option<usize>) -> bool {
     opened.is_some_and(|at| closed.is_none_or(|end| at > end))
 }
 
-fn last_tag(lower: &str, pattern: &str) -> Option<usize> {
-    lower
-        .match_indices(pattern)
-        .filter(|(at, _)| {
-            let rest = lower.get(at.saturating_add(pattern.len())..).unwrap_or("");
-            rest.chars().next().is_none_or(|next| next.is_whitespace() || next == '>' || next == '/')
-        })
-        .map(|(at, _)| at)
-        .last()
+const RAW_TEXT_TAGS: [&str; 5] = ["script", "style", "textarea", "title", "xmp"];
+
+fn tag_boundary(rest: &str) -> bool {
+    rest.chars().next().is_none_or(|next| next.is_ascii_whitespace() || next == '>' || next == '/')
 }
 
+fn raw_text_tag(rest: &str) -> Option<&'static str> {
+    RAW_TEXT_TAGS.iter().copied().find(|tag| rest.strip_prefix(tag).is_some_and(tag_boundary))
+}
+
+// A `>` inside a quoted attribute value does not end the opening tag.
+fn tag_end(rest: &str) -> Option<usize> {
+    let mut quote = None;
+    for (at, ch) in rest.char_indices() {
+        match (quote, ch) {
+            (None, '"' | '\'') => quote = Some(ch),
+            (Some(open), _) if ch == open => quote = None,
+            (None, '>') => return Some(at.saturating_add(1)),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn closer_end(rest: &str, tag: &str) -> Option<usize> {
+    let pattern = format!("</{tag}");
+    rest.match_indices(&pattern)
+        .find(|(at, _)| tag_boundary(rest.get(at.saturating_add(pattern.len())..).unwrap_or("")))
+        .map(|(at, _)| at.saturating_add(pattern.len()))
+}
+
+// Walks the tags in order so a closer inside an opening tag's attribute is not a closer.
 fn raw_text_open(before: &str) -> bool {
     let lower = before.to_ascii_lowercase();
-    still_open(lower.rfind("<![cdata["), lower.rfind("]]>"))
-        || ["script", "style", "textarea", "title", "xmp"]
-            .iter()
-            .any(|tag| still_open(last_tag(&lower, &format!("<{tag}")), last_tag(&lower, &format!("</{tag}"))))
+    if still_open(lower.rfind("<![cdata["), lower.rfind("]]>")) {
+        return true;
+    }
+    let mut rest = lower.as_str();
+    while let Some(start) = rest.find('<') {
+        rest = rest.get(start.saturating_add(1)..).unwrap_or("");
+        let Some(tag) = raw_text_tag(rest) else { continue };
+        let Some(opened) = rest.get(tag.len()..).and_then(tag_end) else { return true };
+        rest = rest.get(tag.len().saturating_add(opened)..).unwrap_or("");
+        match closer_end(rest, tag) {
+            Some(end) => rest = rest.get(end..).unwrap_or(""),
+            None => return true,
+        }
+    }
+    false
 }
 
 // A plain `<!--` outside raw text is cut; scripts and template tags hold code.
@@ -1076,7 +1108,7 @@ pub fn trimmed_with(change: &Change, docstrings: bool) -> Option<Trimmed> {
                 }
             } else {
                 let guarded = protected(body(line)) || (scanner.line_index() < 3 && directive_shaped(line));
-                if !kept && !same_line && scanner.standalone() && !guarded {
+                if !kept && !same_line && scanner.standalone() && !guarded && (lang != HTML || html_cuttable(&lines, index, index)) {
                     pieces.push(Piece {
                         run: run_id,
                         first: index,

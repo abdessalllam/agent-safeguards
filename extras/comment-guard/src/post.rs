@@ -664,7 +664,7 @@ pub(crate) fn rev_text(path: &Path, rev: &str, deadline: Instant) -> Head {
         return Head::Unavailable;
     }
     if ran.success {
-        return Head::Found(String::from_utf8_lossy(&ran.stdout).into_owned());
+        return Head::Found(decode_text(&ran.stdout).0);
     }
     if absent(&ran.stderr, dir) {
         Head::Missing

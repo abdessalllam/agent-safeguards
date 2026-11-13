@@ -2453,6 +2453,20 @@ fn an_html_comment_block_is_cut_outside_raw_text_elements_and_refused_where_it_c
     refused("template tag in the comment", "<!--\n{% include \"a\" %}\n one\n two\n three\n-->\n");
     refused("template output in the comment", "<!--\n one {{ name }}\n two\n three\n four\n-->\n");
     refused("server tag in the comment", "<!--\n one <?php echo 1; ?>\n two\n three\n four\n-->\n");
+    refused("erb tag in the comment", "<!--\n one <% render %>\n two\n three\n four\n-->\n");
+    refused("interpolation in the comment", "<!--\n one ${name}\n two\n three\n four\n-->\n");
+    refused("one line comment in a textarea", "<textarea>\n<!-- previously -->\n</textarea>\n");
+    refused("one line comment with template output", "<p>x</p>\n<!-- {{ render() }} previously -->\n<p>y</p>\n");
+    refused("one line star comment in the body", "<p>x</p>\n/* previously */\n<p>y</p>\n");
+    refused("closer text in an attribute", &format!("<textarea data-example=\"</textarea>\">\n{block}</textarea>\n"));
+    refused("closer with a no-break space", &format!("<textarea>\n</textarea\u{a0}>\n{block}</textarea>\n"));
+    let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join("o.html"), "<p>x</p>\n<!-- previously -->\n<p>y</p>\n"), Provider::Claude));
+    assert_eq!(input["content"], "<p>x</p>\n<p>y</p>\n");
+    for opener in ["<textarea title=\"a>b\">x</textarea>", "<script src='a>b'></script>"] {
+        let attribute = format!("{opener}\n{block}<p>x</p>\n");
+        let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join("q.html"), &attribute), Provider::Claude));
+        assert_eq!(input["content"], format!("{opener}\n<p>x</p>\n"));
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2929,6 +2943,29 @@ fn a_utf16_file_a_command_wrote_is_judged_and_cut_in_its_own_encoding() {
     std::fs::write(&file, &latin).expect("write");
     let _ = after_trimming(&rig, "codex", "'x' > a.py");
     assert_eq!(std::fs::read(&file).expect("read"), latin);
+}
+
+#[test]
+fn a_committed_utf16_comment_is_not_new_when_a_command_changes_only_code() {
+    let wide = |text: &str| -> Vec<u8> {
+        let mut out = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out
+    };
+    let rig = Rig::new("committed-wide");
+    init_repo(&rig.cwd);
+    let file = rig.cwd.join("a.py");
+    std::fs::write(&file, wide("x = 1\r\n# previously cached\r\n")).expect("write");
+    git(&rig.cwd, &["add", "a.py"]);
+    git(&rig.cwd, &["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "base"]);
+    let command = "python3 update.py";
+    rig.pre_bash_with("cw1", "t1", command);
+    std::fs::write(&file, wide("x = 2\r\n# previously cached\r\n")).expect("write");
+    let out = rig.bash_with_id("cw1", "t1", command);
+    assert!(!blocked(&out), "{out}");
+    assert_eq!(std::fs::read(&file).expect("read"), wide("x = 2\r\n# previously cached\r\n"));
 }
 
 #[test]
