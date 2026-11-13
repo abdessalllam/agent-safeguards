@@ -416,7 +416,13 @@ impl Lexer {
                 inner.pos += 1;
                 if let Some(next) = inner.peek(0) {
                     inner.pos += 1;
-                    lit.push(next);
+                    lit.push(match next {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        '0' => '\0',
+                        other => other,
+                    });
                 }
             } else {
                 lit.push(c);
@@ -834,8 +840,9 @@ fn parse_args(spec: &[Param], words: &[Word]) -> Args {
                 }
             }
             Some(found) => {
+                let unresolved = inline.as_ref().is_some_and(|value| value.literal().is_none());
                 let off = inline.and_then(|value| value.literal()).map(|text| text.to_ascii_lowercase());
-                if !matches!(off.as_deref(), Some("false" | "0")) {
+                if !matches!(off.as_deref(), Some("false" | "0")) && !(unresolved && found.name == "whatif") {
                     args.flags.insert(found.name);
                 }
             }
@@ -939,14 +946,29 @@ fn env_query(name: &str) -> String {
 }
 
 fn env_target(words: &[Word]) -> Option<String> {
-    let text = words.first()?.literal()?;
-    strip_prefix_ignore_case(&text, "env:").map(env_query)
+    words.iter().find_map(|word| strip_prefix_ignore_case(&word.literal()?, "env:").map(env_query))
+}
+
+// `& (gcm Remove-Item) -Path x` is a call: a lookup has no such parameter.
+fn invokes_found_command(rest: &[Word]) -> bool {
+    const LOOKUP: [Param; 9] = [
+        param("name", &[], true),
+        param("module", &[], true),
+        param("commandtype", &[], true),
+        param("totalcount", &[], true),
+        param("erroraction", &["ea"], true),
+        param("verb", &[], true),
+        param("noun", &[], true),
+        param("all", &[], false),
+        param("syntax", &[], false),
+    ];
+    let first_is_name = rest.first().is_some_and(|word| word.literal().is_some_and(|text| !text.starts_with('-')));
+    first_is_name && !parse_args(&LOOKUP, rest).unknown.is_empty()
 }
 
 fn item_env(words: &[Word]) -> Option<String> {
     let args = parse_args(&[param("path", &[], true), param("literalpath", &["lp", "pspath"], true)], words);
-    let target = first_target(&args, &["path", "literalpath"]).into_iter().next()?;
-    strip_prefix_ignore_case(&target.literal()?, "env:").map(env_query)
+    env_target(&first_target(&args, &["path", "literalpath"]))
 }
 
 const REMOVE: [Param; 12] = [
@@ -1332,7 +1354,7 @@ fn start_process(words: &[Word], depth: usize) -> String {
     command.extend(list);
     let mut out = dispatch(&command, depth, false);
     if let Some(folder) = named(&args, &["workingdirectory"]).first() {
-        out = format!("cd {} && {out}", folder.emit_path());
+        out = format!("bash -c {}", quote(&format!("cd {} && {out}", folder.emit_path())));
     }
     for key in ["redirectstandardoutput", "redirectstandarderror"] {
         if let Some(target) = named(&args, &[key]).first() {
@@ -1432,7 +1454,7 @@ fn powershell(words: &[Word], depth: usize) -> String {
     });
     let out = powershell_flags(words, depth);
     match folder {
-        Some(folder) => format!("cd {folder} && {out}"),
+        Some(folder) => format!("bash -c {}", quote(&format!("cd {folder} && {out}"))),
         None => out,
     }
 }
@@ -1536,7 +1558,12 @@ fn call_args(inner: &str) -> Vec<String> {
     out
 }
 
-fn static_call_text(raw: &str) -> String {
+fn recycle_requested(arg: &str) -> bool {
+    let option = arg.trim().trim_matches(|c: char| is_single(c) || is_double(c));
+    option.rsplit([':', '.']).next().is_some_and(|name| name.eq_ignore_ascii_case("sendtorecyclebin"))
+}
+
+fn static_call_text(raw: &str, depth: usize) -> String {
     let lower = raw.to_ascii_lowercase();
     let Some((kind, rest)) = lower.split_once("]::") else {
         return "true".to_owned();
@@ -1549,11 +1576,11 @@ fn static_call_text(raw: &str) -> String {
     let first = args.first().map_or("", String::as_str);
     let second = args.get(1).map(|arg| arg.trim().to_ascii_lowercase()).unwrap_or_default();
     let target = unquoted(first);
-    match (kind, method) {
+    let out = match (kind, method) {
         ("environment", "getenvironmentvariable") => env_query(&target.literal().unwrap_or_default()),
         ("environment", _) => "env".to_owned(),
         ("filesystem", "deletefile" | "deletedirectory") => {
-            let asked = args.get(2).is_some_and(|arg| arg.to_ascii_lowercase().contains("sendtorecyclebin"));
+            let asked = args.get(2).is_some_and(|arg| recycle_requested(arg));
             let recycle = asked && crate::env::env_flag("AGENT_SAFEGUARDS_RECYCLE_OK");
             let verb = match (recycle, method) {
                 (true, _) => "trash",
@@ -1567,7 +1594,9 @@ fn static_call_text(raw: &str) -> String {
         ("directory", "delete") => with_tail("rmdir", &target.emit_path()),
         ("file", _) => with_tail("cat", &target.emit_path()),
         _ => "true".to_owned(),
-    }
+    };
+    let computed = args.iter().filter(|arg| arg.contains('(') && !arg.trim_start().starts_with(is_single));
+    computed.fold(out, |text, arg| format!("{text} ; bash -c {}", quote(&convert(arg.trim(), depth + 1))))
 }
 
 fn assignment(words: &[Word], depth: usize) -> Option<String> {
@@ -1593,14 +1622,14 @@ fn dispatch(words: &[Word], depth: usize, piped: bool) -> String {
         return String::new();
     };
     if first.call {
-        return static_call_text(&first.text());
+        return static_call_text(&first.text(), depth);
     }
     if let Some(done) = assignment(words, depth) {
         return done;
     }
     let script = first.literal().map(|text| text.to_ascii_lowercase());
     if script.is_some_and(|text| [".ps1", ".cmd", ".bat"].iter().any(|extension| text.ends_with(extension))) {
-        return with_tail("bash", &first.emit_path());
+        return keep_subexpressions(words.get(1..).unwrap_or(&[]), with_tail("bash", &first.emit_path()));
     }
     let rest = words.get(1..).unwrap_or(&[]);
     let out = match name_of(first).as_str() {
@@ -1608,6 +1637,7 @@ fn dispatch(words: &[Word], depth: usize, piped: bool) -> String {
         "get-content" | "gc" | "cat" | "type" | "more" => read(rest, piped),
         "get-childitem" | "gci" | "dir" | "ls" => list(rest),
         "get-item" | "gi" => item_env(rest).unwrap_or_else(|| generic(words)),
+        "get-command" | "gcm" if invokes_found_command(rest) => dispatch(rest, depth, piped),
         "copy-item" | "cpi" | "cp" | "copy" => transfer(rest, "cp"),
         "move-item" | "mi" | "mv" | "move" => transfer(rest, "mv"),
         "select-string" | "sls" => search(rest),
@@ -1635,17 +1665,13 @@ fn dispatch(words: &[Word], depth: usize, piped: bool) -> String {
     keep_subexpressions(rest, out)
 }
 
-// An argument's subexpression still runs when the verb mapping drops the argument.
-fn keep_subexpressions(words: &[Word], mut out: String) -> String {
-    for part in words.iter().flat_map(|word| word.parts.iter()) {
-        if let Part::Sub(inner) = part {
-            if !out.contains(&format!("$({inner})")) {
-                out.push_str(" ; ");
-                out.push_str(inner);
-            }
-        }
-    }
-    out
+// An argument's subexpression runs even when the verb mapping drops the argument.
+fn keep_subexpressions(words: &[Word], out: String) -> String {
+    let subs = words.iter().flat_map(|word| word.parts.iter()).filter_map(|part| match part {
+        Part::Sub(inner) => Some(inner),
+        _ => None,
+    });
+    subs.fold(out, |text, inner| format!("{text} ; bash -c {}", quote(inner)))
 }
 
 fn generic(words: &[Word]) -> String {
@@ -1961,7 +1987,7 @@ mod tests {
             (r"$t = Get-Content C:\x\.env", "t=$(cat C:/x/.env)"),
             (r"Get-ChildItem C:\x -Recurse | Remove-Item -Force", "find C:/x | xargs rm -f"),
             (r"Get-ChildItem C:\x | Get-Content", "ls C:/x | xargs cat"),
-            (r"Remove-Item $(Join-Path $HOME x) -Recurse", "rm -r \"$(Join-Path \"${HOME}\" x)\""),
+            (r"Remove-Item $(Join-Path $HOME x) -Recurse", "rm -r \"$(Join-Path \"${HOME}\" x)\" ; bash -c 'Join-Path \"${HOME}\" x'"),
             ("Remove-Item C:\\x `\n -Recurse", "rm -r C:/x"),
             ("Remove-Item C:\\a\nRemove-Item C:\\b", "rm C:/a\nrm C:/b"),
             (r"Remove-Item C:\a && Remove-Item C:\b", "rm C:/a && rm C:/b"),
@@ -2032,29 +2058,59 @@ mod tests {
             (r"Remove-Item -Path:$env:USERPROFILE\old -Recurse", "rm -r \"${HOME}/old\""),
             (
                 r"Set-Content -Path C:\Temp\out.txt -Value (Remove-Item -LiteralPath C:\Users\me\Documents\old -Recurse -Force)",
-                "tee C:/Temp/out.txt ; rm -rf C:/Users/me/Documents/old",
+                "tee C:/Temp/out.txt ; bash -c 'rm -rf C:/Users/me/Documents/old'",
             ),
             (
                 r"Set-Content -Path C:\Temp\out.txt -Value (Get-Content C:\Users\me\.ssh\id_rsa)",
-                "tee C:/Temp/out.txt ; cat C:/Users/me/.ssh/id_rsa",
+                "tee C:/Temp/out.txt ; bash -c 'cat C:/Users/me/.ssh/id_rsa'",
             ),
             (
                 "Write-Output @\"\n$(Remove-Item -LiteralPath C:\\Users\\me\\Documents\\old -Recurse -Force)\n\"@",
-                "Write-Output \"$(rm -rf C:/Users/me/Documents/old)\"",
+                "Write-Output \"$(rm -rf C:/Users/me/Documents/old)\" ; bash -c 'rm -rf C:/Users/me/Documents/old'",
             ),
             ("Write-Output @'\n$(Remove-Item x)\n'@", "Write-Output '$(Remove-Item x)'"),
             (r"Invoke-Expression -Command 'Remove-Item C:\Users\me\Documents\old -Recurse -Force'", "bash -c 'rm -rf C:/Users/me/Documents/old'"),
             (r#"cmd /c 'rd /s /q "%USERPROFILE%\Documents\old"'"#, "bash -c 'rm -r \"${HOME}/Documents/old\"'"),
             (
                 r"Start-Process -FilePath powershell -WorkingDirectory 'C:\Users\me\Documents' -ArgumentList '-Command Remove-Item .\old -Recurse -Force' -Wait",
-                "cd C:/Users/me/Documents && bash -c 'rm -rf ./old'",
+                r#"bash -c 'cd C:/Users/me/Documents && bash -c '"'"'rm -rf ./old'"'"''"#,
             ),
-            (r"pwsh -WorkingDirectory C:\x -Command Remove-Item .\old", "cd C:/x && bash -c 'rm ./old'"),
+            (r"pwsh -WorkingDirectory C:\x -Command Remove-Item .\old", r#"bash -c 'cd C:/x && bash -c '"'"'rm ./old'"'"''"#),
             (r"Get-Item -Path Env:EXAMPLE_TOKEN", "printenv EXAMPLE_TOKEN"),
             (r"gi -LiteralPath Env:X", "printenv X"),
             (r"robocopy C:\src C:\Users\me\Documents\backup /MIR /L", "true"),
             (r"xcopy C:\a D:\b /L", "true"),
         ]);
+    }
+
+    #[test]
+    fn a_second_round_of_dropped_forms_still_reaches_the_engines() {
+        check(&[
+            (
+                r"Start-Process -FilePath powershell -WorkingDirectory C:/Temp -ArgumentList '-Command Get-Date' -Wait; Remove-Item ./old -Recurse -Force",
+                "bash -c 'cd C:/Temp && bash -c Get-Date' ; rm -rf ./old",
+            ),
+            (r"Remove-Item C:/old -Recurse -Force -WhatIf:$($false)", "rm -rf C:/old ; bash -c false"),
+            (
+                r"& C:/Temp/harmless.ps1 (Remove-Item -LiteralPath C:/Users/me/Documents/old -Recurse -Force)",
+                "bash C:/Temp/harmless.ps1 ; bash -c 'rm -rf C:/Users/me/Documents/old'",
+            ),
+            (
+                r"[IO.File]::WriteAllText('C:/Temp/out.txt', (Remove-Item -LiteralPath C:/Users/me/Documents/old -Recurse -Force))",
+                "cat C:/Temp/out.txt ; bash -c 'rm -rf C:/Users/me/Documents/old'",
+            ),
+            (r"Get-Item -Path C:/Temp,Env:EXAMPLE_TOKEN", "printenv EXAMPLE_TOKEN"),
+            (r"& (Get-Command Remove-Item) -LiteralPath C:/x -Recurse -Force", "rm -rf C:/x"),
+            (r"Get-Command git -ErrorAction SilentlyContinue", "Get-Command git -ErrorAction SilentlyContinue"),
+        ]);
+        let hidden = r"Select-String -Path C:/Temp/log.txt -Pattern '$(rm -rf C:/x ; UTF8)' -Encoding $(Remove-Item -LiteralPath C:/x -Recurse -Force; 'UTF8')";
+        assert!(to_bash(hidden).contains("; bash -c 'rm -rf C:/x ; UTF8'"), "{}", to_bash(hidden));
+        let newline = "iex @\"\nGet-Date`nRemove-Item C:/x -Recurse -Force\n\"@";
+        assert!(to_bash(newline).contains("rm -rf C:/x"), "{}", to_bash(newline));
+        assert!(super::recycle_requested("'SendToRecycleBin'"));
+        assert!(super::recycle_requested("[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin"));
+        assert!(!super::recycle_requested("'DeletePermanently' <# SendToRecycleBin #>"));
+        assert!(!super::recycle_requested("$option"));
     }
 
     #[test]
