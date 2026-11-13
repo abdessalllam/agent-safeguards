@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::shlex::quote;
 
+const COMMA: char = '\u{1f}';
 const MAX_DEPTH: usize = 6;
 const MAX_TOKENS: usize = 20_000;
 const KEYWORDS: [&str; 17] = [
@@ -102,7 +103,7 @@ impl Word {
         let mut out = String::new();
         for part in &self.parts {
             match part {
-                Part::Lit(text) => out.push_str(text),
+                Part::Lit(text) => out.push_str(&text.replace(COMMA, ",")),
                 Part::Var(name) => {
                     out.push('$');
                     out.push_str(name);
@@ -118,17 +119,15 @@ impl Word {
     }
 
     fn emit_with(&self, path: bool) -> String {
-        let parts: Vec<Part> = if path {
-            self.parts
-                .iter()
-                .map(|part| match part {
-                    Part::Lit(text) => Part::Lit(path_text(text)),
-                    other => other.clone(),
-                })
-                .collect()
-        } else {
-            self.parts.clone()
-        };
+        let parts: Vec<Part> = self
+            .parts
+            .iter()
+            .map(|part| match part {
+                Part::Lit(text) if path => Part::Lit(path_text(&text.replace(COMMA, ","))),
+                Part::Lit(text) => Part::Lit(text.replace(COMMA, ",")),
+                other => other.clone(),
+            })
+            .collect();
         let mut plain = String::new();
         for part in &parts {
             match part {
@@ -551,6 +550,10 @@ impl Lexer {
                         }
                     }
                 }
+                ',' => {
+                    lit.push(COMMA);
+                    self.pos += 1;
+                }
                 '$' => self.expansion(&mut parts, &mut lit),
                 '@' if self.peek(1) == Some('(') => {
                     self.pos += 1;
@@ -772,13 +775,42 @@ fn parse_args(spec: &[Param], words: &[Word]) -> Args {
 }
 
 fn split_commas(word: Word) -> Vec<Word> {
-    match word.literal() {
-        Some(text) if !word.quoted && text.contains(',') => text
-            .split(',')
-            .filter(|piece| !piece.is_empty())
-            .map(Word::lit)
-            .collect(),
-        _ => vec![word],
+    let mut out: Vec<Word> = Vec::new();
+    let mut current: Vec<Part> = Vec::new();
+    for part in &word.parts {
+        match part {
+            Part::Lit(text) if text.contains(COMMA) => {
+                let mut pieces = text.split(COMMA);
+                if let Some(first) = pieces.next().filter(|piece| !piece.is_empty()) {
+                    current.push(Part::Lit(first.to_owned()));
+                }
+                for piece in pieces {
+                    if !current.is_empty() {
+                        out.push(Word {
+                            parts: std::mem::take(&mut current),
+                            quoted: word.quoted,
+                            call: false,
+                        });
+                    }
+                    if !piece.is_empty() {
+                        current.push(Part::Lit(piece.to_owned()));
+                    }
+                }
+            }
+            other => current.push(other.clone()),
+        }
+    }
+    if !current.is_empty() {
+        out.push(Word {
+            parts: current,
+            quoted: word.quoted,
+            call: false,
+        });
+    }
+    if out.is_empty() {
+        vec![word]
+    } else {
+        out
     }
 }
 
@@ -1033,6 +1065,173 @@ fn change_directory(words: &[Word]) -> String {
     with_tail("cd", &paths_text(&targets))
 }
 
+const WRITE: [Param; 18] = [
+    param("path", &[], true),
+    param("filepath", &["fp"], true),
+    param("literalpath", &["lp", "pspath"], true),
+    param("value", &[], true),
+    param("append", &[], false),
+    param("force", &[], false),
+    param("encoding", &[], true),
+    param("nonewline", &[], false),
+    param("noclobber", &["nc"], false),
+    param("inputobject", &["io"], true),
+    param("stream", &[], true),
+    param("passthru", &[], false),
+    param("whatif", &["wi"], false),
+    param("confirm", &["cf"], false),
+    param("width", &[], true),
+    param("variable", &[], true),
+    param("delimiter", &[], true),
+    param("notypeinformation", &["nti"], false),
+];
+
+fn first_target(args: &Args, keys: &[&str]) -> Vec<Word> {
+    let mut targets = named(args, keys);
+    if targets.is_empty() {
+        if let Some(first) = args.positional.iter().find(|word| cmd_flag(word).is_none()).cloned() {
+            targets = split_commas(first);
+        }
+    }
+    targets
+}
+
+fn write(words: &[Word], append: bool) -> String {
+    let args = parse_args(&WRITE, words);
+    if args.flags.contains("whatif") {
+        return "true".to_owned();
+    }
+    let targets = first_target(&args, &["path", "filepath", "literalpath"]);
+    let verb = if append || args.flags.contains("append") { "tee -a" } else { "tee" };
+    with_tail(verb, &paths_text(&targets))
+}
+
+const NEW_ITEM: [Param; 8] = [
+    param("path", &[], true),
+    param("name", &[], true),
+    param("itemtype", &["type"], true),
+    param("value", &[], true),
+    param("force", &[], false),
+    param("whatif", &["wi"], false),
+    param("confirm", &["cf"], false),
+    param("credential", &[], true),
+];
+
+fn new_item(words: &[Word]) -> String {
+    let args = parse_args(&NEW_ITEM, words);
+    if args.flags.contains("whatif") {
+        return "true".to_owned();
+    }
+    let kind = named(&args, &["itemtype"]).first().and_then(Word::literal).unwrap_or_default().to_ascii_lowercase();
+    let mut targets = first_target(&args, &["path"]);
+    if let (Some(base), Some(name)) = (targets.first().and_then(Word::literal), named(&args, &["name"]).first().and_then(Word::literal)) {
+        targets = vec![Word::lit(&format!("{}/{name}", base.trim_end_matches(['/', '\\'])))];
+    }
+    let verb = if args.values.contains_key("value") || kind == "file" { "tee" } else { "mkdir" };
+    with_tail(verb, &paths_text(&targets))
+}
+
+const RENAME: [Param; 7] = [
+    param("path", &[], true),
+    param("literalpath", &["lp", "pspath"], true),
+    param("newname", &[], true),
+    param("force", &[], false),
+    param("passthru", &[], false),
+    param("whatif", &["wi"], false),
+    param("confirm", &["cf"], false),
+];
+
+fn rename(words: &[Word]) -> String {
+    let args = parse_args(&RENAME, words);
+    if args.flags.contains("whatif") {
+        return "true".to_owned();
+    }
+    let mut positional = args.positional.iter().cloned();
+    let mut sources = named(&args, &["path", "literalpath"]);
+    if sources.is_empty() {
+        sources = positional.next().map(split_commas).unwrap_or_default();
+    }
+    let target = named(&args, &["newname"]).into_iter().next().or_else(|| positional.next());
+    let tail = with_tail(&paths_text(&sources), &target.map(|word| word.emit_path()).unwrap_or_default());
+    with_tail("mv", &tail)
+}
+
+const START: [Param; 14] = [
+    param("filepath", &[], true),
+    param("argumentlist", &["args"], true),
+    param("workingdirectory", &[], true),
+    param("verb", &[], true),
+    param("wait", &[], false),
+    param("passthru", &[], false),
+    param("nonewwindow", &[], false),
+    param("windowstyle", &[], true),
+    param("redirectstandardoutput", &[], true),
+    param("redirectstandarderror", &[], true),
+    param("redirectstandardinput", &[], true),
+    param("credential", &[], true),
+    param("usenewenvironment", &[], false),
+    param("loaduserprofile", &[], false),
+];
+
+fn start_process(words: &[Word], depth: usize) -> String {
+    let args = parse_args(&START, words);
+    let mut positional = args.positional.iter().cloned();
+    let Some(program) = named(&args, &["filepath"]).into_iter().next().or_else(|| positional.next()) else {
+        return "true".to_owned();
+    };
+    let mut list = named(&args, &["argumentlist"]);
+    list.extend(positional.flat_map(split_commas));
+    let wrapper = matches!(name_of(&program).as_str(), "cmd" | "powershell" | "pwsh");
+    if wrapper && list.len() == 1 {
+        if let Some(text) = list.first().and_then(Word::literal) {
+            list = text.replace(COMMA, ",").split_whitespace().map(Word::lit).collect();
+        }
+    }
+    let mut command = vec![program];
+    command.extend(list);
+    let mut out = dispatch(&command, depth, false);
+    for key in ["redirectstandardoutput", "redirectstandarderror"] {
+        if let Some(target) = named(&args, &[key]).first() {
+            out.push_str(&format!(" > {}", target.emit_path()));
+        }
+    }
+    out
+}
+
+const INVOKE: [Param; 10] = [
+    param("scriptblock", &["sb"], true),
+    param("computername", &["cn"], true),
+    param("session", &[], true),
+    param("argumentlist", &["args"], true),
+    param("credential", &[], true),
+    param("asjob", &[], false),
+    param("filepath", &["fp"], true),
+    param("throttlelimit", &[], true),
+    param("hidecomputername", &[], false),
+    param("name", &[], true),
+];
+
+fn script_block(words: &[Word], depth: usize) -> String {
+    let args = parse_args(&INVOKE, words);
+    if let Some(script) = named(&args, &["filepath"]).first() {
+        return with_tail("bash", &script.emit_path());
+    }
+    let block = named(&args, &["scriptblock"]).into_iter().next().or_else(|| args.positional.first().cloned());
+    let Some(block) = block else {
+        return "true".to_owned();
+    };
+    let Some(text) = block.literal() else {
+        return format!("eval {}", block.emit());
+    };
+    let text = text.replace(COMMA, ",");
+    let trimmed = text.trim();
+    let inner = trimmed.strip_prefix('{').and_then(|rest| rest.strip_suffix('}')).unwrap_or(trimmed);
+    match named(&args, &["computername", "session"]).first() {
+        Some(host) => format!("ssh {} {}", host.emit(), quote(&convert(inner, depth + 1))),
+        None => nested(inner, depth),
+    }
+}
+
 fn name_of(word: &Word) -> String {
     let Some(text) = word.literal() else {
         return String::new();
@@ -1206,6 +1405,10 @@ fn dispatch(words: &[Word], depth: usize, piped: bool) -> String {
     if let Some(done) = assignment(words, depth) {
         return done;
     }
+    let script = first.literal().map(|text| text.to_ascii_lowercase());
+    if script.is_some_and(|text| [".ps1", ".cmd", ".bat"].iter().any(|extension| text.ends_with(extension))) {
+        return with_tail("bash", &first.emit_path());
+    }
     let rest = words.get(1..).unwrap_or(&[]);
     match name_of(first).as_str() {
         "remove-item" | "ri" | "rm" | "rmdir" | "rd" | "del" | "erase" => remove(rest, piped),
@@ -1216,10 +1419,16 @@ fn dispatch(words: &[Word], depth: usize, piped: bool) -> String {
         "move-item" | "mi" | "mv" | "move" => transfer(rest, "mv"),
         "select-string" | "sls" => search(rest),
         "set-location" | "sl" | "cd" | "chdir" | "push-location" | "pushd" => change_directory(rest),
+        "set-content" | "sc" | "out-file" | "clear-content" | "clc" | "tee-object" | "tee" | "export-csv" | "export-clixml" => write(rest, false),
+        "add-content" | "ac" => write(rest, true),
+        "new-item" | "ni" => new_item(rest),
+        "rename-item" | "rni" | "ren" => rename(rest),
+        "start-process" | "start" | "saps" => start_process(rest, depth),
+        "invoke-command" | "icm" | "start-job" | "sajb" => script_block(rest, depth),
         "powershell" | "pwsh" | "powershell_ise" => powershell(words, depth),
         "cmd" => cmd_wrapper(words, depth),
         "invoke-expression" | "iex" => match rest.first().and_then(Word::literal) {
-            Some(inner) => nested(&inner, depth),
+            Some(inner) => nested(&inner.replace(COMMA, ","), depth),
             None => format!("eval {}", rest.iter().map(Word::emit).collect::<Vec<_>>().join(" ")),
         },
         _ => generic(words),
@@ -1395,6 +1604,49 @@ pub fn active() -> bool {
     cfg!(windows) || std::env::var("AGENT_SAFEGUARDS_SHELL").is_ok_and(|value| value.eq_ignore_ascii_case("powershell"))
 }
 
+/// UTF-16 with a byte order mark, which Windows PowerShell 5.1 writes for `>`.
+pub fn has_wide_bom(bytes: &[u8]) -> bool {
+    matches!(bytes, [0xFF, 0xFE, ..] | [0xFE, 0xFF, ..])
+}
+
+fn decoded_script(bytes: &[u8]) -> String {
+    let (little, body) = match bytes {
+        [0xFF, 0xFE, body @ ..] => (true, body),
+        [0xFE, 0xFF, body @ ..] => (false, body),
+        _ => return String::from_utf8_lossy(bytes).trim_start_matches('\u{feff}').to_owned(),
+    };
+    let units: Vec<u16> = body
+        .chunks_exact(2)
+        .map(|pair| match pair {
+            [first, second] if little => u16::from_le_bytes([*first, *second]),
+            [first, second] => u16::from_be_bytes([*first, *second]),
+            _ => 0,
+        })
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// A script as the guards read it; `.ps1`, `.cmd` and `.bat` are rewritten on Windows.
+pub fn script_text(path: &str, bytes: &[u8]) -> String {
+    let text = decoded_script(bytes);
+    if !active() {
+        return text;
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".ps1") || lower.ends_with(".psm1") {
+        return to_bash(&text);
+    }
+    if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+        let lines: Vec<String> = text
+            .lines()
+            .map(|line| cmd_convert(line.trim_start_matches('@'), 0))
+            .filter(|line| !line.is_empty())
+            .collect();
+        return lines.join("\n");
+    }
+    text
+}
+
 pub fn for_guards(command: &str) -> String {
     if active() {
         to_bash(command)
@@ -1520,9 +1772,39 @@ mod tests {
     }
 
     #[test]
+    fn writes_start_process_and_script_blocks_are_judged_like_their_unix_forms() {
+        check(&[
+            (r"Set-Content -Path C:\Users\me\.env -Value x", "tee C:/Users/me/.env"),
+            (r"'x' | Out-File -FilePath C:\a.txt -Append", "x | tee -a C:/a.txt"),
+            (r"Add-Content C:\a.txt hello", "tee -a C:/a.txt"),
+            (r"Clear-Content C:\a.txt", "tee C:/a.txt"),
+            (r"echo hi | Tee-Object C:\a.log", "echo hi | tee C:/a.log"),
+            (r"New-Item -Path C:\a -Name b.txt -ItemType File -Value x", "tee C:/a/b.txt"),
+            (r"New-Item -ItemType Directory C:\d", "mkdir C:/d"),
+            (r"Rename-Item C:\a.txt b.txt", "mv C:/a.txt b.txt"),
+            (r"sc C:\x.txt v -WhatIf", "true"),
+            (r"Start-Process cmd -ArgumentList '/c','rd /s /q C:\x'", "bash -c 'rm -r C:/x'"),
+            (r#"Start-Process -FilePath powershell -ArgumentList "-Command Remove-Item C:\x -Recurse""#, "bash -c 'rm -r C:/x'"),
+            (r"Start-Process git -ArgumentList status", "git status"),
+            (r"Start-Process cmd -ArgumentList '/c type C:\a' -RedirectStandardOutput C:\out.txt", "bash -c 'cat C:/a' > C:/out.txt"),
+            (r"Invoke-Command -ScriptBlock { Remove-Item C:\x -Recurse }", "bash -c 'rm -r C:/x'"),
+            (r"icm -ComputerName srv1 -ScriptBlock { Remove-Item /srv/x -Recurse }", "ssh srv1 'rm -r /srv/x'"),
+            (r"Start-Job { Remove-Item C:\x }", "bash -c 'rm C:/x'"),
+            (r"Invoke-Command -FilePath C:\s.ps1", "bash C:/s.ps1"),
+            (r".\run.ps1 -Force", "bash ./run.ps1"),
+            (r"& 'C:\my tools\clean.bat' arg", "bash 'C:/my tools/clean.bat'"),
+        ]);
+        let wide = [0xFF, 0xFE, b'R', 0, b'm', 0];
+        assert!(super::has_wide_bom(&wide) && !super::has_wide_bom(b"Rm"));
+        assert_eq!(super::decoded_script(&wide), "Rm");
+        assert_eq!(super::decoded_script(&[0xFE, 0xFF, 0, b'R']), "R");
+        assert_eq!(super::decoded_script("\u{feff}Rm".as_bytes()), "Rm");
+    }
+
+    #[test]
     fn here_strings_and_odd_input_never_panic_and_stay_bounded() {
         let here = "Set-Content -Path C:\\a.txt -Value @'\nline # one\n'@\nRemove-Item C:\\b";
-        assert_eq!(to_bash(here), "Set-Content -Path 'C:\\a.txt' -Value 'line # one'\nrm C:/b");
+        assert_eq!(to_bash(here), "tee C:/a.txt\nrm C:/b");
         for text in ["", "(", ")", "{", "}", "'", "\"", "`", "$(", "${", "@'", "@\"\n", "<#", "&&", "|", ">", "2>&1", "[", "[x]::", "$", "$$", "a`", "iex iex iex iex iex iex iex iex"] {
             let _ = to_bash(text);
         }

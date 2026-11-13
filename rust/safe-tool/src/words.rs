@@ -12,7 +12,9 @@ pub fn is_self(word: &str) -> Result<bool, sys::EmbeddedNul> {
     if word == TOOL_NAME {
         return Ok(true);
     }
-    if word.rsplit('/').next() != Some(TOOL_NAME) {
+    let file = word.rsplit('/').next();
+    let file = if cfg!(windows) { file.map(|name| name.strip_suffix(".exe").unwrap_or(name)) } else { file };
+    if file != Some(TOOL_NAME) {
         return Ok(false);
     }
     let expanded = if let Some(tail) = word.strip_prefix("$HOME") {

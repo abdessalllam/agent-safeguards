@@ -58,6 +58,37 @@ fn powershell_and_cmd_deletes_of_real_data_are_refused_with_the_windows_path() {
 }
 
 #[test]
+fn script_files_run_by_path_are_read_and_judged_even_when_saved_as_utf16() {
+    let home = profile();
+    let dir = std::env::temp_dir().join(format!("dg-script-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let line = format!("Remove-Item -Recurse -Force '{home}\\Documents\\old'\r\n");
+    let plain = dir.join("clean.ps1");
+    std::fs::write(&plain, &line).expect("write");
+    let wide = dir.join("wide.ps1");
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in line.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&wide, bytes).expect("write");
+    let batch = dir.join("clean.cmd");
+    std::fs::write(&batch, format!("@echo off\r\nrd /s /q \"{home}\\Documents\\old\"\r\n")).expect("write");
+    let harmless = dir.join("harmless.ps1");
+    std::fs::write(&harmless, "Get-Date\r\n").expect("write");
+    for command in [
+        format!("powershell -File '{}'", plain.display()),
+        format!("& '{}'", wide.display()),
+        format!("cmd /c '{}'", batch.display()),
+    ] {
+        let (decision, reason) = verdict(&command);
+        assert_eq!(decision, "deny", "{command}: {reason}");
+    }
+    let (decision, reason) = verdict(&format!("& '{}'", harmless.display()));
+    assert_eq!(decision, "allow", "{reason}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn protected_folders_and_the_profile_itself_are_refused() {
     let home = profile();
     for command in ["Remove-Item C:\\Windows -Recurse".to_owned(), "Remove-Item C:\\ -Recurse -Force".to_owned(), format!("Remove-Item '{home}' -Recurse")] {

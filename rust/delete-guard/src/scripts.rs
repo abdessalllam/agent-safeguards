@@ -282,11 +282,12 @@ pub fn check_script_file(raw: &str, cwd: Option<&str>, shell: bool) -> Result<()
     let Some(data) = read_regular_file(&resolved, MAX_SCRIPT_BYTES)? else {
         return Ok(());
     };
-    if data.len() > MAX_SCRIPT_BYTES || data.get(..data.len().min(1024)).unwrap_or(&[]).contains(&0)
+    let wide = guard_common::powershell::has_wide_bom(&data);
+    if data.len() > MAX_SCRIPT_BYTES || (!wide && data.get(..data.len().min(1024)).unwrap_or(&[]).contains(&0))
     {
         return Ok(());
     }
-    let text = String::from_utf8_lossy(&data);
+    let text = guard_common::powershell::script_text(&resolved, &data);
     if !shell
         && SHELL_SHEBANG
             .find(&text)
