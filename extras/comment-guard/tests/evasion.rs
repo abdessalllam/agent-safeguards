@@ -2460,6 +2460,15 @@ fn an_html_comment_block_is_cut_outside_raw_text_elements_and_refused_where_it_c
     refused("one line star comment in the body", "<p>x</p>\n/* previously */\n<p>y</p>\n");
     refused("closer text in an attribute", &format!("<textarea data-example=\"</textarea>\">\n{block}</textarea>\n"));
     refused("closer with a no-break space", &format!("<textarea>\n</textarea\u{a0}>\n{block}</textarea>\n"));
+    refused("angle bracket in a quoted attribute", &format!("<textarea data-example=\"> </textarea>\">\n{block}</textarea>\n"));
+    refused("angle bracket in a single quoted attribute", &format!("<textarea data-example='> </textarea>'>\n{block}</textarea>\n"));
+    refused("opener inside an earlier comment", &format!("<!-- <script> -->\n<textarea>\n</script>\n{block}</textarea>\n"));
+    refused("opener inside an earlier attribute", &format!("<div data-example=\"<script>\"></div>\n<textarea>\n</script>\n{block}</textarea>\n"));
+    for earlier in ["<!-- <script> -->", "<div data-example=\"<script>\"></div>"] {
+        let page = format!("{earlier}\n{block}<p>x</p>\n");
+        let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join("e.html"), &page), Provider::Claude));
+        assert_eq!(input["content"], format!("{earlier}\n<p>x</p>\n"));
+    }
     let (input, _) = cut(trimming_in(Mode::Drop, None, None, "Write", written(&dir.join("o.html"), "<p>x</p>\n<!-- previously -->\n<p>y</p>\n"), Provider::Claude));
     assert_eq!(input["content"], "<p>x</p>\n<p>y</p>\n");
     for opener in ["<textarea title=\"a>b\">x</textarea>", "<script src='a>b'></script>"] {
